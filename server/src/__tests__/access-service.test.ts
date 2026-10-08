@@ -56,6 +56,37 @@ async function createCompanyWithOwner(db: ReturnType<typeof createDb>) {
   return { company, owner };
 }
 
+async function createMember(
+  db: ReturnType<typeof createDb>,
+  companyId: string,
+  membershipRole: "owner" | "admin" | "operator" | "viewer",
+) {
+  return db
+    .insert(companyMemberships)
+    .values({
+      companyId,
+      principalType: "user",
+      principalId: `member-${randomUUID()}`,
+      status: "active",
+      membershipRole,
+    })
+    .returning()
+    .then((rows) => rows[0]!);
+}
+
+async function grantKeysFor(db: ReturnType<typeof createDb>, companyId: string, principalId: string) {
+  return db
+    .select({ permissionKey: principalPermissionGrants.permissionKey })
+    .from(principalPermissionGrants)
+    .where(
+      and(
+        eq(principalPermissionGrants.companyId, companyId),
+        eq(principalPermissionGrants.principalId, principalId),
+      ),
+    )
+    .then((rows) => rows.map((row) => row.permissionKey));
+}
+
 describeEmbeddedPostgres("access service", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -123,6 +154,97 @@ describeEmbeddedPostgres("access service", () => {
       .where(eq(companyMemberships.id, owner.id))
       .then((rows) => rows[0]!);
     expect(unchanged.status).toBe("active");
+  });
+
+  it("keeps role-derived grants when a member permissions PATCH omits them", async () => {
+    const { company, owner } = await createCompanyWithOwner(db);
+    const access = accessService(db);
+    const member = await createMember(db, company.id, "owner");
+
+    await access.setMemberPermissions(company.id, member.id, [], owner.principalId);
+
+    const grants = await grantKeysFor(db, company.id, member.principalId);
+    expect(grants.sort()).toEqual(
+      grantsForHumanRole("owner").map((grant) => grant.permissionKey).sort(),
+    );
+    expect(grants).toContain("users:manage_permissions");
+  });
+
+  it("keeps role-derived grants and still adds explicit ones on a role-and-grants PATCH", async () => {
+    const { company, owner } = await createCompanyWithOwner(db);
+    const access = accessService(db);
+    const member = await createMember(db, company.id, "operator");
+
+    await access.updateMemberAndPermissions(
+      company.id,
+      member.id,
+      { grants: [{ permissionKey: "pipelines:write" }] },
+      owner.principalId,
+    );
+
+    const grants = await grantKeysFor(db, company.id, member.principalId);
+    for (const defaultGrant of grantsForHumanRole("operator")) {
+      expect(grants).toContain(defaultGrant.permissionKey);
+    }
+    expect(grants).toContain("pipelines:write");
+  });
+
+  it("applies the next role's defaults when a grants PATCH changes the role", async () => {
+    const { company, owner } = await createCompanyWithOwner(db);
+    const access = accessService(db);
+    const member = await createMember(db, company.id, "viewer");
+
+    await access.updateMemberAndPermissions(
+      company.id,
+      member.id,
+      { membershipRole: "owner", grants: [] },
+      owner.principalId,
+    );
+
+    const grants = await grantKeysFor(db, company.id, member.principalId);
+    expect(grants).toContain("users:manage_permissions");
+    for (const defaultGrant of grantsForHumanRole("owner")) {
+      expect(grants).toContain(defaultGrant.permissionKey);
+    }
+  });
+
+  it("confers the new role's permissions on promotion through updateMember", async () => {
+    const { company } = await createCompanyWithOwner(db);
+    const access = accessService(db);
+    const member = await createMember(db, company.id, "operator");
+
+    await access.updateMember(company.id, member.id, { membershipRole: "owner" });
+
+    const grants = await grantKeysFor(db, company.id, member.principalId);
+    expect(grants).toContain("users:manage_permissions");
+    for (const defaultGrant of grantsForHumanRole("owner")) {
+      expect(grants).toContain(defaultGrant.permissionKey);
+    }
+  });
+
+  it("does not rewrite agent principal grants, which have no role defaults", async () => {
+    const { company } = await createCompanyWithOwner(db);
+    const access = accessService(db);
+    const agent = await db
+      .insert(companyMemberships)
+      .values({
+        companyId: company.id,
+        principalType: "agent",
+        principalId: `agent-${randomUUID()}`,
+        status: "active",
+        membershipRole: "member",
+      })
+      .returning()
+      .then((rows) => rows[0]!);
+
+    await access.setMemberPermissions(
+      company.id,
+      agent.id,
+      [{ permissionKey: "tasks:assign" }],
+      null,
+    );
+
+    expect(await grantKeysFor(db, company.id, agent.principalId)).toEqual(["tasks:assign"]);
   });
 
   it("archives members, clears grants, and reassigns open issues without deleting history", async () => {

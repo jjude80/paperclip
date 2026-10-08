@@ -18,7 +18,15 @@ import type { PermissionKey, PrincipalType } from "@paperclipai/shared";
 import { conflict } from "../errors.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import { authorizationService, type AuthorizationActor, type AuthorizationResource } from "./authorization.js";
-import { ensureHumanRoleDefaultGrants } from "./principal-access-compatibility.js";
+import {
+  grantsForHumanRole,
+  mergeRoleDefaultGrants,
+  normalizeHumanRole,
+} from "./company-member-roles.js";
+import {
+  ensureHumanRoleDefaultGrants,
+  insertMissingPrincipalGrants,
+} from "./principal-access-compatibility.js";
 
 type MembershipRow = typeof companyMemberships.$inferSelect;
 type GrantInput = {
@@ -451,6 +459,12 @@ export function accessService(db: Db) {
     const member = await getMemberById(companyId, memberId);
     if (!member) return null;
 
+    const effectiveGrants = mergeRoleDefaultGrants({
+      principalType: member.principalType,
+      membershipRole: member.membershipRole,
+      grants,
+    });
+
     await db.transaction(async (tx) => {
       await tx
         .delete(principalPermissionGrants)
@@ -461,9 +475,9 @@ export function accessService(db: Db) {
             eq(principalPermissionGrants.principalId, member.principalId),
           ),
         );
-      if (grants.length > 0) {
+      if (effectiveGrants.length > 0) {
         await tx.insert(principalPermissionGrants).values(
-          grants.map((grant) => ({
+          effectiveGrants.map((grant) => ({
             companyId,
             principalType: member.principalType,
             principalId: member.principalId,
@@ -560,9 +574,15 @@ export function accessService(db: Db) {
             eq(principalPermissionGrants.principalId, existing.principalId),
           ),
         );
-      if (data.grants.length > 0) {
+      const effectiveGrants = mergeRoleDefaultGrants({
+        principalType: existing.principalType,
+        membershipRole: nextMembershipRole,
+        grants: data.grants,
+      });
+
+      if (effectiveGrants.length > 0) {
         await tx.insert(principalPermissionGrants).values(
-          data.grants.map((grant) => ({
+          effectiveGrants.map((grant) => ({
             companyId,
             principalType: existing.principalType,
             principalId: existing.principalId,
@@ -1112,7 +1132,7 @@ export function accessService(db: Db) {
         await sweepMemberConnectionAccess(tx, companyId, existing.principalId, now);
       }
 
-      return tx
+      const updated = await tx
         .update(companyMemberships)
         .set({
           membershipRole: nextMembershipRole,
@@ -1122,6 +1142,24 @@ export function accessService(db: Db) {
         .where(eq(companyMemberships.id, existing.id))
         .returning()
         .then((rows) => rows[0] ?? existing);
+
+      // A role change must confer the new role's permissions. Grant rows are the only
+      // source of non-`tools:` permissions, so promoting a member without seeding the
+      // new role's defaults leaves them unable to exercise the role they were given.
+      if (
+        existing.principalType === "user"
+        && nextMembershipRole !== existing.membershipRole
+      ) {
+        await insertMissingPrincipalGrants(tx as unknown as Db, {
+          companyId,
+          principalType: "user",
+          principalId: existing.principalId,
+          grants: grantsForHumanRole(normalizeHumanRole(nextMembershipRole, "operator")),
+          grantedByUserId: null,
+        });
+      }
+
+      return updated;
     });
   }
 

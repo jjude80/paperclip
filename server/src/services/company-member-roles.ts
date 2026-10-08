@@ -76,6 +76,39 @@ export function grantsForHumanRole(
   }
 }
 
+type RoleGrant = {
+  permissionKey: (typeof PERMISSION_KEYS)[number];
+  scope?: Record<string, unknown> | null;
+};
+
+/**
+ * Role-derived permissions are materialized as ordinary grant rows, so any writer
+ * that replaces a principal's grants must re-apply the role defaults or it will
+ * silently strip the permissions the membership role implies. Callers may only
+ * add to the role defaults, never remove them.
+ *
+ * Agent principals have no role defaults: their grants are set explicitly.
+ */
+export function mergeRoleDefaultGrants<T extends RoleGrant>(input: {
+  principalType: string;
+  membershipRole: string | null | undefined;
+  grants: T[];
+}): T[] {
+  if (input.principalType !== "user") return input.grants;
+
+  const defaults = grantsForHumanRole(normalizeHumanRole(input.membershipRole, "operator"));
+  if (defaults.length === 0) return input.grants;
+
+  const merged = [...input.grants];
+  const seen = new Set(input.grants.map((grant) => grant.permissionKey));
+  for (const roleGrant of defaults) {
+    if (seen.has(roleGrant.permissionKey)) continue;
+    seen.add(roleGrant.permissionKey);
+    merged.push({ permissionKey: roleGrant.permissionKey, scope: roleGrant.scope } as T);
+  }
+  return merged;
+}
+
 export function resolveHumanInviteRole(
   defaultsPayload: Record<string, unknown> | null | undefined
 ): HumanCompanyMembershipRole {

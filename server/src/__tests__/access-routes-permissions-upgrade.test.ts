@@ -19,6 +19,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { grantsForHumanRole } from "../services/company-member-roles.js";
 
 vi.hoisted(() => {
   process.env.PAPERCLIP_HOME = "/tmp/paperclip-test-home";
@@ -133,6 +134,98 @@ describeEmbeddedPostgres("access routes permissions upgrade compatibility", () =
     expect(unchanged.membershipRole).toBe("owner");
   }, 10_000);
 
+  it("keeps role-derived grants when the role-and-grants route replaces a member's grants", async () => {
+    const { company, owner } = await createCompanyWithOwner(db);
+    const operator = await db
+      .insert(companyMemberships)
+      .values({
+        companyId: company.id,
+        principalType: "user",
+        principalId: `operator-${randomUUID()}`,
+        status: "active",
+        membershipRole: "operator",
+      })
+      .returning()
+      .then((rows) => rows[0]!);
+    for (const grant of grantsForHumanRole("operator")) {
+      await db.insert(principalPermissionGrants).values({
+        companyId: company.id,
+        principalType: "user",
+        principalId: operator.principalId,
+        permissionKey: grant.permissionKey,
+        scope: grant.scope,
+        grantedByUserId: owner.principalId,
+      });
+    }
+
+    // An owner editing an operator's grants is the reachable case: the target rank
+    // is below the actor rank, so assertCanManageCompanyMember allows it.
+    const res = await request(await createApp(db, company.id, owner.principalId))
+      .patch(`/api/companies/${company.id}/members/${operator.id}/role-and-grants`)
+      .send({ status: "active", grants: [] });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.membershipRole).toBe("operator");
+
+    const grants = await db
+      .select({ permissionKey: principalPermissionGrants.permissionKey })
+      .from(principalPermissionGrants)
+      .where(
+        and(
+          eq(principalPermissionGrants.companyId, company.id),
+          eq(principalPermissionGrants.principalId, operator.principalId),
+        ),
+      )
+      .then((rows) => rows.map((row) => row.permissionKey));
+    // The membership role still says operator, so its permissions must survive.
+    for (const roleGrant of grantsForHumanRole("operator")) {
+      expect(grants).toContain(roleGrant.permissionKey);
+    }
+  });
+
+  it("keeps role-derived grants when the permissions-only route replaces a member's grants", async () => {
+    const { company, owner } = await createCompanyWithOwner(db);
+    const admin = await db
+      .insert(companyMemberships)
+      .values({
+        companyId: company.id,
+        principalType: "user",
+        principalId: `admin-${randomUUID()}`,
+        status: "active",
+        membershipRole: "admin",
+      })
+      .returning()
+      .then((rows) => rows[0]!);
+    for (const grant of grantsForHumanRole("admin")) {
+      await db.insert(principalPermissionGrants).values({
+        companyId: company.id,
+        principalType: "user",
+        principalId: admin.principalId,
+        permissionKey: grant.permissionKey,
+        scope: grant.scope,
+        grantedByUserId: owner.principalId,
+      });
+    }
+
+    const res = await request(await createApp(db, company.id, owner.principalId))
+      .patch(`/api/companies/${company.id}/members/${admin.id}/permissions`)
+      .send({ grants: [] });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+    const grants = await db
+      .select({ permissionKey: principalPermissionGrants.permissionKey })
+      .from(principalPermissionGrants)
+      .where(
+        and(
+          eq(principalPermissionGrants.companyId, company.id),
+          eq(principalPermissionGrants.principalId, admin.principalId),
+        ),
+      )
+      .then((rows) => rows.map((row) => row.permissionKey));
+    for (const roleGrant of grantsForHumanRole("admin")) {
+      expect(grants).toContain(roleGrant.permissionKey);
+    }
+  });
+
   it("keeps custom grants when the role-only member route changes a member role", async () => {
     const { company, owner } = await createCompanyWithOwner(db);
     const member = await db
@@ -173,12 +266,17 @@ describeEmbeddedPostgres("access routes permissions upgrade compatibility", () =
           eq(principalPermissionGrants.principalId, member.principalId),
         ),
       );
-    expect(grants).toHaveLength(1);
-    expect(grants[0]).toMatchObject({
+    const customGrant = grants.find((grant) => grant.permissionKey === "tasks:assign_scope");
+    expect(customGrant).toMatchObject({
       permissionKey: "tasks:assign_scope",
       scope: customScope,
       grantedByUserId: owner.principalId,
     });
+    // The new role's defaults are materialized alongside the custom grant, so a
+    // role change is what confers the role's permissions.
+    for (const roleGrant of grantsForHumanRole("operator")) {
+      expect(grants.map((grant) => grant.permissionKey)).toContain(roleGrant.permissionKey);
+    }
   });
 
   it("sweeps personal connection access when the member route suspends a user", async () => {
