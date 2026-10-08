@@ -26,6 +26,7 @@ import {
 import {
   ensureHumanRoleDefaultGrants,
   insertMissingPrincipalGrants,
+  pruneSupersededRoleDefaultGrants,
 } from "./principal-access-compatibility.js";
 
 type MembershipRow = typeof companyMemberships.$inferSelect;
@@ -1143,14 +1144,25 @@ export function accessService(db: Db) {
         .returning()
         .then((rows) => rows[0] ?? existing);
 
-      // A role change must confer the new role's permissions. Grant rows are the only
-      // source of non-`tools:` permissions, so promoting a member without seeding the
-      // new role's defaults leaves them unable to exercise the role they were given.
+      // A role change must both confer the new role's permissions and take back the
+      // old role's. Grant rows are the only source of non-`tools:` permissions, so
+      // without the seed a promoted member cannot exercise the role they were given,
+      // and without the prune a demoted member keeps the owner-only permissions the
+      // demotion just took away -- `users:manage_permissions` among them, which is a
+      // self-escalation path: the demoted member can re-grant themselves what the
+      // demotion removed. The prune runs in this transaction so a failure cannot leave
+      // the membership updated and the grants behind.
       if (
         existing.principalType === "user"
         && nextMembershipRole !== existing.membershipRole
       ) {
-        await insertMissingPrincipalGrants(tx as unknown as Db, {
+        await pruneSupersededRoleDefaultGrants(tx, {
+          companyId,
+          principalId: existing.principalId,
+          previousRole: existing.membershipRole,
+          nextRole: nextMembershipRole,
+        });
+        await insertMissingPrincipalGrants(tx, {
           companyId,
           principalType: "user",
           principalId: existing.principalId,

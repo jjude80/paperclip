@@ -1,4 +1,4 @@
-import { and, eq, notInArray } from "drizzle-orm";
+import { and, eq, inArray, isNull, notInArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, companyMemberships, principalPermissionGrants } from "@paperclipai/db";
 import type { PermissionKey, PrincipalType } from "@paperclipai/shared";
@@ -14,8 +14,16 @@ export type PrincipalAccessCompatibilityBackfillStats = {
   humanGrantsInserted: number;
 };
 
+/**
+ * These helpers only read and write rows; they never open or commit a transaction of
+ * their own. Widening the parameter to just the statement builders lets a
+ * `db.transaction()` handle be passed without a cast, so a call site inside a
+ * transaction cannot silently be handed a non-transactional client.
+ */
+type GrantStore = Pick<Db, "insert" | "select" | "delete">;
+
 export async function insertMissingPrincipalGrants(
-  db: Db,
+  db: GrantStore,
   input: {
     companyId: string;
     principalType: PrincipalType;
@@ -71,6 +79,51 @@ export async function ensureHumanRoleDefaultGrants(
     grants: grantsForHumanRole(role),
     grantedByUserId: input.grantedByUserId,
   });
+}
+
+/**
+ * Role-derived grants are materialized as ordinary grant rows, so a demotion has to
+ * withdraw the ones the previous role contributed. Only rows with no granting human
+ * are considered role-derived: a grant a human made explicitly carries that human's
+ * id and survives a demotion.
+ */
+export async function pruneSupersededRoleDefaultGrants(
+  db: GrantStore,
+  input: {
+    companyId: string;
+    principalId: string;
+    previousRole: string | null | undefined;
+    nextRole: string | null | undefined;
+  },
+): Promise<number> {
+  const previousKeys = new Set(
+    grantsForHumanRole(normalizeHumanRole(input.previousRole, "operator")).map(
+      (grant) => grant.permissionKey,
+    ),
+  );
+  if (previousKeys.size === 0) return 0;
+
+  const nextKeys = new Set(
+    grantsForHumanRole(normalizeHumanRole(input.nextRole, "operator")).map(
+      (grant) => grant.permissionKey,
+    ),
+  );
+  const revokedKeys = [...previousKeys].filter((key) => !nextKeys.has(key));
+  if (revokedKeys.length === 0) return 0;
+
+  return db
+    .delete(principalPermissionGrants)
+    .where(
+      and(
+        eq(principalPermissionGrants.companyId, input.companyId),
+        eq(principalPermissionGrants.principalType, "user"),
+        eq(principalPermissionGrants.principalId, input.principalId),
+        isNull(principalPermissionGrants.grantedByUserId),
+        inArray(principalPermissionGrants.permissionKey, revokedKeys),
+      ),
+    )
+    .returning({ id: principalPermissionGrants.id })
+    .then((rows) => rows.length);
 }
 
 export async function backfillPrincipalAccessCompatibility(
