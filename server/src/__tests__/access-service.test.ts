@@ -239,6 +239,31 @@ describeEmbeddedPostgres("access service", () => {
     }
   });
 
+  it("keeps an explicitly granted permission when a demotion removes the role that implied it", async () => {
+    const { company } = await createCompanyWithOwner(db);
+    const access = accessService(db);
+    const member = await createMember(db, company.id, "operator");
+
+    // A human grants one of the owner-only permissions outside the role. It is not
+    // part of the operator defaults, so only this grant accounts for it.
+    await access.setPrincipalPermission(
+      company.id,
+      "user",
+      member.principalId,
+      "users:manage_permissions",
+      true,
+      `grantor-${randomUUID()}`,
+    );
+
+    await access.updateMember(company.id, member.id, { membershipRole: "owner" });
+    await access.updateMember(company.id, member.id, { membershipRole: "operator" });
+
+    const grants = await grantKeysFor(db, company.id, member.principalId);
+    expect(grants).toContain("users:manage_permissions");
+    // The other owner-only permission had no explicit grant, so the demotion takes it.
+    expect(grants).not.toContain("joins:approve");
+  });
+
   it("does not rewrite agent principal grants, which have no role defaults", async () => {
     const { company } = await createCompanyWithOwner(db);
     const access = accessService(db);
