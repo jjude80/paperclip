@@ -222,6 +222,23 @@ describeEmbeddedPostgres("access service", () => {
     }
   });
 
+  it("revokes the previous role's permissions on demotion through updateMember", async () => {
+    const { company } = await createCompanyWithOwner(db);
+    const access = accessService(db);
+    const member = await createMember(db, company.id, "operator");
+
+    await access.updateMember(company.id, member.id, { membershipRole: "owner" });
+    expect(await grantKeysFor(db, company.id, member.principalId)).toContain("users:manage_permissions");
+
+    await access.updateMember(company.id, member.id, { membershipRole: "operator" });
+
+    const grants = await grantKeysFor(db, company.id, member.principalId);
+    const operatorDefaults = new Set(grantsForHumanRole("operator").map((grant) => grant.permissionKey));
+    for (const permissionKey of grants) {
+      expect(operatorDefaults.has(permissionKey)).toBe(true);
+    }
+  });
+
   it("does not rewrite agent principal grants, which have no role defaults", async () => {
     const { company } = await createCompanyWithOwner(db);
     const access = accessService(db);
