@@ -684,7 +684,6 @@ async function resolveCloudTenantActorOnce(
     companyId,
     principalId: userId,
     membershipRole: effectiveMembership.membershipRole ?? membershipRole,
-    grantedByUserId: null,
   });
   if (shouldSync) {
     cloudTenantWriteDebounce.delete(userId);

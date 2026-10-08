@@ -1216,7 +1216,6 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
       company.id,
       ownerPrincipalId,
       "owner",
-      req.actor.userId ?? null,
     );
     await logActivity(db, {
       companyId: company.id,

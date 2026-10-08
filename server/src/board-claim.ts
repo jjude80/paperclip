@@ -148,7 +148,6 @@ export async function claimBoardOwnership(
       companyId,
       principalId: opts.userId,
       membershipRole: "owner",
-      grantedByUserId: opts.userId,
     });
   }
 

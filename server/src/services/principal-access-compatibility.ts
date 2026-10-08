@@ -1,4 +1,4 @@
-import { and, eq, notInArray } from "drizzle-orm";
+import { and, eq, inArray, isNull, notInArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, companyMemberships, principalPermissionGrants } from "@paperclipai/db";
 import type { PermissionKey, PrincipalType } from "@paperclipai/shared";
@@ -54,13 +54,27 @@ export async function insertMissingPrincipalGrants(
   return inserted.length;
 }
 
+/**
+ * Seed the defaults a membership role implies.
+ *
+ * Role defaults are always recorded with no granting human. That is what makes
+ * `granted_by_user_id IS NULL` a usable provenance signal: it separates a row the
+ * role produced from a permission somebody granted on purpose, and
+ * `pruneSupersededRoleDefaultGrants` depends on the two being distinguishable.
+ *
+ * This parameter is deliberately absent rather than merely ignored. Accepting a
+ * granting human here is what let board-claim, company-create and company-clone
+ * owners seed owner defaults stamped with their own id, which made those rows
+ * indistinguishable from explicit grants and let a later demotion keep
+ * `users:manage_permissions`. Removing it makes that mistake a compile error
+ * instead of a silent escalation path.
+ */
 export async function ensureHumanRoleDefaultGrants(
   db: Db,
   input: {
     companyId: string;
     principalId: string;
     membershipRole: string | null | undefined;
-    grantedByUserId: string | null;
   },
 ): Promise<number> {
   const role = normalizeHumanRole(input.membershipRole, "operator");
@@ -69,8 +83,63 @@ export async function ensureHumanRoleDefaultGrants(
     principalType: "user",
     principalId: input.principalId,
     grants: grantsForHumanRole(role),
-    grantedByUserId: input.grantedByUserId,
+    grantedByUserId: null,
   });
+}
+
+/**
+ * A role change must revoke what the previous role implied, not only confer what
+ * the new one does. Role defaults are materialized as ordinary grant rows, so
+ * seeding the new role without withdrawing the old one leaves the demoted member
+ * holding them -- `users:manage_permissions` among them, which is a
+ * self-escalation primitive: the demoted member can re-grant themselves exactly
+ * what the demotion removed.
+ *
+ * Only rows with no granting human are removed. Role defaults are seeded without
+ * one, so `granted_by_user_id IS NULL` is the provenance signal available in the
+ * current schema; a permission a human granted deliberately carries that human's
+ * id and survives the demotion.
+ *
+ * The residual: rows seeded as role defaults by a caller that recorded a granting
+ * human, and rows whose provenance predates that convention, are not recognized as
+ * role-derived and survive. Closing that needs a provenance column on the table.
+ */
+export async function pruneSupersededRoleDefaultGrants(
+  db: Db,
+  input: {
+    companyId: string;
+    principalId: string;
+    previousMembershipRole: string | null | undefined;
+    nextMembershipRole: string | null | undefined;
+  },
+): Promise<number> {
+  const nextKeys = new Set(
+    grantsForHumanRole(normalizeHumanRole(input.nextMembershipRole, "operator")).map(
+      (grant) => grant.permissionKey,
+    ),
+  );
+  const supersededKeys = grantsForHumanRole(
+    normalizeHumanRole(input.previousMembershipRole, "operator"),
+  )
+    .map((grant) => grant.permissionKey)
+    .filter((permissionKey) => !nextKeys.has(permissionKey));
+
+  if (supersededKeys.length === 0) return 0;
+
+  const removed = await db
+    .delete(principalPermissionGrants)
+    .where(
+      and(
+        eq(principalPermissionGrants.companyId, input.companyId),
+        eq(principalPermissionGrants.principalType, "user"),
+        eq(principalPermissionGrants.principalId, input.principalId),
+        isNull(principalPermissionGrants.grantedByUserId),
+        inArray(principalPermissionGrants.permissionKey, supersededKeys),
+      ),
+    )
+    .returning({ id: principalPermissionGrants.id });
+
+  return removed.length;
 }
 
 export async function backfillPrincipalAccessCompatibility(
@@ -130,7 +199,6 @@ export async function backfillPrincipalAccessCompatibility(
       companyId: membership.companyId,
       principalId: membership.principalId,
       membershipRole: membership.membershipRole,
-      grantedByUserId: null,
     });
   }
 

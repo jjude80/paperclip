@@ -26,7 +26,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { accessService } from "../services/access.js";
 import { grantsForHumanRole } from "../services/company-member-roles.js";
-import { backfillPrincipalAccessCompatibility } from "../services/principal-access-compatibility.js";
+import { backfillPrincipalAccessCompatibility, ensureHumanRoleDefaultGrants } from "../services/principal-access-compatibility.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -237,6 +237,47 @@ describeEmbeddedPostgres("access service", () => {
     for (const permissionKey of grants) {
       expect(operatorDefaults.has(permissionKey)).toBe(true);
     }
+  });
+
+  it("revokes owner defaults for a member who claimed or created the company", async () => {
+    // Board-claim, company-create and company-clone all seed an owner's role
+    // defaults directly. If those rows carry a granting human they look like
+    // explicit grants, and the demotion below cannot tell them apart -- leaving
+    // the escalation path open for exactly the highest-privilege principals.
+    const { company, owner } = await createCompanyWithOwner(db);
+    const access = accessService(db);
+
+    await ensureHumanRoleDefaultGrants(db, {
+      companyId: company.id,
+      principalId: owner.principalId,
+      membershipRole: "owner",
+    });
+
+    const seeded = await db
+      .select({
+        permissionKey: principalPermissionGrants.permissionKey,
+        grantedByUserId: principalPermissionGrants.grantedByUserId,
+      })
+      .from(principalPermissionGrants)
+      .where(
+        and(
+          eq(principalPermissionGrants.companyId, company.id),
+          eq(principalPermissionGrants.principalId, owner.principalId),
+        ),
+      );
+    expect(seeded.length).toBeGreaterThan(0);
+    for (const grant of seeded) {
+      expect(grant.grantedByUserId).toBeNull();
+    }
+
+    // A second owner, so the last-owner guard does not block the demotion.
+    await createMember(db, company.id, "owner");
+
+    await access.updateMember(company.id, owner.id, { membershipRole: "operator" });
+
+    const grants = await grantKeysFor(db, company.id, owner.principalId);
+    expect(grants).not.toContain("users:manage_permissions");
+    expect(grants).not.toContain("joins:approve");
   });
 
   it("keeps an explicitly granted permission when a demotion removes the role that implied it", async () => {

@@ -5336,7 +5336,6 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
           created.id,
           ownerPrincipalId,
           "owner",
-          actorUserId ?? null,
         );
       }
       targetCompany = created;

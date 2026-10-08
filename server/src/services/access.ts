@@ -26,6 +26,7 @@ import {
 import {
   ensureHumanRoleDefaultGrants,
   insertMissingPrincipalGrants,
+  pruneSupersededRoleDefaultGrants,
 } from "./principal-access-compatibility.js";
 
 type MembershipRow = typeof companyMemberships.$inferSelect;
@@ -969,23 +970,23 @@ export function accessService(db: Db) {
         companyId: targetCompanyId,
         principalId: membership.principalId,
         membershipRole: membership.membershipRole,
-        grantedByUserId: null,
       });
     }
     return sourceMemberships;
   }
 
+  // No granting human is accepted here on purpose -- see
+  // ensureHumanRoleDefaultGrants. Role defaults must stay distinguishable from
+  // explicit grants so a demotion can withdraw them.
   async function ensureRoleDefaultGrants(
     companyId: string,
     principalId: string,
     membershipRole: string | null | undefined,
-    grantedByUserId: string | null,
   ) {
     return ensureHumanRoleDefaultGrants(db, {
       companyId,
       principalId,
       membershipRole,
-      grantedByUserId,
     });
   }
 
@@ -1143,13 +1144,21 @@ export function accessService(db: Db) {
         .returning()
         .then((rows) => rows[0] ?? existing);
 
-      // A role change must confer the new role's permissions. Grant rows are the only
-      // source of non-`tools:` permissions, so promoting a member without seeding the
-      // new role's defaults leaves them unable to exercise the role they were given.
+      // A role change has to move the member's permissions in both directions.
+      // Seeding the new role's defaults is the promotion half; without withdrawing
+      // the previous role's, a demoted member keeps them and can use the retained
+      // ones to re-grant themselves what the demotion just removed. Both run in the
+      // membership transaction so a failure leaves no partial role change.
       if (
         existing.principalType === "user"
         && nextMembershipRole !== existing.membershipRole
       ) {
+        await pruneSupersededRoleDefaultGrants(tx as unknown as Db, {
+          companyId,
+          principalId: existing.principalId,
+          previousMembershipRole: existing.membershipRole,
+          nextMembershipRole,
+        });
         await insertMissingPrincipalGrants(tx as unknown as Db, {
           companyId,
           principalType: "user",
