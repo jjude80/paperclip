@@ -31,6 +31,12 @@ export interface PrincipalPermissionGrant {
   permissionKey: PermissionKey;
   scope: Record<string, unknown> | null;
   grantedByUserId: string | null;
+  /**
+   * The membership role that implied this grant, or null when it was granted
+   * deliberately. Null also covers rows written before the column existed, whose
+   * provenance the table cannot recover.
+   */
+  grantedViaRole: string | null;
   createdAt: Date;
   updatedAt: Date;
 }

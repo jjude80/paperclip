@@ -110,6 +110,13 @@ export type CompanyMemberGrant = {
   permissionKey: PermissionKey;
   scope: Record<string, unknown> | null;
   grantedByUserId: string | null;
+  /**
+   * The membership role that implied this grant, or null when it was granted
+   * deliberately. The permissions UI must not present a role-derived grant as
+   * removable: revoking it by hand does not survive the next role change, and
+   * the member silently regains it.
+   */
+  grantedViaRole: string | null;
   createdAt: string;
   updatedAt: string;
 };

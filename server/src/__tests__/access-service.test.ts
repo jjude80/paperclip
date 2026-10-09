@@ -26,7 +26,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { accessService } from "../services/access.js";
 import { grantsForHumanRole } from "../services/company-member-roles.js";
-import { backfillPrincipalAccessCompatibility, ensureHumanRoleDefaultGrants } from "../services/principal-access-compatibility.js";
+import { backfillPrincipalAccessCompatibility, countUndecidableRoleDefaultGrants, ensureHumanRoleDefaultGrants } from "../services/principal-access-compatibility.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -85,6 +85,22 @@ async function grantKeysFor(db: ReturnType<typeof createDb>, companyId: string, 
       ),
     )
     .then((rows) => rows.map((row) => row.permissionKey));
+}
+
+async function grantsFor(db: ReturnType<typeof createDb>, companyId: string, principalId: string) {
+  return db
+    .select({
+      permissionKey: principalPermissionGrants.permissionKey,
+      grantedByUserId: principalPermissionGrants.grantedByUserId,
+      grantedViaRole: principalPermissionGrants.grantedViaRole,
+    })
+    .from(principalPermissionGrants)
+    .where(
+      and(
+        eq(principalPermissionGrants.companyId, companyId),
+        eq(principalPermissionGrants.principalId, principalId),
+      ),
+    );
 }
 
 describeEmbeddedPostgres("access service", () => {
@@ -305,6 +321,143 @@ describeEmbeddedPostgres("access service", () => {
     expect(grants).not.toContain("joins:approve");
   });
 
+  it("records the role that produced a grant rather than inferring it from a null grantor", async () => {
+    const { company } = await createCompanyWithOwner(db);
+    const access = accessService(db);
+    const member = await createMember(db, company.id, "operator");
+
+    await access.updateMember(company.id, member.id, { membershipRole: "owner" });
+
+    const rows = await grantsFor(db, company.id, member.principalId);
+    expect(rows.length).toBeGreaterThan(0);
+    for (const row of rows) {
+      // Every owner default names the role that produced it. This is the fact the
+      // prune reads; the old `granted_by_user_id IS NULL` guess was wrong because
+      // board-claim, company-create and company-clone stamped role defaults with
+      // the owner's own id.
+      expect(row.grantedViaRole).toBe("owner");
+      expect(row.grantedByUserId).toBeNull();
+    }
+
+    await access.setPrincipalPermission(
+      company.id,
+      "user",
+      member.principalId,
+      "tools:admin",
+      true,
+      `grantor-${randomUUID()}`,
+    );
+
+    const explicit = await grantsFor(db, company.id, member.principalId);
+    expect(explicit.find((row) => row.permissionKey === "tools:admin")?.grantedViaRole).toBeNull();
+  });
+
+  it("keeps a grant a human made on purpose even when the same permission is a role default", async () => {
+    // This is the case the old schema could not decide. `users:manage_permissions`
+    // is an owner default, and an owner was also granted it by hand. One row, two
+    // valid readings, and `granted_by_user_id` identical either way.
+    //
+    // The marker resolves it because the writer knows which list a key came from:
+    // supplied by the caller means deliberate, contributed by the role means
+    // derived. The caller's list wins, so a demotion must not revoke it.
+    const { company, owner } = await createCompanyWithOwner(db);
+    const access = accessService(db);
+    const member = await createMember(db, company.id, "owner");
+
+    const grantor = `grantor-${randomUUID()}`;
+    await access.setMemberPermissions(
+      company.id,
+      member.id,
+      // Only this one key is hand-granted. `joins:approve` is left out on
+      // purpose so it arrives only through the owner role and is therefore
+      // role-derived -- the two rows differ solely in provenance.
+      [{ permissionKey: "users:manage_permissions" }],
+      grantor,
+    );
+
+    const beforeDemotion = await grantsFor(db, company.id, member.principalId);
+    // Named by the caller, so recorded as deliberate even though the owner role
+    // implies it too.
+    expect(beforeDemotion.find((r) => r.permissionKey === "users:manage_permissions")?.grantedViaRole)
+      .toBeNull();
+    // Never named by the caller, so recorded as role-derived.
+    const roleDerived = beforeDemotion.filter((row) => row.grantedViaRole === "owner");
+    expect(roleDerived.map((row) => row.permissionKey)).toContain("joins:approve");
+    expect(roleDerived.some((row) => row.permissionKey === "users:manage_permissions")).toBe(false);
+
+    // A second owner, so the last-owner guard does not block the demotion.
+    await createMember(db, company.id, "owner");
+    await access.updateMember(company.id, member.id, { membershipRole: "operator" });
+
+    const grants = await grantKeysFor(db, company.id, member.principalId);
+    // The hand-made grant survives the demotion that removed the role implying it.
+    expect(grants).toContain("users:manage_permissions");
+    // The purely role-derived one is withdrawn -- this is the escalation the
+    // demotion has to close.
+    expect(grants).not.toContain("joins:approve");
+    // Exactly the operator defaults plus that one deliberate grant. Nothing else
+    // leaked through, and nothing the operator role implies was lost.
+    expect(grants.sort()).toEqual(
+      [
+        ...grantsForHumanRole("operator").map((g) => g.permissionKey),
+        "users:manage_permissions",
+      ].sort(),
+    );
+    expect(owner.principalId).toBeTruthy();
+  });
+
+  it("lists the rows whose provenance cannot be recovered so the backfill policy can be chosen from data", async () => {
+    const { company } = await createCompanyWithOwner(db);
+    const access = accessService(db);
+    const member = await createMember(db, company.id, "operator");
+
+    await access.updateMember(company.id, member.id, { membershipRole: "owner" });
+    await access.updateMember(company.id, member.id, { membershipRole: "operator" });
+
+    // Every row now written carries provenance, so nothing is left ambiguous.
+    const report = await countUndecidableRoleDefaultGrants(db);
+    expect(report.rows.some((row) => row.principalId === member.principalId)).toBe(false);
+
+    // A row from before the column existed: no marker, and its key is a current
+    // role default, so both readings are valid and no query can separate them.
+    const staleKey = grantsForHumanRole("operator")[0]!.permissionKey;
+    const legacyPrincipalId = `legacy-${randomUUID()}`;
+    await db.insert(companyMemberships).values({
+      companyId: company.id,
+      principalType: "user",
+      principalId: legacyPrincipalId,
+      status: "active",
+      membershipRole: "operator",
+    });
+    await db.insert(principalPermissionGrants).values({
+      companyId: company.id,
+      principalType: "user",
+      principalId: legacyPrincipalId,
+      permissionKey: staleKey,
+      grantedByUserId: `grantor-${randomUUID()}`,
+      grantedViaRole: null,
+    });
+
+    const after = await countUndecidableRoleDefaultGrants(db);
+    const reported = after.rows.filter((row) => row.principalId === legacyPrincipalId);
+    expect(reported).toHaveLength(1);
+    expect(reported[0]!.permissionKey).toBe(staleKey);
+    expect(after.total).toBe(reported.length);
+
+    // A key that is not a role default was never seeded by anything, so it is
+    // not ambiguous and must not be reported.
+    await db.insert(principalPermissionGrants).values({
+      companyId: company.id,
+      principalType: "user",
+      principalId: legacyPrincipalId,
+      permissionKey: "users:manage_permissions",
+      grantedByUserId: `grantor-${randomUUID()}`,
+      grantedViaRole: null,
+    });
+    const final = await countUndecidableRoleDefaultGrants(db);
+    expect(final.rows.filter((row) => row.principalId === legacyPrincipalId)).toHaveLength(1);
+  });
+
   it("does not rewrite agent principal grants, which have no role defaults", async () => {
     const { company } = await createCompanyWithOwner(db);
     const access = accessService(db);
@@ -327,8 +480,7 @@ describeEmbeddedPostgres("access service", () => {
       null,
     );
 
-    expect(await grantKeysFor(db, company.id, agent.principalId)).toEqual(["tasks:assign"]);
-  });
+    expect(await grantKeysFor(db, company.id, agent.principalId)).toEqual(["tasks:assign"]);  });
 
   it("archives members, clears grants, and reassigns open issues without deleting history", async () => {
     const { company, owner } = await createCompanyWithOwner(db);

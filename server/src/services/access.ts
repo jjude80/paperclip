@@ -460,7 +460,7 @@ export function accessService(db: Db) {
     const member = await getMemberById(companyId, memberId);
     if (!member) return null;
 
-    const effectiveGrants = mergeRoleDefaultGrants({
+    const effective = mergeRoleDefaultGrants({
       principalType: member.principalType,
       membershipRole: member.membershipRole,
       grants,
@@ -476,15 +476,21 @@ export function accessService(db: Db) {
             eq(principalPermissionGrants.principalId, member.principalId),
           ),
         );
-      if (effectiveGrants.length > 0) {
+      if (effective.grants.length > 0) {
         await tx.insert(principalPermissionGrants).values(
-          effectiveGrants.map((grant) => ({
+          effective.grants.map((grant) => ({
             companyId,
             principalType: member.principalType,
             principalId: member.principalId,
             permissionKey: grant.permissionKey,
             scope: grant.scope ?? null,
             grantedByUserId,
+            // Only the keys the caller did not supply came from the role. A key
+            // the caller listed is a deliberate grant even when the role also
+            // implies it, and must survive a later demotion.
+            grantedViaRole: effective.roleDefaultKeys.has(grant.permissionKey)
+              ? normalizeHumanRole(member.membershipRole, "operator")
+              : null,
             createdAt: new Date(),
             updatedAt: new Date(),
           })),
@@ -575,21 +581,28 @@ export function accessService(db: Db) {
             eq(principalPermissionGrants.principalId, existing.principalId),
           ),
         );
-      const effectiveGrants = mergeRoleDefaultGrants({
+      const effective = mergeRoleDefaultGrants({
         principalType: existing.principalType,
         membershipRole: nextMembershipRole,
         grants: data.grants,
       });
 
-      if (effectiveGrants.length > 0) {
+      if (effective.grants.length > 0) {
         await tx.insert(principalPermissionGrants).values(
-          effectiveGrants.map((grant) => ({
+          effective.grants.map((grant) => ({
             companyId,
             principalType: existing.principalType,
             principalId: existing.principalId,
             permissionKey: grant.permissionKey,
             scope: grant.scope ?? null,
             grantedByUserId,
+            // This path replaces every grant row, so it is the one place where
+            // provenance has to be re-derived rather than preserved. Keys the
+            // caller supplied are deliberate; keys the role contributed are
+            // marked with the role so a later demotion can withdraw them.
+            grantedViaRole: effective.roleDefaultKeys.has(grant.permissionKey)
+              ? normalizeHumanRole(nextMembershipRole, "operator")
+              : null,
             createdAt: now,
             updatedAt: now,
           })),
@@ -949,6 +962,10 @@ export function accessService(db: Db) {
           permissionKey: grant.permissionKey,
           scope: grant.scope ?? null,
           grantedByUserId,
+          // Every key here was supplied by the caller. A plugin or an agent
+          // setting a grant is naming it deliberately; nothing about this list is
+          // implied by a role, so nothing is role-derived.
+          grantedViaRole: null,
           createdAt: new Date(),
           updatedAt: new Date(),
         })),
@@ -1052,6 +1069,11 @@ export function accessService(db: Db) {
         .set({
           scope,
           grantedByUserId,
+          // Naming a permission here is a deliberate act, so the row stops being
+          // role-derived even if the role also implies it. Leaving a role marker
+          // on a row somebody just granted by hand would let the next demotion
+          // revoke a grant they made on purpose.
+          grantedViaRole: null,
           updatedAt: new Date(),
         })
         .where(eq(principalPermissionGrants.id, existing.id));
@@ -1065,6 +1087,8 @@ export function accessService(db: Db) {
       permissionKey,
       scope,
       grantedByUserId,
+      // Explicitly enabled, so deliberately granted rather than role-implied.
+      grantedViaRole: null,
       createdAt: new Date(),
       updatedAt: new Date(),
     });
@@ -1165,6 +1189,7 @@ export function accessService(db: Db) {
           principalId: existing.principalId,
           grants: grantsForHumanRole(normalizeHumanRole(nextMembershipRole, "operator")),
           grantedByUserId: null,
+          grantedViaRole: normalizeHumanRole(nextMembershipRole, "operator"),
         });
       }
 

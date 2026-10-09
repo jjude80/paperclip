@@ -1,0 +1,1 @@
+ALTER TABLE "principal_permission_grants" ADD COLUMN "granted_via_role" text;

@@ -11,6 +11,16 @@ export const principalPermissionGrants = pgTable(
     permissionKey: text("permission_key").notNull(),
     scope: jsonb("scope").$type<Record<string, unknown> | null>(),
     grantedByUserId: text("granted_by_user_id"),
+    // Provenance. Non-null means this row exists because a human membership role
+    // implied it; the value is that role. Null means either a human granted it
+    // deliberately or the row predates this column.
+    //
+    // This is recorded, never inferred. `granted_by_user_id` cannot carry the
+    // signal: three seeding paths (board-claim, company-create, company-clone)
+    // wrote role defaults stamped with the owner's own id, so a role default and
+    // an explicit grant were indistinguishable and a demotion could not tell
+    // which rows to withdraw. See pruneSupersededRoleDefaultGrants.
+    grantedViaRole: text("granted_via_role"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },

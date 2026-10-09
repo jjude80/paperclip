@@ -122,9 +122,11 @@ export { inboxDismissalService } from "./inbox-dismissals.js";
 export { accessService } from "./access.js";
 export {
   backfillPrincipalAccessCompatibility,
+  countUndecidableRoleDefaultGrants,
   ensureHumanRoleDefaultGrants,
   insertMissingPrincipalGrants,
   type PrincipalAccessCompatibilityBackfillStats,
+  type UndecidableRoleDefaultGrant,
 } from "./principal-access-compatibility.js";
 export { authorizationService } from "./authorization.js";
 export { inboxAgentPolicyService } from "./inbox-agent-policy.js";

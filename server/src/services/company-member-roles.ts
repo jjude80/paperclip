@@ -81,6 +81,21 @@ type RoleGrant = {
   scope?: Record<string, unknown> | null;
 };
 
+export type RoleDefaultMerge<T extends RoleGrant> = {
+  /** Every grant to persist, role defaults included. */
+  grants: T[];
+  /**
+   * Permission keys this function appended because the role implies them, as
+   * opposed to keys the caller supplied.
+   *
+   * The caller needs the distinction to record provenance. A permission the
+   * caller supplied was granted deliberately and must survive a later demotion;
+   * one appended here exists only because of the role and must be withdrawn when
+   * the role no longer implies it.
+   */
+  roleDefaultKeys: Set<string>;
+};
+
 /**
  * Role-derived permissions are materialized as ordinary grant rows, so any writer
  * that replaces a principal's grants must re-apply the role defaults or it will
@@ -88,25 +103,37 @@ type RoleGrant = {
  * add to the role defaults, never remove them.
  *
  * Agent principals have no role defaults: their grants are set explicitly.
+ *
+ * A key present in both `grants` and the role defaults counts as supplied, not
+ * role-default. The caller's list is the statement of what somebody meant to
+ * hold, so it wins: marking that row role-derived would let a demotion silently
+ * revoke a grant a person made on purpose.
  */
 export function mergeRoleDefaultGrants<T extends RoleGrant>(input: {
   principalType: string;
   membershipRole: string | null | undefined;
   grants: T[];
-}): T[] {
-  if (input.principalType !== "user") return input.grants;
+}): RoleDefaultMerge<T> {
+  const supplied = [...input.grants];
+  if (input.principalType !== "user") {
+    return { grants: supplied, roleDefaultKeys: new Set() };
+  }
 
   const defaults = grantsForHumanRole(normalizeHumanRole(input.membershipRole, "operator"));
-  if (defaults.length === 0) return input.grants;
+  if (defaults.length === 0) {
+    return { grants: supplied, roleDefaultKeys: new Set() };
+  }
 
-  const merged = [...input.grants];
-  const seen = new Set(input.grants.map((grant) => grant.permissionKey));
+  const merged = [...supplied];
+  const roleDefaultKeys = new Set<string>();
+  const seen = new Set(supplied.map((grant) => grant.permissionKey));
   for (const roleGrant of defaults) {
     if (seen.has(roleGrant.permissionKey)) continue;
     seen.add(roleGrant.permissionKey);
+    roleDefaultKeys.add(roleGrant.permissionKey);
     merged.push({ permissionKey: roleGrant.permissionKey, scope: roleGrant.scope } as T);
   }
-  return merged;
+  return { grants: merged, roleDefaultKeys };
 }
 
 export function resolveHumanInviteRole(
