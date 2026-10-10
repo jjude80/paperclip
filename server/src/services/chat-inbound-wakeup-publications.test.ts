@@ -59,6 +59,8 @@ function fixture() {
     runId: null,
     requestedByActorType: "user",
     requestedByActorId: "owner",
+    actorAuthSource: "session",
+    peerAddress: "127.0.0.1",
     idempotencyKey: trusted.idempotencyKey,
     coalescedCount: 0,
     requestedAt: new Date(),

@@ -6334,6 +6334,12 @@ export function agentRoutes(
         ),
       );
     }
+    const peerAddress = ((): string | null => {
+      const forwarded = req.headers["x-forwarded-for"];
+      if (typeof forwarded === "string") return forwarded.split(",")[0].trim();
+      if (Array.isArray(forwarded) && forwarded.length > 0) return forwarded[0].trim();
+      return req.ip ?? null;
+    })();
     const run = await heartbeat.wakeup(id, {
       failedRunId: req.body.failedRunId ?? null,
       ...(req.actor.type === "board" && !req.body.failedRunId ? { manualUserWake: true } : {}),
@@ -6346,6 +6352,8 @@ export function agentRoutes(
       idempotencyKey: req.body.idempotencyKey ?? null,
       requestedByActorType: req.actor.type === "agent" ? "agent" : "user",
       requestedByActorId: req.actor.type === "agent" ? req.actor.agentId ?? null : req.actor.userId ?? null,
+      actorAuthSource: req.actor.source,
+      peerAddress,
       contextSnapshot: {
         ...retryConversationContext,
         // Only the selected server-owned run can carry review authority into
@@ -6473,12 +6481,20 @@ export function agentRoutes(
         contextSnapshot.resumeIntent = true;
       }
     }
+    const peerAddress = ((): string | null => {
+      const forwarded = req.headers["x-forwarded-for"];
+      if (typeof forwarded === "string") return forwarded.split(",")[0].trim();
+      if (Array.isArray(forwarded) && forwarded.length > 0) return forwarded[0].trim();
+      return req.ip ?? null;
+    })();
     const wakeOpts: Parameters<typeof heartbeat.wakeup>[1] = {
       ...(req.actor.type === "board" ? { manualUserWake: true } : {}),
       source: "on_demand",
       triggerDetail: typeof body.triggerDetail === "string" ? body.triggerDetail as "manual" | "system" | "ping" | "callback" : "manual",
       requestedByActorType: req.actor.type === "agent" ? "agent" : "user",
       requestedByActorId: req.actor.type === "agent" ? req.actor.agentId ?? null : req.actor.userId ?? null,
+      actorAuthSource: req.actor.source,
+      peerAddress,
       contextSnapshot,
     };
     if (typeof body.reason === "string" && body.reason.length > 0) {

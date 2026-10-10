@@ -3781,6 +3781,8 @@ interface WakeupOptions {
   idempotencyKey?: string | null;
   requestedByActorType?: "user" | "agent" | "system";
   requestedByActorId?: string | null;
+  actorAuthSource?: string;
+  peerAddress?: string | null;
   contextSnapshot?: Record<string, unknown>;
   issueStateGuard?: {
     statuses: string[];
@@ -27300,6 +27302,8 @@ export function heartbeatService(
         status: "skipped",
         requestedByActorType: opts.requestedByActorType ?? null,
         requestedByActorId: opts.requestedByActorId ?? null,
+        actorAuthSource: opts.actorAuthSource ?? null,
+        peerAddress: opts.peerAddress ?? null,
         idempotencyKey: opts.idempotencyKey ?? null,
         finishedAt: new Date(),
         ...patch,
@@ -27781,6 +27785,8 @@ export function heartbeatService(
                   status: "skipped",
                   requestedByActorType: "system",
                   requestedByActorId: opts.requestedByActorId ?? null,
+                  actorAuthSource: opts.actorAuthSource ?? null,
+                  peerAddress: opts.peerAddress ?? null,
                   idempotencyKey: opts.idempotencyKey ?? null,
                   finishedAt: new Date(),
                 });
@@ -27908,6 +27914,8 @@ export function heartbeatService(
               status: "skipped",
               requestedByActorType: opts.requestedByActorType ?? null,
               requestedByActorId: opts.requestedByActorId ?? null,
+              actorAuthSource: opts.actorAuthSource ?? null,
+              peerAddress: opts.peerAddress ?? null,
               idempotencyKey: opts.idempotencyKey ?? null,
               finishedAt: new Date(),
             });
@@ -27956,6 +27964,8 @@ export function heartbeatService(
               status: "skipped",
               requestedByActorType: opts.requestedByActorType ?? null,
               requestedByActorId: opts.requestedByActorId ?? null,
+              actorAuthSource: opts.actorAuthSource ?? null,
+              peerAddress: opts.peerAddress ?? null,
               idempotencyKey: opts.idempotencyKey ?? null,
               finishedAt: new Date(),
             });
@@ -28120,6 +28130,8 @@ export function heartbeatService(
                 status: "deferred_issue_execution",
                 requestedByActorType: opts.requestedByActorType ?? null,
                 requestedByActorId: opts.requestedByActorId ?? null,
+                actorAuthSource: opts.actorAuthSource ?? null,
+                peerAddress: opts.peerAddress ?? null,
                 idempotencyKey: opts.idempotencyKey ?? null,
               });
             } else {
@@ -28133,6 +28145,8 @@ export function heartbeatService(
                   payload,
                   requestedByActorType: opts.requestedByActorType ?? null,
                   requestedByActorId: opts.requestedByActorId ?? null,
+                  actorAuthSource: opts.actorAuthSource ?? null,
+                  peerAddress: opts.peerAddress ?? null,
                   idempotencyKey: opts.idempotencyKey ?? null,
                 },
               });
@@ -28183,6 +28197,8 @@ export function heartbeatService(
               status: "skipped",
               requestedByActorType: opts.requestedByActorType ?? null,
               requestedByActorId: opts.requestedByActorId ?? null,
+              actorAuthSource: opts.actorAuthSource ?? null,
+              peerAddress: opts.peerAddress ?? null,
               idempotencyKey: opts.idempotencyKey ?? null,
               finishedAt: new Date(),
             });
@@ -28494,6 +28510,8 @@ export function heartbeatService(
                 status: "skipped",
                 requestedByActorType: opts.requestedByActorType ?? null,
                 requestedByActorId: opts.requestedByActorId ?? null,
+                actorAuthSource: opts.actorAuthSource ?? null,
+                peerAddress: opts.peerAddress ?? null,
                 idempotencyKey: opts.idempotencyKey ?? null,
                 finishedAt: new Date(),
               },
@@ -28615,6 +28633,8 @@ export function heartbeatService(
                 status: "skipped",
                 requestedByActorType: opts.requestedByActorType ?? null,
                 requestedByActorId: opts.requestedByActorId ?? null,
+                actorAuthSource: opts.actorAuthSource ?? null,
+                peerAddress: opts.peerAddress ?? null,
                 idempotencyKey: opts.idempotencyKey ?? null,
                 finishedAt: now,
               });
@@ -28826,6 +28846,8 @@ export function heartbeatService(
                   status: "skipped",
                   requestedByActorType: opts.requestedByActorType ?? null,
                   requestedByActorId: opts.requestedByActorId ?? null,
+                  actorAuthSource: opts.actorAuthSource ?? null,
+                  peerAddress: opts.peerAddress ?? null,
                   idempotencyKey: opts.idempotencyKey ?? null,
                   finishedAt: throttleNow,
                 });
@@ -28866,6 +28888,8 @@ export function heartbeatService(
               status: "skipped",
               requestedByActorType: opts.requestedByActorType ?? null,
               requestedByActorId: opts.requestedByActorId ?? null,
+              actorAuthSource: opts.actorAuthSource ?? null,
+              peerAddress: opts.peerAddress ?? null,
               idempotencyKey: opts.idempotencyKey ?? null,
               finishedAt: now,
             });
@@ -28909,6 +28933,8 @@ export function heartbeatService(
               status: "queued",
               requestedByActorType: opts.requestedByActorType ?? null,
               requestedByActorId: opts.requestedByActorId ?? null,
+              actorAuthSource: opts.actorAuthSource ?? null,
+              peerAddress: opts.peerAddress ?? null,
               idempotencyKey: opts.idempotencyKey ?? null,
             })
             .returning()
@@ -29183,6 +29209,8 @@ export function heartbeatService(
         coalescedCount: 1,
         requestedByActorType: opts.requestedByActorType ?? null,
         requestedByActorId: opts.requestedByActorId ?? null,
+        actorAuthSource: opts.actorAuthSource ?? null,
+        peerAddress: opts.peerAddress ?? null,
         idempotencyKey: opts.idempotencyKey ?? null,
         runId: mergedRun.id,
         finishedAt: new Date(),
@@ -29194,6 +29222,34 @@ export function heartbeatService(
       await tx.execute(
         sql`select id from agents where id = ${agentId} and company_id = ${agent.companyId} for update`,
       );
+
+      // If an idempotencyKey is provided for a non-issue-scoped wake, check for
+      // an existing non-skipped wakeup request with the same key and coalesce to it.
+      // This must be inside the transaction to avoid races between concurrent callers.
+      if (opts.idempotencyKey && !issueId) {
+        const [existingWake] = await tx
+          .select({ runId: agentWakeupRequests.runId })
+          .from(agentWakeupRequests)
+          .where(
+            and(
+              eq(agentWakeupRequests.companyId, agent.companyId),
+              eq(agentWakeupRequests.agentId, agentId),
+              eq(agentWakeupRequests.idempotencyKey, opts.idempotencyKey),
+              ne(agentWakeupRequests.status, "skipped"),
+              isNotNull(agentWakeupRequests.runId),
+            ),
+          )
+          .orderBy(asc(agentWakeupRequests.requestedAt))
+          .limit(1);
+        if (existingWake?.runId) {
+          const [run] = await tx
+            .select()
+            .from(heartbeatRuns)
+            .where(eq(heartbeatRuns.id, existingWake.runId))
+            .limit(1);
+          if (run) return { kind: "coalesced" as const, run };
+        }
+      }
 
       const dailyCapBlock = await getHeartbeatDailyCapBlock(
         agent,
@@ -29250,6 +29306,8 @@ export function heartbeatService(
           status: "queued",
           requestedByActorType: opts.requestedByActorType ?? null,
           requestedByActorId: opts.requestedByActorId ?? null,
+          actorAuthSource: opts.actorAuthSource ?? null,
+          peerAddress: opts.peerAddress ?? null,
           idempotencyKey: opts.idempotencyKey ?? null,
         })
         .returning()
