@@ -35,6 +35,7 @@ import { ApiError } from "../api/client";
 import { queryKeys } from "../lib/queryKeys";
 import { agentRouteRef } from "../lib/utils";
 import { copyTextToClipboard } from "../lib/clipboard";
+import { createUuid } from "../lib/uuid";
 import { useDialogActions } from "../context/DialogContext";
 import { useToastActions } from "../context/ToastContext";
 import {
@@ -223,6 +224,13 @@ export function AgentActionButtons({
   const beforeNavigateRef = useRef(onBeforeNavigate);
   const agentActionStartedDirtyRef = useRef(false);
   const duplicateStartedDirtyRef = useRef(false);
+  // One idempotency key per in-flight invoke action, per control. Presses that
+  // land while an invoke is still unresolved reuse the key so the server
+  // coalesces them into a single run. A failed request keeps its key so an
+  // immediate retry coalesces instead of duplicating the wake; only a settled
+  // success retires the key, so the next deliberate press starts a new run.
+  const invokeIdempotencyKeyRef = useRef<string | null>(null);
+  const providerTraceIdempotencyKeyRef = useRef<string | null>(null);
   pendingNavigationChangesRef.current = hasPendingNavigationChanges;
   beforeNavigateRef.current = onBeforeNavigate;
 
@@ -270,13 +278,23 @@ export function AgentActionButtons({
   const agentAction = useMutation({
     mutationFn: async (action: "invoke" | "pause" | "resume" | "clear_error" | "approve" | "terminate") => {
       switch (action) {
-        case "invoke": return agentsApi.invoke(agent.id, resolvedCompanyId ?? undefined);
+        case "invoke": {
+          invokeIdempotencyKeyRef.current ??= createUuid();
+          return agentsApi.invoke(agent.id, resolvedCompanyId ?? undefined, {
+            idempotencyKey: invokeIdempotencyKeyRef.current,
+          });
+        }
         case "pause": return agentsApi.pause(agent.id, resolvedCompanyId ?? undefined);
         case "resume": return agentsApi.resume(agent.id, resolvedCompanyId ?? undefined);
         case "clear_error": return agentsApi.clearError(agent.id, resolvedCompanyId ?? undefined);
         case "approve": return agentsApi.approve(agent.id, resolvedCompanyId ?? undefined);
         case "terminate": return agentsApi.terminate(agent.id, resolvedCompanyId ?? undefined);
       }
+    },
+    onSettled: (data, error, action) => {
+      // Retire the key only on a settled success. A failure keeps it so the
+      // next press is a retry of the same action and coalesces server-side.
+      if (action === "invoke" && !error) invokeIdempotencyKeyRef.current = null;
     },
     onSuccess: (data, action) => {
       onActionError?.(null);
@@ -296,10 +314,16 @@ export function AgentActionButtons({
   });
 
   const providerTraceAction = useMutation({
-    mutationFn: () =>
-      agentsApi.invoke(agent.id, resolvedCompanyId ?? undefined, {
+    mutationFn: () => {
+      providerTraceIdempotencyKeyRef.current ??= createUuid();
+      return agentsApi.invoke(agent.id, resolvedCompanyId ?? undefined, {
+        idempotencyKey: providerTraceIdempotencyKeyRef.current,
         debug: { providerTrace: "raw" },
-      }),
+      });
+    },
+    onSettled: (_data, error) => {
+      if (!error) providerTraceIdempotencyKeyRef.current = null;
+    },
     onSuccess: (run) => {
       onActionError?.(null);
       invalidateAgent();

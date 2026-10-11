@@ -44,6 +44,8 @@ vi.mock("../api/agents", () => ({
   agentsApi: mockAgentsApi,
 }));
 
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -192,9 +194,111 @@ describe("AgentActionButtons", () => {
     await flushReact();
 
     expect(mockAgentsApi.invoke).toHaveBeenCalledWith("agent-1", "company-1", {
+      idempotencyKey: expect.stringMatching(UUID_PATTERN),
       debug: { providerTrace: "raw" },
     });
     expect(mockNavigate).toHaveBeenCalledWith("/agents/alpha/runs/run-1");
+  });
+
+  it("sends one idempotency key for two presses of Run now so they produce one run", async () => {
+    render(makeAgent());
+    await flushReact();
+
+    const runButton = Array.from(container.querySelectorAll("button")).find(
+      (button) => button.textContent?.includes("Run Heartbeat"),
+    );
+    expect(runButton).toBeTruthy();
+
+    // Two presses inside one act both reach the mutation before the pending
+    // state can disable the control - the duplicate-wakeup race from NEXA-180.
+    await act(async () => {
+      runButton?.click();
+      runButton?.click();
+    });
+    await flushReact();
+
+    expect(mockAgentsApi.invoke).toHaveBeenCalledTimes(2);
+    const [firstCall, secondCall] = mockAgentsApi.invoke.mock.calls;
+    expect(firstCall?.[2]?.idempotencyKey).toMatch(UUID_PATTERN);
+    // The same key coalesces both requests into one run server-side.
+    expect(secondCall?.[2]?.idempotencyKey).toBe(firstCall?.[2]?.idempotencyKey);
+  });
+
+  it("mints a fresh idempotency key for a later deliberate Run now press", async () => {
+    render(makeAgent());
+    await flushReact();
+
+    const runButton = Array.from(container.querySelectorAll("button")).find(
+      (button) => button.textContent?.includes("Run Heartbeat"),
+    );
+    expect(runButton).toBeTruthy();
+
+    await act(async () => {
+      runButton?.click();
+    });
+    await flushReact();
+
+    await act(async () => {
+      runButton?.click();
+    });
+    await flushReact();
+
+    expect(mockAgentsApi.invoke).toHaveBeenCalledTimes(2);
+    const [firstCall, secondCall] = mockAgentsApi.invoke.mock.calls;
+    expect(firstCall?.[2]?.idempotencyKey).toMatch(UUID_PATTERN);
+    expect(secondCall?.[2]?.idempotencyKey).toMatch(UUID_PATTERN);
+    expect(secondCall?.[2]?.idempotencyKey).not.toBe(firstCall?.[2]?.idempotencyKey);
+  });
+
+  it("reuses the idempotency key when a failed Run now press is retried", async () => {
+    mockAgentsApi.invoke.mockRejectedValueOnce(new Error("Network unavailable"));
+    render(makeAgent());
+    await flushReact();
+
+    const runButton = Array.from(container.querySelectorAll("button")).find(
+      (button) => button.textContent?.includes("Run Heartbeat"),
+    );
+    expect(runButton).toBeTruthy();
+
+    await act(async () => {
+      runButton?.click();
+    });
+    await flushReact();
+    expect(mockPushToast).toHaveBeenCalledWith(
+      expect.objectContaining({ title: "Action failed" }),
+    );
+
+    await act(async () => {
+      runButton?.click();
+    });
+    await flushReact();
+
+    expect(mockAgentsApi.invoke).toHaveBeenCalledTimes(2);
+    const [firstCall, secondCall] = mockAgentsApi.invoke.mock.calls;
+    expect(firstCall?.[2]?.idempotencyKey).toMatch(UUID_PATTERN);
+    expect(secondCall?.[2]?.idempotencyKey).toBe(firstCall?.[2]?.idempotencyKey);
+  });
+
+  it("sends one idempotency key for two presses of the provider trace control", async () => {
+    render(makeAgent(), { canRunWithProviderTrace: true });
+    await flushReact();
+
+    const traceButton = Array.from(container.querySelectorAll("button")).find(
+      (button) => button.textContent?.includes("Run with provider trace"),
+    );
+    expect(traceButton).toBeTruthy();
+
+    await act(async () => {
+      traceButton?.click();
+      traceButton?.click();
+    });
+    await flushReact();
+
+    expect(mockAgentsApi.invoke).toHaveBeenCalledTimes(2);
+    const [firstCall, secondCall] = mockAgentsApi.invoke.mock.calls;
+    expect(firstCall?.[2]?.debug).toEqual({ providerTrace: "raw" });
+    expect(firstCall?.[2]?.idempotencyKey).toMatch(UUID_PATTERN);
+    expect(secondCall?.[2]?.idempotencyKey).toBe(firstCall?.[2]?.idempotencyKey);
   });
 
   it("calls the terminate success handler after terminating an agent", async () => {
