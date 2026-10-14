@@ -1723,7 +1723,7 @@ describe("agent issue mutation checkout ownership", () => {
     });
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
-    expect(res.body.error).toBe("Agents may only name themselves as an unblock owner");
+    expect(res.body.error).toBe("Agents may only name themselves as an unblock owner; use a comment to hand off to another team member");
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
@@ -1738,7 +1738,7 @@ describe("agent issue mutation checkout ownership", () => {
     });
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
-    expect(res.body.error).toBe("Agents may only name themselves as an unblock owner");
+    expect(res.body.error).toBe("Agents may only name themselves as an unblock owner; use a comment to hand off to another team member");
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 

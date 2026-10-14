@@ -13783,7 +13783,7 @@ export function issueRoutes(
           (owner === "board" || "userId" in owner)
         ) {
           throw forbidden(
-            "Agents may only name themselves as an unblock owner",
+            "Agents may only name themselves as an unblock owner; use a comment to hand off to another team member",
           );
         }
         if (owner !== "board" && "agentId" in owner) {
@@ -13807,7 +13807,7 @@ export function issueRoutes(
             req.actor.agentId !== owner.agentId
           ) {
             throw forbidden(
-              "Agents may only name themselves as an unblock owner",
+              "Agents may only name themselves as an unblock owner; use a comment to hand off to another team member",
             );
           }
         } else if (owner !== "board" && "userId" in owner) {
