@@ -1818,6 +1818,7 @@ describe("effective run execution workspace config freshness", () => {
       requestedExecutionWorkspaceId: "workspace-old",
       requestedShouldReuseExisting: true,
       existingExecutionWorkspaceAvailable: false,
+      conflictingWorkspaceOwnerIssueId: null,
     });
 
     const metadata = buildWorkspaceConfigMetadata();
@@ -1872,6 +1873,7 @@ describe("effective run execution workspace config freshness", () => {
         requestedExecutionWorkspaceId: "workspace-old",
         requestedShouldReuseExisting: false,
         existingExecutionWorkspaceAvailable: false,
+        conflictingWorkspaceOwnerIssueId: null,
       });
 
       const metadata = buildWorkspaceConfigMetadata();
@@ -1910,6 +1912,74 @@ describe("effective run execution workspace config freshness", () => {
       requestedExecutionWorkspaceId: "workspace-old",
       requestedShouldReuseExisting: true,
       existingExecutionWorkspaceAvailable: true,
+      conflictingWorkspaceOwnerIssueId: null,
+    });
+  });
+
+  // NEXA-424: an isolated workspace is one issue's worktree. A second issue
+  // that points at it is refused, and the refusal names the holder.
+  it("refuses to reuse another issue's isolated workspace and names the holder", () => {
+    expect(resolveExecutionWorkspaceReuseRequestForIssue({
+      issueExecutionWorkspaceId: "workspace-parent",
+      issueExecutionWorkspacePreference: "reuse_existing",
+      existingExecutionWorkspaceStatus: "active",
+      issueId: "issue-child",
+      existingExecutionWorkspaceMode: "isolated_workspace",
+      existingExecutionWorkspaceSourceIssueId: "issue-parent",
+    })).toEqual({
+      requestedExecutionWorkspaceId: "workspace-parent",
+      requestedShouldReuseExisting: false,
+      existingExecutionWorkspaceAvailable: false,
+      conflictingWorkspaceOwnerIssueId: "issue-parent",
+    });
+  });
+
+  it("reuses an issue's own isolated workspace", () => {
+    expect(resolveExecutionWorkspaceReuseRequestForIssue({
+      issueExecutionWorkspaceId: "workspace-own",
+      issueExecutionWorkspacePreference: "reuse_existing",
+      existingExecutionWorkspaceStatus: "active",
+      issueId: "issue-parent",
+      existingExecutionWorkspaceMode: "isolated_workspace",
+      existingExecutionWorkspaceSourceIssueId: "issue-parent",
+    })).toEqual({
+      requestedExecutionWorkspaceId: "workspace-own",
+      requestedShouldReuseExisting: true,
+      existingExecutionWorkspaceAvailable: true,
+      conflictingWorkspaceOwnerIssueId: null,
+    });
+  });
+
+  it("still reuses another issue's shared workspace, which is shared by design", () => {
+    expect(resolveExecutionWorkspaceReuseRequestForIssue({
+      issueExecutionWorkspaceId: "workspace-shared",
+      issueExecutionWorkspacePreference: "reuse_existing",
+      existingExecutionWorkspaceStatus: "active",
+      issueId: "issue-child",
+      existingExecutionWorkspaceMode: "shared_workspace",
+      existingExecutionWorkspaceSourceIssueId: "issue-parent",
+    })).toEqual({
+      requestedExecutionWorkspaceId: "workspace-shared",
+      requestedShouldReuseExisting: true,
+      existingExecutionWorkspaceAvailable: true,
+      conflictingWorkspaceOwnerIssueId: null,
+    });
+  });
+
+  it("restores the workspace a recovered run was already dispatched into", () => {
+    expect(resolveExecutionWorkspaceReuseRequestForIssue({
+      issueExecutionWorkspaceId: "workspace-parent",
+      issueExecutionWorkspacePreference: "reuse_existing",
+      existingExecutionWorkspaceStatus: "active",
+      issueId: "issue-child",
+      existingExecutionWorkspaceMode: "isolated_workspace",
+      existingExecutionWorkspaceSourceIssueId: "issue-parent",
+      allowForeignIsolatedWorkspaceReuse: true,
+    })).toEqual({
+      requestedExecutionWorkspaceId: "workspace-parent",
+      requestedShouldReuseExisting: true,
+      existingExecutionWorkspaceAvailable: true,
+      conflictingWorkspaceOwnerIssueId: null,
     });
   });
 
