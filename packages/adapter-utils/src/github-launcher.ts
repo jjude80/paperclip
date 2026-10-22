@@ -17,6 +17,60 @@ if (!['git', 'gh'].includes(program) || !executable) {
   process.stderr.write('Paperclip: requested GitHub command is not installed.\n');
   process.exit(127);
 }
+// Git commands that never contact a remote and never create a commit object.
+// A managed credential is not needed for these, and asking the broker for one
+// on every call made local-only work (status checks, hooks, test suites) cost
+// a round trip per command. That was slow enough to time out the gates that
+// depend on it, which turned a green suite red for a reason unrelated to the
+// change under test.
+const LOCAL_ONLY_GIT_COMMANDS = new Set([
+  'add', 'annotate', 'apply', 'blame', 'branch', 'cat-file', 'check-attr', 'check-ignore',
+  'check-mailmap', 'check-ref-format', 'cherry', 'clean', 'column', 'checkout', 'config',
+  'describe', 'diff', 'diff-files', 'diff-index', 'diff-tree', 'fast-export', 'for-each-ref',
+  'fsck', 'gc',
+  'grep', 'hash-object', 'init', 'interpret-trailers', 'log', 'ls-files', 'ls-tree', 'merge-base',
+  'merge-file', 'merge-tree', 'mktree', 'mktag', 'name-rev', 'pack-objects', 'prune',
+  'prune-packed', 'range-diff', 'read-tree', 'reflog', 'replace', 'rerere', 'reset', 'restore',
+  'rev-list', 'rev-parse', 'rm', 'shortlog', 'show', 'show-branch', 'show-ref',
+  'sparse-checkout', 'stage', 'status', 'switch', 'symbolic-ref', 'unpack-file',
+  'unpack-objects', 'update-index', 'update-ref', 'update-server-info', 'var', 'verify-commit',
+  'verify-pack', 'verify-tag', 'whatchanged', 'worktree', 'write-tree',
+]);
+// Global options that consume the next argument, so the subcommand is not the
+// first bare word on the command line.
+const GIT_GLOBAL_OPTIONS_WITH_VALUE = new Set([
+  '-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--super-prefix',
+  '--config-env',
+]);
+function gitSubcommandIndex(argv) {
+  for (let index = 0; index < argv.length; index += 1) {
+    const argument = argv[index];
+    if (argument === '--') return -1;
+    if (argument.startsWith('-')) {
+      const name = argument.includes('=') ? argument.slice(0, argument.indexOf('=')) : argument;
+      if (!argument.includes('=') && GIT_GLOBAL_OPTIONS_WITH_VALUE.has(name)) index += 1;
+      continue;
+    }
+    return index;
+  }
+  return -1;
+}
+function isLocalOnlyGitInvocation(argv) {
+  const index = gitSubcommandIndex(argv);
+  if (index < 0) return false;
+  const command = argv[index];
+  if (command === 'remote') {
+    // 'git remote' only reads configuration, but 'remote update' and
+    // 'remote prune' contact the remote.
+    const subcommand = argv.slice(index + 1).find((value) => !value.startsWith('-'));
+    return subcommand === undefined || subcommand === 'show' || subcommand === 'get-url';
+  }
+  if (command === 'archive') {
+    // 'git archive --remote' reads a remote repository.
+    return !argv.some((value) => value === '--remote' || value.startsWith('--remote='));
+  }
+  return LOCAL_ONLY_GIT_COMMANDS.has(command);
+}
 async function main() {
   let env = { ...process.env };
   const diagnostic = (code) => process.stderr.write('Paperclip: GitHub ' + code + '; continuing without managed credentials.\n');
@@ -49,6 +103,13 @@ async function main() {
       GIT_CONFIG_KEY_3: 'core.askPass', GIT_CONFIG_VALUE_3: '',
       GIT_CONFIG_KEY_4: 'user.useConfigOnly', GIT_CONFIG_VALUE_4: 'true',
     });
+    // A local-only Git command never reaches the remote, so it skips the
+    // managed credential round trip instead of paying for it on every call.
+    // Commands that create commits keep it: the broker is what supplies the
+    // managed identity that commits are attributed to.
+    const needsManagedCredentials =
+      program !== 'git' || !isLocalOnlyGitInvocation(process.argv.slice(2));
+    if (needsManagedCredentials) {
     const base = env.PAPERCLIP_GITHUB_BROKER_URL || env.PAPERCLIP_API_URL;
     try {
     let response;
@@ -98,6 +159,7 @@ async function main() {
       }
     } else { diagnostic('capability_missing'); }
     } catch { diagnostic('broker_transport_unavailable'); }
+    }
   }
   // Only this invocation and its children inherit the captured credential.
   // Its Git children use the real binary, so steering cannot split a gh operation.
