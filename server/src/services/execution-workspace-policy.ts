@@ -449,6 +449,32 @@ export function resolveExecutionWorkspaceStrategyConfig(input: {
   return config;
 }
 
+export function resolveExecutionWorkspaceReuseWorkspaceId(input: {
+  reusableWorkspaceId: string | null | undefined;
+  requestedWorkspaceId: string | null | undefined;
+  conflictingWorkspaceOwnerIssueId: string | null | undefined;
+}): string | null {
+  if (input.reusableWorkspaceId) return input.reusableWorkspaceId;
+  if (input.conflictingWorkspaceOwnerIssueId) return null;
+  return input.requestedWorkspaceId ?? null;
+}
+
+export function resolveExecutionWorkspaceConflictNotice(input: {
+  conflictingWorkspaceOwnerIssueId: string | null | undefined;
+  executionWorkspacePreference: string | null | undefined;
+  requestedExecutionWorkspaceId: string | null | undefined;
+  executionWorkspaceId: string | null | undefined;
+}): { shouldNotify: boolean; ownerIssueId: string | null; marker: string } {
+  const ownerIssueId = input.conflictingWorkspaceOwnerIssueId ?? null;
+  const marker = `workspace_conflict:${input.executionWorkspaceId ?? "none"}`;
+  const shouldNotify = Boolean(
+    ownerIssueId &&
+      input.executionWorkspacePreference === "reuse_existing" &&
+      input.requestedExecutionWorkspaceId,
+  );
+  return { shouldNotify, ownerIssueId, marker };
+}
+
 export function resolveExecutionWorkspaceMode(input: {
   projectPolicy: ProjectExecutionWorkspacePolicy | null;
   issueSettings: IssueExecutionWorkspaceSettings | null;

@@ -48,7 +48,7 @@ import {
   type ResolvedWorkspaceForRun,
 } from "../services/heartbeat.ts";
 import { stripHostWorkspaceProvision } from "../services/heartbeat/workspaces.js";
-import { resolveExecutionWorkspaceStrategyConfig } from "../services/execution-workspace-policy.js";
+import { resolveExecutionWorkspaceReuseWorkspaceId, resolveExecutionWorkspaceStrategyConfig } from "../services/execution-workspace-policy.js";
 import type { TrustPresetResolution } from "../services/trust-preset-resolver.ts";
 
 const execFile = promisify(execFileCallback);
@@ -1946,13 +1946,45 @@ describe("effective run execution workspace config freshness", () => {
     expect(resolveExecutionWorkspaceStrategyConfig({
       config: {
         mode: "isolated_workspace",
-        workspaceStrategy: { type: "git_worktree", existingBranch: "NEXA-415-thing" },
+        workspaceStrategy: { type: "git_worktree", existingBranch: "holder-branch" },
       },
       conflictingWorkspaceOwnerIssueId: reuseRequest.conflictingWorkspaceOwnerIssueId,
     })).toEqual({
       mode: "isolated_workspace",
       workspaceStrategy: { type: "git_worktree" },
     });
+  });
+
+  it("keeps the holder's workspace out of a refused child's plugin preparation", () => {
+    const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
+      issueExecutionWorkspaceId: "workspace-parent",
+      issueExecutionWorkspacePreference: "reuse_existing",
+      existingExecutionWorkspaceStatus: "active",
+      issueId: "issue-child",
+      existingExecutionWorkspaceMode: "isolated_workspace",
+      existingExecutionWorkspaceSourceIssueId: "issue-parent",
+    });
+    expect(resolveExecutionWorkspaceReuseWorkspaceId({
+      reusableWorkspaceId: null,
+      requestedWorkspaceId: reuseRequest.requestedExecutionWorkspaceId,
+      conflictingWorkspaceOwnerIssueId: reuseRequest.conflictingWorkspaceOwnerIssueId,
+    })).toBeNull();
+  });
+
+  it("still passes the issue's own workspace to the plugin preparation", () => {
+    const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
+      issueExecutionWorkspaceId: "workspace-own",
+      issueExecutionWorkspacePreference: "reuse_existing",
+      existingExecutionWorkspaceStatus: "active",
+      issueId: "issue-child",
+      existingExecutionWorkspaceMode: "isolated_workspace",
+      existingExecutionWorkspaceSourceIssueId: "issue-child",
+    });
+    expect(resolveExecutionWorkspaceReuseWorkspaceId({
+      reusableWorkspaceId: null,
+      requestedWorkspaceId: reuseRequest.requestedExecutionWorkspaceId,
+      conflictingWorkspaceOwnerIssueId: reuseRequest.conflictingWorkspaceOwnerIssueId,
+    })).toBe("workspace-own");
   });
 
   it("reuses an issue's own isolated workspace", () => {

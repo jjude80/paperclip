@@ -57,6 +57,7 @@ import { isRuntimeOwnedGitBranch } from "../execution-workspace-branch-ownership
 import {
   issueExecutionWorkspaceModeForPersistedWorkspace,
   resolveEffectiveWorkspaceStrategyType,
+  resolveExecutionWorkspaceReuseWorkspaceId,
   resolveExecutionWorkspaceStrategyConfig,
 } from "../execution-workspace-policy.js";
 import { evaluateExecutionAllowlist } from "../execution-allowlist.js";
@@ -408,7 +409,13 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
   const pluginPrepared = isDotRun ? null : await preparePluginWorkspace(db, input.services.workspaceWorkers, {
     companyId: agent.companyId, projectId: resolvedWorkspace.projectId, projectWorkspaceId: resolvedWorkspace.workspaceId,
     issueId, runId: run.id, agentId: agent.id, responsibleUserId,
-    existingWorkspaceId: providerFresh ? providerFresh.previousWorkspaceId : reusableExistingExecutionWorkspace?.id ?? issueRef?.executionWorkspaceId ?? null,
+    existingWorkspaceId: providerFresh
+      ? providerFresh.previousWorkspaceId
+      : resolveExecutionWorkspaceReuseWorkspaceId({
+          reusableWorkspaceId: reusableExistingExecutionWorkspace?.id ?? null,
+          requestedWorkspaceId: issueRef?.executionWorkspaceId ?? null,
+          conflictingWorkspaceOwnerIssueId: workspaceReuseRequest.conflictingWorkspaceOwnerIssueId,
+        }),
     ...(providerFresh ? { fresh: providerFresh, expectedBindingRevision: previousProviderBindingRevision } : {}),
     selectedProviderPluginId: projectExecutionWorkspacePolicy?.storageProviderPluginId ?? null,
     mode: requestedExecutionWorkspaceMode,

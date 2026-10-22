@@ -20,6 +20,8 @@ import {
   resolveExecutionWorkspaceInheritanceDecision,
   resolvePinnedIssueWorkspaceStrategyType,
   resolveExecutionWorkspaceMode,
+  resolveExecutionWorkspaceConflictNotice,
+  resolveExecutionWorkspaceReuseWorkspaceId,
   resolveExecutionWorkspaceStrategyConfig,
   resolveSharedWorkspaceConcurrency,
   selectEnvironmentExecutionWorkspaceSettings,
@@ -849,7 +851,7 @@ describe("execution workspace inheritance", () => {
       buildInheritedExecutionWorkspaceSettings({
         sourceSettings: {
           mode: "isolated_workspace",
-          workspaceStrategy: { type: "git_worktree", existingBranch: "NEXA-415-thing", branchTemplate: "{{issue.identifier}}-{{slug}}" },
+          workspaceStrategy: { type: "git_worktree", existingBranch: "holder-branch", branchTemplate: "{{issue.identifier}}-{{slug}}" },
         },
         sourceWorkspaceMode: "isolated_workspace",
         bindSourceWorkspace: false,
@@ -865,14 +867,14 @@ describe("execution workspace inheritance", () => {
       buildInheritedExecutionWorkspaceSettings({
         sourceSettings: {
           mode: "isolated_workspace",
-          workspaceStrategy: { type: "git_worktree", existingBranch: "NEXA-415-thing" },
+          workspaceStrategy: { type: "git_worktree", existingBranch: "holder-branch" },
         },
         sourceWorkspaceMode: "isolated_workspace",
         bindSourceWorkspace: true,
       }),
     ).toEqual({
       mode: "isolated_workspace",
-      workspaceStrategy: { type: "git_worktree", existingBranch: "NEXA-415-thing" },
+      workspaceStrategy: { type: "git_worktree", existingBranch: "holder-branch" },
     });
   });
 
@@ -891,7 +893,7 @@ describe("execution workspace inheritance", () => {
       resolveExecutionWorkspaceStrategyConfig({
         config: {
           mode: "isolated_workspace",
-          workspaceStrategy: { type: "git_worktree", existingBranch: "NEXA-415-thing" },
+          workspaceStrategy: { type: "git_worktree", existingBranch: "holder-branch" },
         },
         conflictingWorkspaceOwnerIssueId: "issue-parent",
       }),
@@ -905,21 +907,96 @@ describe("execution workspace inheritance", () => {
     expect(
       resolveExecutionWorkspaceStrategyConfig({
         config: {
-          workspaceStrategy: { type: "git_worktree", existingBranch: "NEXA-424-thing" },
+          workspaceStrategy: { type: "git_worktree", existingBranch: "own-branch" },
         },
         conflictingWorkspaceOwnerIssueId: null,
       }),
     ).toEqual({
-      workspaceStrategy: { type: "git_worktree", existingBranch: "NEXA-424-thing" },
+      workspaceStrategy: { type: "git_worktree", existingBranch: "own-branch" },
     });
   });
 
   it("drops the whole strategy when the pinned branch was all it held", () => {
     expect(
       resolveExecutionWorkspaceStrategyConfig({
-        config: { workspaceStrategy: { existingBranch: "NEXA-415-thing" } },
+        config: { workspaceStrategy: { existingBranch: "holder-branch" } },
         conflictingWorkspaceOwnerIssueId: "issue-parent",
       }),
     ).toEqual({});
+  });
+
+  it("keeps the requested workspace when no other issue owns it", () => {
+    expect(
+      resolveExecutionWorkspaceReuseWorkspaceId({
+        reusableWorkspaceId: null,
+        requestedWorkspaceId: "workspace-own",
+        conflictingWorkspaceOwnerIssueId: null,
+      }),
+    ).toBe("workspace-own");
+  });
+
+  it("prefers the reusable workspace over the requested one", () => {
+    expect(
+      resolveExecutionWorkspaceReuseWorkspaceId({
+        reusableWorkspaceId: "workspace-own",
+        requestedWorkspaceId: "workspace-own",
+        conflictingWorkspaceOwnerIssueId: null,
+      }),
+    ).toBe("workspace-own");
+  });
+
+  it("does not hand a refused child the holder's workspace", () => {
+    expect(
+      resolveExecutionWorkspaceReuseWorkspaceId({
+        reusableWorkspaceId: null,
+        requestedWorkspaceId: "workspace-parent",
+        conflictingWorkspaceOwnerIssueId: "issue-parent",
+      }),
+    ).toBeNull();
+  });
+
+  it("notifies the holder only for a refused reuse request", () => {
+    expect(
+      resolveExecutionWorkspaceConflictNotice({
+        conflictingWorkspaceOwnerIssueId: "issue-parent",
+        executionWorkspacePreference: "reuse_existing",
+        requestedExecutionWorkspaceId: "workspace-parent",
+        executionWorkspaceId: "workspace-parent",
+      }),
+    ).toEqual({
+      shouldNotify: true,
+      ownerIssueId: "issue-parent",
+      marker: "workspace_conflict:workspace-parent",
+    });
+  });
+
+  it("stays quiet when the issue never asked to reuse the workspace", () => {
+    expect(
+      resolveExecutionWorkspaceConflictNotice({
+        conflictingWorkspaceOwnerIssueId: "issue-parent",
+        executionWorkspacePreference: null,
+        requestedExecutionWorkspaceId: "workspace-parent",
+        executionWorkspaceId: "workspace-parent",
+      }),
+    ).toEqual({
+      shouldNotify: false,
+      ownerIssueId: "issue-parent",
+      marker: "workspace_conflict:workspace-parent",
+    });
+  });
+
+  it("stays quiet when no other issue owns the workspace", () => {
+    expect(
+      resolveExecutionWorkspaceConflictNotice({
+        conflictingWorkspaceOwnerIssueId: null,
+        executionWorkspacePreference: "reuse_existing",
+        requestedExecutionWorkspaceId: "workspace-own",
+        executionWorkspaceId: "workspace-own",
+      }),
+    ).toEqual({
+      shouldNotify: false,
+      ownerIssueId: null,
+      marker: "workspace_conflict:workspace-own",
+    });
   });
 });
