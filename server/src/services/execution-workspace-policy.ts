@@ -373,29 +373,8 @@ export function issueExecutionWorkspaceModeForPersistedWorkspace(
   return "shared_workspace";
 }
 
-/**
- * Whether a child issue may be bound to the execution workspace its parent
- * already owns.
- *
- * An `isolated_workspace` is a *per-issue* workspace: it is one git worktree,
- * with one branch and one index, cut for one issue. Binding a second issue to
- * it does not make the tree shared in some softer sense -- it puts two runs in
- * the same working tree, where a whole-file write destroys the other run's
- * edit, `git commit` publishes the other run's staged paths, and the tree does
- * not build for reasons that belong to neither run. That was measured on
- * NEXA-415 (six children of one parent, four runs live in one worktree at
- * once), so the rule here is not a preference: a child of a decomposed parent
- * gets its own workspace.
- *
- * A `shared_workspace` is a different animal. It is shared *by design*, it is
- * not a per-issue branch, and inheriting it is how a child continues its
- * parent's work in the project checkout. So the rule keys on the mode of the
- * workspace being inherited, not on the relationship between the two issues.
- */
 export type ExecutionWorkspaceInheritanceDecision = {
-  /** Bind the child to the source issue's persisted execution workspace row. */
   bindSourceWorkspace: boolean;
-  /** Copy the source issue's workspace settings (mode, runtime) onto the child. */
   inheritSourceSettings: boolean;
   reason:
     | "explicit_override"
@@ -408,8 +387,6 @@ export function resolveExecutionWorkspaceInheritanceDecision(input: {
   hasExplicitExecutionWorkspaceOverride: boolean;
 }): ExecutionWorkspaceInheritanceDecision {
   if (input.hasExplicitExecutionWorkspaceOverride) {
-    // The caller named its own workspace. Nothing is inherited, and nothing
-    // is inferred on its behalf.
     return {
       bindSourceWorkspace: false,
       inheritSourceSettings: false,
@@ -430,15 +407,6 @@ export function resolveExecutionWorkspaceInheritanceDecision(input: {
   };
 }
 
-/**
- * The workspace settings a child carries when it inherits from a source issue.
- *
- * The mode always travels: a child of an isolated parent is still an isolated
- * task, it just gets an isolated workspace of its own rather than the parent's
- * tree. A pinned exact branch does not travel with it, for the same reason the
- * workspace row does not: `existingBranch` names one branch, and a branch is
- * the thing two issues must not share.
- */
 export function buildInheritedExecutionWorkspaceSettings(input: {
   sourceSettings: Record<string, unknown> | null | undefined;
   sourceWorkspaceMode: string | null | undefined;
@@ -461,6 +429,24 @@ export function buildInheritedExecutionWorkspaceSettings(input: {
     }
   }
   return settings;
+}
+
+export function resolveExecutionWorkspaceStrategyConfig(input: {
+  config: Record<string, unknown> | null | undefined;
+  conflictingWorkspaceOwnerIssueId: string | null | undefined;
+}): Record<string, unknown> {
+  const config = { ...(input.config ?? {}) };
+  if (!input.conflictingWorkspaceOwnerIssueId) return config;
+  const strategy = parseObject(config.workspaceStrategy);
+  if (typeof strategy.existingBranch !== "string") return config;
+  const nextStrategy = { ...strategy };
+  delete nextStrategy.existingBranch;
+  if (Object.keys(nextStrategy).length > 0) {
+    config.workspaceStrategy = nextStrategy;
+  } else {
+    delete config.workspaceStrategy;
+  }
+  return config;
 }
 
 export function resolveExecutionWorkspaceMode(input: {

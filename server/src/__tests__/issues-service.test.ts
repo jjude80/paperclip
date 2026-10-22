@@ -3063,11 +3063,6 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     await tempDb?.cleanup();
   });
 
-  // NEXA-424: this is the shape that was measured on NEXA-415. Six children
-  // of one parent were dispatched into the parent's worktree, four runs were
-  // live in it at once, and the tree did not compile for reasons that
-  // belonged to neither run. A child of a decomposed parent gets the parent's
-  // *mode* and its own workspace, never the parent's tree.
   it("does not inherit the parent's isolated workspace linkage when child workspace fields are omitted", async () => {
     const companyId = randomUUID();
     const projectId = randomUUID();
@@ -3126,8 +3121,6 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     expect(child.parentId).toBe(parentIssueId);
     expect(child.projectWorkspaceId).toBe(projectWorkspaceId);
-    // The parent's worktree is the parent's. The child is still an isolated
-    // task, so it keeps the mode -- but it resolves a workspace of its own.
     expect(child.executionWorkspaceId).toBeNull();
     expect(child.executionWorkspacePreference).toBeNull();
     expect(child.executionWorkspaceSettings).toEqual({
@@ -3940,8 +3933,6 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     expect(child.description).toContain("## Acceptance Criteria");
     expect(child.description).toContain("- Uses the parent issue as parentId");
     expect(child.projectWorkspaceId).toBe(projectWorkspaceId);
-    // The parent's workspace is an isolated per-issue worktree, so the child
-    // inherits the mode and resolves a workspace of its own (NEXA-424).
     expect(child.executionWorkspaceId).toBeNull();
     expect(child.executionWorkspacePreference).toBeNull();
     expect(child.executionWorkspaceSettings).toEqual({ mode: "isolated_workspace" });
@@ -5015,7 +5006,6 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     expect(child.parentId).toBe(parentIssueId);
     expect(child.projectId).toBe(projectId);
     expect(child.projectWorkspaceId).toBe(projectWorkspaceId);
-    // The project is inherited; the parent's isolated worktree is not.
     expect(child.executionWorkspaceId).toBeNull();
     expect(child.executionWorkspaceSettings).toEqual({ mode: "isolated_workspace" });
   });
