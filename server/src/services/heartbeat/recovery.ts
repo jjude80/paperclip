@@ -5,6 +5,15 @@ import { preserveCancelledNativeWorkspaces } from "../native-runtime/native-fail
 import { nativeWorkspaceExportPendingForLease, pendingNativeWorkspaceFinalizationCondition } from "../native-runtime/native-workspace-finalization-state.js";
 import { CHAT_COMPLETION_WAKE_REASON } from "../chat-completion-delivery.js";
 import {
+  SERVER_SHUTDOWN_RETRY_REASON,
+  SERVER_SHUTDOWN_RETRY_WAKE_REASON,
+} from "../execution-recovery-attempt.js";
+import {
+  readShutdownSnapshot,
+  removeShutdownSnapshot,
+  writeShutdownSnapshot,
+} from "../shutdown-snapshot.js";
+import {
   hasStopOnlyCleanup,
   settleStopOnlyCleanup,
 } from "../sandbox-stop-and-retain.js";
@@ -400,6 +409,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     run: typeof heartbeatRuns.$inferSelect,
     agent: typeof agents.$inferSelect,
     now: Date,
+    opts?: { retryReason?: string; wakeReason?: string },
   ) {
     // Completion deliveries own their durable bounded retry and reply identity.
     // A second process-loss retry would compete for the same outbox input.
@@ -410,7 +420,11 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     // transient retries; process loss must not open a second retry budget.
     if (run.runtimeMode === "native" || await legacyExecutionNeedsReconciliationWithEvidence(db, run))
       return null;
-    const scheduled = await scheduleBoundedRetryForRun(run, agent, { now });
+    const scheduled = await scheduleBoundedRetryForRun(run, agent, {
+      now,
+      ...(opts?.retryReason ? { retryReason: opts.retryReason } : {}),
+      ...(opts?.wakeReason ? { wakeReason: opts.wakeReason } : {}),
+    });
     return scheduled.outcome === "scheduled" ? scheduled.run : null;
   }
 
@@ -1065,10 +1079,194 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     };
   }
 
+  /**
+   * Persist the set of runs this server had in flight before the drain tries
+   * to write to a database that may be shutting down with it. Runs still
+   * executing in this process are included even when the query fails, so the
+   * next boot can still finalize them as a service stop rather than an adapter
+   * failure.
+   */
+  async function captureShutdownSnapshot(
+    signal: "SIGINT" | "SIGTERM",
+    now = new Date(),
+  ) {
+    const runIds = new Set<string>([
+      ...runningProcesses.keys(),
+      ...activeRunExecutions,
+    ]);
+    try {
+      const rows = await db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.status, "running"));
+      for (const row of rows) runIds.add(row.id);
+    } catch (err) {
+      logger.warn(
+        { err, signal },
+        "failed to read running runs for the shutdown snapshot; using in-memory executions only",
+      );
+    }
+    await writeShutdownSnapshot({
+      version: 1,
+      capturedAt: now.toISOString(),
+      signal,
+      serverPid: process.pid,
+      runIds: [...runIds].sort(),
+    });
+    return { capturedAt: now.toISOString(), runIds: [...runIds].sort() };
+  }
+
+  const SHUTDOWN_INFRA_ERROR_CODES = new Set([
+    "adapter_failed",
+    "adapter_exit_code",
+    "process_exit",
+    "setup_failed",
+    "timeout",
+  ]);
+
+  /**
+   * Finalize the runs a previous service stop found in flight.
+   *
+   * The drain normally does this before exiting; this is the durable backstop
+   * for a stop where the drain could not write (the embedded PostgreSQL was
+   * torn down with the server, or the process died mid-drain). A run the stop
+   * captured is a service interruption even if its adapter had already
+   * recorded an infrastructure failure, so the leftover failure is corrected
+   * to `server_shutdown_interrupted` and its replacement attempt is queued in
+   * the non-failure shutdown lane.
+   */
+  async function reconcileShutdownSnapshot(now = new Date()) {
+    const snapshot = await readShutdownSnapshot().catch((err) => {
+      logger.warn({ err }, "failed to read the shutdown snapshot; skipping shutdown reconciliation");
+      return null;
+    });
+    const result = {
+      present: snapshot !== null,
+      reclassifiedRunIds: [] as string[],
+      interruptedRunIds: [] as string[],
+      retryRunIds: [] as string[],
+    };
+    if (!snapshot) return result;
+    if (snapshot.runIds.length === 0) {
+      await removeShutdownSnapshot();
+      return result;
+    }
+
+    const rows = await db
+      .select({ run: heartbeatRuns, agent: agents })
+      .from(heartbeatRuns)
+      .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
+      .where(inArray(heartbeatRuns.id, snapshot.runIds));
+    const byRunId = new Map(rows.map((row) => [row.run.id, row]));
+    const stillRunningRunIds: string[] = [];
+
+    for (const runId of snapshot.runIds) {
+      const row = byRunId.get(runId);
+      if (!row) continue;
+      const { run, agent } = row;
+      if (run.status === "running") {
+        stillRunningRunIds.push(run.id);
+        continue;
+      }
+      if (run.status !== "failed" && run.status !== "timed_out") continue;
+      const recordedErrorCode = run.errorCode;
+      if (!recordedErrorCode || !SHUTDOWN_INFRA_ERROR_CODES.has(recordedErrorCode)) continue;
+
+      const message =
+        `Interrupted by server shutdown (${snapshot.signal} at ${snapshot.capturedAt}); ` +
+        `the recorded ${recordedErrorCode} was infrastructure, not an adapter failure`;
+      const [updated] = await db
+        .update(heartbeatRuns)
+        .set({
+          status: "interrupted",
+          error: message,
+          errorCode: "server_shutdown_interrupted",
+          finishedAt: run.finishedAt ?? now,
+          resultJson: mergeRunStopMetadataForAgent(agent, "interrupted", {
+            conversationContinuationEligible: await runUsedConversationAdapter(db, run),
+            resultJson: parseObject(run.resultJson),
+            errorCode: "server_shutdown_interrupted",
+            errorMessage: message,
+          }),
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(heartbeatRuns.id, run.id),
+            inArray(heartbeatRuns.status, ["failed", "timed_out"]),
+            eq(heartbeatRuns.errorCode, recordedErrorCode),
+          ),
+        )
+        .returning();
+      if (!updated) continue;
+
+      result.reclassifiedRunIds.push(updated.id);
+      await releaseEnvironmentLeasesForRun({
+        runId: updated.id,
+        companyId: updated.companyId,
+        agentId: updated.agentId,
+        status: updated.status,
+        failureReason: updated.error ?? undefined,
+      });
+      const retry = await enqueueProcessLossRetry(updated, agent, now, {
+        retryReason: SERVER_SHUTDOWN_RETRY_REASON,
+        wakeReason: SERVER_SHUTDOWN_RETRY_WAKE_REASON,
+      });
+      if (retry) {
+        result.retryRunIds.push(retry.id);
+      } else {
+        await releaseIssueExecutionAndPromote(updated);
+      }
+      await appendRunEvent(updated, {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message,
+        payload: {
+          signal: snapshot.signal,
+          shutdownSnapshotCapturedAt: snapshot.capturedAt,
+          previousErrorCode: recordedErrorCode,
+          ...(retry ? { retryRunId: retry.id } : {}),
+        },
+      });
+      await finalizeAgentStatus(updated.agentId, "interrupted", message, {
+        wasFirstHeartbeat: timerClaimWasFirstHeartbeat(updated),
+      });
+    }
+
+    if (stillRunningRunIds.length > 0) {
+      // The snapshot is proof these rows belonged to the server that wrote
+      // it, so the new boot may finalize them even though the controller boot
+      // id changed.
+      const drain = await drainRunningRunsForShutdown(
+        snapshot.signal,
+        now,
+        stillRunningRunIds,
+        { allowPreviousBootOwnership: true },
+      );
+      result.interruptedRunIds.push(...drain.interruptedRunIds);
+      result.retryRunIds.push(...drain.retryRunIds);
+    }
+
+    await removeShutdownSnapshot();
+    logger.warn(
+      {
+        signal: snapshot.signal,
+        capturedAt: snapshot.capturedAt,
+        reclassifiedRunIds: result.reclassifiedRunIds,
+        interruptedRunIds: result.interruptedRunIds,
+        retryRunIds: result.retryRunIds,
+      },
+      "reconciled runs captured by a service stop",
+    );
+    return result;
+  }
+
   async function drainRunningRunsForShutdown(
     signal: "SIGINT" | "SIGTERM",
     now = new Date(),
     runIds: readonly string[] | null = null,
+    opts?: { allowPreviousBootOwnership?: boolean },
   ) {
     const selectedRunIds = runIds ? [...new Set(runIds)] : null;
     if (selectedRunIds?.length === 0) {
@@ -1103,7 +1301,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     const settlements = await Promise.allSettled(activeRuns.map(async ({ run, agent }) => {
       // Shutdown owns only this boot's legacy executions. Expired foreign
       // owners belong to the reaper, not another container's drain.
-      if (run.runtimeMode === "legacy" && run.controllerBootId &&
+      if (!opts?.allowPreviousBootOwnership && run.runtimeMode === "legacy" && run.controllerBootId &&
           run.controllerBootId !== legacyControllerBootId) return;
       if (isNativeRunnerOwnershipHeld(run)) return;
       if (
@@ -1251,7 +1449,10 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
           failureReason: interrupted.error ?? undefined,
         });
 
-        const retry = await enqueueProcessLossRetry(interrupted, agent, now);
+        const retry = await enqueueProcessLossRetry(interrupted, agent, now, {
+          retryReason: SERVER_SHUTDOWN_RETRY_REASON,
+          wakeReason: SERVER_SHUTDOWN_RETRY_WAKE_REASON,
+        });
         if (!retry) {
           await releaseIssueExecutionAndPromote(interrupted);
         } else {
@@ -2554,5 +2755,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     reapOrphanedRuns,
     sweepOrphanedActiveLeases,
     drainRunningRunsForShutdown,
+    captureShutdownSnapshot,
+    reconcileShutdownSnapshot,
   };
 }

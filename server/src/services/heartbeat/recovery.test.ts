@@ -31,6 +31,16 @@ vi.mock("../hot-restart.js", async (importOriginal) => ({
   ...await importOriginal<typeof import("../hot-restart.js")>(),
   readHotRestartIntent: hotRestart.read,
 }));
+const shutdownSnapshot = vi.hoisted(() => ({
+  read: vi.fn<() => Promise<import("../shutdown-snapshot.js").ShutdownSnapshot | null>>(async () => null),
+  write: vi.fn(async () => undefined),
+  remove: vi.fn(async () => undefined),
+}));
+vi.mock("../shutdown-snapshot.js", () => ({
+  readShutdownSnapshot: shutdownSnapshot.read,
+  writeShutdownSnapshot: shutdownSnapshot.write,
+  removeShutdownSnapshot: shutdownSnapshot.remove,
+}));
 vi.mock("../native-runtime/index.js", async (importOriginal) => ({
   ...await importOriginal<typeof import("../native-runtime/index.js")>(),
   closeIdleWarmNativeSessionsForRestart: native.closeIdle,
@@ -91,6 +101,9 @@ function guardedDatabase() {
 beforeEach(() => {
   vi.clearAllMocks();
   hotRestart.read.mockResolvedValue(null);
+  shutdownSnapshot.read.mockResolvedValue(null);
+  shutdownSnapshot.write.mockResolvedValue(undefined);
+  shutdownSnapshot.remove.mockResolvedValue(undefined);
   native.closeIdle.mockResolvedValue({ closed: 0, failed: 0 });
   native.finalizations.mockResolvedValue(undefined);
   native.cleanups.mockResolvedValue(undefined);
@@ -573,6 +586,84 @@ describePostgres("heartbeat recovery module ownership", () => {
       await db.delete(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, run.issueId!));
       await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
     }
+  });
+
+  it("writes a durable shutdown snapshot from persisted and in-memory runs", async () => {
+    const run = await seedRun();
+    const deps = callbacks(db);
+    deps.activeRunExecutions.add("in-memory-only-run");
+    const capturedAt = new Date("2026-10-22T07:42:45.000Z");
+    const snapshot = await createHeartbeatRecovery(db, deps).captureShutdownSnapshot("SIGTERM", capturedAt);
+    expect(snapshot.runIds).toEqual([run.id, "in-memory-only-run"].sort());
+    expect(shutdownSnapshot.write).toHaveBeenCalledWith({
+      version: 1,
+      capturedAt: capturedAt.toISOString(),
+      signal: "SIGTERM",
+      serverPid: process.pid,
+      runIds: [run.id, "in-memory-only-run"].sort(),
+    });
+    await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+  });
+
+  it("reclassifies a shutdown-captured adapter failure and queues the non-failure retry lane", async () => {
+    const run = await seedRun();
+    await db.update(heartbeatRuns).set({ status: "failed", errorCode: "adapter_failed",
+      finishedAt: new Date("2026-10-22T07:42:45.500Z"),
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+      contextSnapshot: { issueId: run.issueId } })
+      .where(eq(heartbeatRuns.id, run.id));
+    const retryRun = { ...run, id: randomUUID(), status: "scheduled_retry" } as Run;
+    const deps = callbacks(db);
+    deps.scheduleBoundedRetryForRun.mockResolvedValue({ outcome: "scheduled", run: retryRun, reusedExisting: false } as never);
+    shutdownSnapshot.read.mockResolvedValue({
+      version: 1,
+      capturedAt: "2026-10-22T07:42:45.000Z",
+      signal: "SIGTERM",
+      serverPid: 1234,
+      runIds: [run.id],
+    });
+
+    const result = await createHeartbeatRecovery(db, deps).reconcileShutdownSnapshot();
+
+    expect(result).toMatchObject({ present: true, reclassifiedRunIds: [run.id], retryRunIds: [retryRun.id] });
+    const [row] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+    expect(row).toMatchObject({ status: "interrupted", errorCode: "server_shutdown_interrupted" });
+    expect(row.error).toContain("infrastructure, not an adapter failure");
+    expect(deps.scheduleBoundedRetryForRun).toHaveBeenCalledWith(
+      expect.objectContaining({ id: run.id, status: "interrupted" }),
+      expect.objectContaining({ id: run.agentId }),
+      expect.objectContaining({ retryReason: "server_shutdown_retry", wakeReason: "server_shutdown_retry" }),
+    );
+    expect(deps.releaseIssueExecutionAndPromote).not.toHaveBeenCalled();
+    expect(shutdownSnapshot.remove).toHaveBeenCalledOnce();
+    await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+  });
+
+  it("finalizes a run still executing when a previous boot stopped, despite its old controller boot id", async () => {
+    const run = await seedRun();
+    await db.update(heartbeatRuns).set({ controllerBootId: randomUUID() }).where(eq(heartbeatRuns.id, run.id));
+    const deps = callbacks(db);
+    deps.setRunStatusIfRunning.mockImplementation(async (id, status, patch) => {
+      const [updated] = await db.update(heartbeatRuns).set({ ...patch, status }).where(eq(heartbeatRuns.id, id)).returning();
+      return { updated: true, run: updated };
+    });
+    deps.getRun.mockImplementation(async id => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, id)))[0] ?? null);
+    shutdownSnapshot.read.mockResolvedValue({
+      version: 1,
+      capturedAt: "2026-10-22T07:42:45.000Z",
+      signal: "SIGTERM",
+      serverPid: 1234,
+      runIds: [run.id],
+    });
+
+    const result = await createHeartbeatRecovery(db, deps).reconcileShutdownSnapshot();
+
+    expect(result).toMatchObject({ present: true, interruptedRunIds: [run.id] });
+    const [row] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+    expect(row).toMatchObject({ status: "interrupted", errorCode: "server_shutdown_interrupted" });
+    expect(deps.scheduleBoundedRetryForRun).not.toHaveBeenCalled();
+    expect(shutdownSnapshot.remove).toHaveBeenCalledOnce();
+    await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
   });
 
   it("uses the shared live-execution set after construction across two factories", async () => {

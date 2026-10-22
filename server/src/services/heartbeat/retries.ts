@@ -12,6 +12,8 @@ import {
 } from "../conversation-continuation.js";
 import { legacyExecutionNeedsReconciliationWithEvidence } from "../legacy-execution-recovery.js";
 import {
+  SERVER_SHUTDOWN_RETRY_REASON,
+  SERVER_SHUTDOWN_RETRY_WAKE_REASON,
   executionFailureRetryCount,
   executionRetryAttemptCount,
   accountingForScheduledRetry,
@@ -129,6 +131,11 @@ export const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS =
   BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length;
 
 const INTERACTION_CONTINUATION_INFRA_MAX_ATTEMPTS = 2;
+
+// A service stop gets one replacement attempt. It is its own lane, so this cap
+// never competes with the transient-failure budget the agent earns for real
+// execution failures.
+const BOUNDED_SHUTDOWN_RETRY_MAX_ATTEMPTS = 1;
 
 const MAX_TURN_CONTINUATION_LIVE_RUN_STATUSES = [
   "scheduled_retry",
@@ -426,11 +433,17 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
     const retryReason =
       opts?.retryReason ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON;
     const wakeReason =
-      opts?.wakeReason ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON;
+      opts?.wakeReason ??
+      (retryReason === SERVER_SHUTDOWN_RETRY_REASON
+        ? SERVER_SHUTDOWN_RETRY_WAKE_REASON
+        : BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON);
     const maxAttempts = Math.max(
       0,
       Math.floor(
-        opts?.maxAttempts ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS,
+        opts?.maxAttempts ??
+          (retryReason === SERVER_SHUTDOWN_RETRY_REASON
+            ? BOUNDED_SHUTDOWN_RETRY_MAX_ATTEMPTS
+            : BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS),
       ),
     );
     const consumedAttempts = executionRetryAttemptCount(run, retryReason);

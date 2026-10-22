@@ -1624,6 +1624,21 @@ async function startServerWithDatabaseTeardown(
           );
         }
 
+        try {
+          const shutdownRecovery = await heartbeat.reconcileShutdownSnapshot();
+          if (shutdownRecovery.present) {
+            logger.warn(
+              shutdownRecovery,
+              "reconciled runs left in flight by a service stop",
+            );
+          }
+        } catch (err) {
+          logger.error(
+            { err },
+            "startup reconciliation of the shutdown snapshot failed - the orphan reaper will serve as degraded backstop",
+          );
+        }
+
         for (let attempt = 1; attempt <= 2; attempt++) {
           try {
             const result = await timeStartupRecovery("orphan_reaping", () => heartbeat.reapOrphanedRuns());
@@ -2092,6 +2107,22 @@ async function startServerWithDatabaseTeardown(
     if (telemetryClient) {
       telemetryClient.stop();
       await telemetryClient.flush();
+    }
+
+    if (!skipHeartbeatDrain && heartbeat) {
+      // Write the set of in-flight runs to disk first. The drain below needs
+      // the database, and a service stop can take the embedded PostgreSQL
+      // down with it; this snapshot is what lets the next boot classify the
+      // run as a service interruption instead of an adapter failure.
+      try {
+        const snapshot = await heartbeat.captureShutdownSnapshot(signal);
+        logger.info(
+          { signal, capturedAt: snapshot.capturedAt, runIds: snapshot.runIds },
+          "captured durable shutdown run snapshot",
+        );
+      } catch (err) {
+        logger.error({ err, signal }, "failed to capture the durable shutdown run snapshot");
+      }
     }
 
     if (!skipHeartbeatDrain && drainHeartbeatRunsForShutdown) {
