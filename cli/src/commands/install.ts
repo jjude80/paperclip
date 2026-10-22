@@ -280,6 +280,17 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
     await runCommand("corepack", ["pnpm", "install", "--frozen-lockfile"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
     await runCommand("bash", ["scripts/build-npm.sh", "--skip-checks", "--skip-typecheck"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
     await runCommand("corepack", ["pnpm", "-r", "--filter", "@paperclipai/server...", "--if-present", "run", "build"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
+    // The server package ships the built UI inside it, and
+    // prepare-bundled-package.mjs copies server/ui-dist into the staged
+    // package. `pnpm pack` would build that UI through the server package's
+    // prepack hook, but this flow stages the package directly, so a fresh
+    // git checkout has no server/ui-dist and the packaging step fails with
+    // ENOENT. Build the UI here so the staged server package is
+    // self-contained, the same way scripts/release.sh does before it packs.
+    const serverUiDistScript = path.join(checkoutPath, "scripts", "prepare-server-ui-dist.sh");
+    if (fs.existsSync(serverUiDistScript)) {
+      await runCommand("bash", [serverUiDistScript], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
+    }
     const metadata = JSON.parse(fs.readFileSync(path.join(checkoutPath, "cli", "package.json"), "utf8")) as { version: string };
     const workspacePackages = resolveGitInstallWorkspacePackages(checkoutPath);
     for (const [index, workspacePackage] of workspacePackages.entries()) {
