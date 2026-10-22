@@ -55,12 +55,23 @@ describe("managed GitHub launchers", () => {
       ...process.env, ...githubBrokerEnvironment({ GH_TOKEN: "host-must-not-leak" }, { url: `http://127.0.0.1:${port}`, token: "private-capability" }),
       GH_CONFIG_DIR: configRoot, PATH: `${bin}:${process.env.PATH}`,
     } });
-    expect(result.stderr).toContain(failure === "broker-offline" ? "broker_transport_unavailable" : failure === "config-unwritable" ? "configuration_directory_unavailable" : "capability_rejected");
     expect(result.stderr).not.toMatch(/host-must-not-leak|private-capability/);
-    await exec(path.join(bin, "git"), ["commit", "--allow-empty", "-m", "Offline work"], { cwd: root, env: {
+    if (failure === "config-unwritable") {
+      // The configuration directory is prepared for every command.
+      expect(result.stderr).toContain("configuration_directory_unavailable");
+    } else {
+      // A local-only command never contacts the broker, so it has no broker
+      // diagnostic to report.
+      expect(result.stderr).not.toContain("broker_transport_unavailable");
+      expect(result.stderr).not.toContain("capability_rejected");
+    }
+    // A command that needs a managed credential still reports the failure.
+    const remote = await exec(path.join(bin, "git"), ["commit", "--allow-empty", "-m", "Offline work"], { cwd: root, env: {
       ...process.env, ...githubBrokerEnvironment({}, { url: `http://127.0.0.1:${port}`, token: "private-capability" }),
       GH_CONFIG_DIR: configRoot, PATH: `${bin}:${process.env.PATH}`,
     } });
+    expect(remote.stderr).toContain(failure === "broker-offline" ? "broker_transport_unavailable" : failure === "config-unwritable" ? "configuration_directory_unavailable" : "capability_rejected");
+    expect(remote.stderr).not.toMatch(/host-must-not-leak|private-capability/);
   }, 15_000); // broker-offline retries the transport twice per command before it falls back
 
   it("explains unavailable access while allowing local work without credentials", async () => {
@@ -182,4 +193,49 @@ process.stdout.write(JSON.stringify({identity, token:process.env.GH_TOKEN ?? nul
     expect(env.GH_TOKEN).toBe("");
     expect(env.GIT_AUTHOR_NAME).toBe("");
   });
+
+  it("skips the managed credential broker for local-only Git commands", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-local-only-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const bin = path.join(root, "managed"), realBin = path.join(root, "real");
+    await mkdir(bin); await mkdir(realBin);
+    await writeFile(path.join(bin, "git"), githubLauncherSource(), { mode: 0o700 });
+    // A stand-in for the real Git binary: it reports the arguments it received
+    // and whether it was handed a managed credential.
+    await writeFile(path.join(realBin, "git"), `#!/usr/bin/env node
+process.stdout.write(JSON.stringify({ argv: process.argv.slice(2), token: process.env.GH_TOKEN ?? null }));
+`, { mode: 0o700 });
+    let requests = 0;
+    const server = createServer((_req, res) => {
+      requests += 1;
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ status: "available", env: { GH_TOKEN: "managed-token" } }));
+    });
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    cleanups.push(() => new Promise<void>(resolve => server.close(() => resolve())));
+    const { port } = server.address() as { port: number };
+    const env = { ...process.env, ...githubBrokerEnvironment({}, { url: `http://127.0.0.1:${port}`, token: "run-capability" }), PATH: `${bin}:${realBin}:${process.env.PATH}` };
+    const git = async (...args: string[]) => JSON.parse((await exec(path.join(bin, "git"), args, { env })).stdout);
+    for (const args of [
+      ["rev-parse", "--git-dir"], ["status", "--porcelain"], ["ls-files"],
+      ["config", "--local", "--list"], ["diff", "--stat"], ["worktree", "list"],
+      ["-C", root, "rev-parse", "--git-dir"],
+    ]) {
+      requests = 0;
+      const result = await git(...args);
+      expect(result.token, `git ${args.join(" ")} must not receive a managed credential`).toBeNull();
+      expect(requests, `git ${args.join(" ")} must not call the broker`).toBe(0);
+    }
+    // Commands that can reach the remote still ask the broker for a credential.
+    for (const args of [["fetch"], ["push"], ["clone", "https://example.test/repo.git"], ["ls-remote"]]) {
+      requests = 0;
+      const result = await git(...args);
+      expect(result.token, `git ${args.join(" ")} must receive a managed credential`).toBe("managed-token");
+      expect(requests).toBe(1);
+    }
+    // A command that creates a commit keeps the managed identity, so it still asks.
+    requests = 0;
+    expect((await git("commit", "--allow-empty", "-m", "Managed identity")).token).toBe("managed-token");
+    expect(requests).toBe(1);
+  }, 20_000);
 });
