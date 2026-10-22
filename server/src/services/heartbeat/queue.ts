@@ -3730,9 +3730,13 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               resolvedMode,
               workspaceManagedConfig,
             );
-            const existingExecutionWorkspaceStatus = issue.executionWorkspaceId
+            const existingExecutionWorkspaceRow = issue.executionWorkspaceId
               ? await tx
-                  .select({ status: executionWorkspaces.status })
+                  .select({
+                    status: executionWorkspaces.status,
+                    mode: executionWorkspaces.mode,
+                    sourceIssueId: executionWorkspaces.sourceIssueId,
+                  })
                   .from(executionWorkspaces)
                   .where(
                     and(
@@ -3740,16 +3744,75 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                       eq(executionWorkspaces.companyId, issue.companyId),
                     ),
                   )
-                  .then((rows) => rows[0]?.status ?? null)
+                  .then((rows) => rows[0] ?? null)
               : null;
+            const existingExecutionWorkspaceStatus =
+              existingExecutionWorkspaceRow?.status ?? null;
             const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
               issueExecutionWorkspaceId: issue.executionWorkspaceId,
               issueExecutionWorkspacePreference:
                 issue.executionWorkspacePreference,
               existingExecutionWorkspaceStatus,
+              issueId: issue.id,
+              existingExecutionWorkspaceMode:
+                existingExecutionWorkspaceRow?.mode ?? null,
+              existingExecutionWorkspaceSourceIssueId:
+                existingExecutionWorkspaceRow?.sourceIssueId ?? null,
             });
             const hasResolvablePriorSessionWorkspace =
               await resolveHasResolvablePriorSessionWorkspace();
+
+            // The refusal is loud on purpose. An isolated workspace is one
+            // issue's worktree, so a run that would land in another issue's
+            // tree is told so -- and told whose tree it is -- instead of
+            // quietly sharing a directory with somebody who is already
+            // writing in it.
+            if (reuseRequest.conflictingWorkspaceOwnerIssueId) {
+              const ownerIssueId = reuseRequest.conflictingWorkspaceOwnerIssueId;
+              const owner = await tx
+                .select({ identifier: issues.identifier })
+                .from(issues)
+                .where(
+                  and(
+                    eq(issues.id, ownerIssueId),
+                    eq(issues.companyId, issue.companyId),
+                  ),
+                )
+                .then((rows) => rows[0] ?? null);
+              const ownerLabel = owner?.identifier ?? ownerIssueId;
+              const marker = `workspace_conflict:${issue.executionWorkspaceId ?? "none"}`;
+              const alreadyNotified = await tx
+                .select({ body: issueComments.body })
+                .from(issueComments)
+                .where(
+                  and(
+                    eq(issueComments.companyId, issue.companyId),
+                    eq(issueComments.issueId, issue.id),
+                    isNull(issueComments.deletedAt),
+                  ),
+                )
+                .then((rows) =>
+                  rows.some((row) => (row.body ?? "").includes(marker)),
+                );
+              if (!alreadyNotified) {
+                const now = new Date();
+                await insertIssueComment(tx, {
+                  companyId: issue.companyId,
+                  issueId: issue.id,
+                  body: [
+                    `Paperclip refused to run ${issue.identifier} in the execution workspace it points at.`,
+                    "",
+                    `- That workspace is an isolated per-issue worktree owned by ${ownerLabel}.`,
+                    "- Isolation is per issue, not per tree: two issues sharing one worktree is the failure this refuses.",
+                    "- This run realizes a workspace of its own instead.",
+                    "",
+                    `<!-- ${marker} -->`,
+                  ].join("\n"),
+                  createdAt: now,
+                  updatedAt: now,
+                });
+              }
+            }
 
             if (
               isUnrunnableWorktreeCombo({

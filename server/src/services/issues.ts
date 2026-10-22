@@ -137,12 +137,13 @@ import {
   SUCCESSFUL_RUN_HANDOFF_LIVE_WAKE_STATUSES,
 } from "./successful-run-handoff-state.js";
 import {
+  buildInheritedExecutionWorkspaceSettings,
   defaultIssueExecutionWorkspaceSettingsForProject,
   gateProjectExecutionWorkspacePolicy,
-  issueExecutionWorkspaceModeForPersistedWorkspace,
   isUnrunnableWorktreeCombo,
   parseIssueExecutionWorkspaceSettings,
   parseProjectExecutionWorkspacePolicy,
+  resolveExecutionWorkspaceInheritanceDecision,
   resolvePinnedIssueWorkspaceStrategyType,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE,
@@ -10138,16 +10139,28 @@ export function issueService(db: Db) {
               )
               .then((rows) => rows[0] ?? null);
             if (sourceWorkspace) {
-              executionWorkspaceId = sourceWorkspace.id;
-              inheritedWorkspaceSelection = true;
-              executionWorkspacePreference = "reuse_existing";
-              executionWorkspaceSettings = {
-                ...((workspaceSource.executionWorkspaceSettings as
-                  Record<string, unknown> | null | undefined) ?? {}),
-                mode: issueExecutionWorkspaceModeForPersistedWorkspace(
-                  sourceWorkspace.mode,
-                ),
-              };
+              // An isolated workspace belongs to the issue that owns it. A
+              // child of a decomposed parent inherits the parent's *mode* --
+              // it is still an isolated task -- but not the parent's tree,
+              // because two issues in one worktree is the failure this
+              // decision exists to prevent (NEXA-424).
+              const inheritance = resolveExecutionWorkspaceInheritanceDecision({
+                sourceWorkspaceMode: sourceWorkspace.mode,
+                hasExplicitExecutionWorkspaceOverride,
+              });
+              if (inheritance.inheritSourceSettings) {
+                executionWorkspaceSettings = buildInheritedExecutionWorkspaceSettings({
+                  sourceSettings: workspaceSource.executionWorkspaceSettings as
+                    Record<string, unknown> | null | undefined,
+                  sourceWorkspaceMode: sourceWorkspace.mode,
+                  bindSourceWorkspace: inheritance.bindSourceWorkspace,
+                });
+              }
+              if (inheritance.bindSourceWorkspace) {
+                executionWorkspaceId = sourceWorkspace.id;
+                inheritedWorkspaceSelection = true;
+                executionWorkspacePreference = "reuse_existing";
+              }
             }
           }
         }
