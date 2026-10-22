@@ -6,6 +6,7 @@ import {
 import {
   applyDefaultIsolatedExecutionWorkspacePolicy,
   buildExecutionWorkspaceAdapterConfig,
+  buildInheritedExecutionWorkspaceSettings,
   defaultIssueExecutionWorkspaceSettingsForProject,
   gateProjectExecutionWorkspacePolicy,
   isUnrunnableWorktreeCombo,
@@ -16,6 +17,7 @@ import {
   ManagedSandboxUnavailableError,
   resolveEffectiveWorkspaceStrategyType,
   resolveExecutionWorkspaceEnvironmentId,
+  resolveExecutionWorkspaceInheritanceDecision,
   resolvePinnedIssueWorkspaceStrategyType,
   resolveExecutionWorkspaceMode,
   resolveSharedWorkspaceConcurrency,
@@ -768,5 +770,105 @@ describe("operator default isolated execution workspaces", () => {
     const defaults = {agentDefaultEnvironmentId: "agent-env", instanceDefaultEnvironmentId: "instance-env", localDefaultEnvironmentId: "local-env"};
     expect(resolveExecutionWorkspaceEnvironmentId({...defaults, lowTrustIssueEnvironmentId: "phone-sandbox"})).toEqual({environmentId: "phone-sandbox", source: "issue"});
     expect(resolveExecutionWorkspaceEnvironmentId(defaults)).toEqual({environmentId: "agent-env", source: "agent"});
+  });
+});
+
+// NEXA-424: a child of a decomposed parent must not inherit the parent's
+// isolated worktree. The failure this covers was measured on NEXA-415, where
+// six children of one parent were dispatched into one worktree and four runs
+// were live in it at once.
+describe("execution workspace inheritance", () => {
+  it("does not bind a child to the parent's isolated workspace", () => {
+    expect(
+      resolveExecutionWorkspaceInheritanceDecision({
+        sourceWorkspaceMode: "isolated_workspace",
+        hasExplicitExecutionWorkspaceOverride: false,
+      }),
+    ).toEqual({
+      bindSourceWorkspace: false,
+      inheritSourceSettings: true,
+      reason: "source_workspace_isolated_per_issue",
+    });
+  });
+
+  it("keeps inheriting a shared workspace, which is shared by design", () => {
+    expect(
+      resolveExecutionWorkspaceInheritanceDecision({
+        sourceWorkspaceMode: "shared_workspace",
+        hasExplicitExecutionWorkspaceOverride: false,
+      }),
+    ).toEqual({
+      bindSourceWorkspace: true,
+      inheritSourceSettings: true,
+      reason: "source_workspace_shared",
+    });
+  });
+
+  it("inherits nothing when the caller named its own workspace", () => {
+    expect(
+      resolveExecutionWorkspaceInheritanceDecision({
+        sourceWorkspaceMode: "isolated_workspace",
+        hasExplicitExecutionWorkspaceOverride: true,
+      }),
+    ).toEqual({
+      bindSourceWorkspace: false,
+      inheritSourceSettings: false,
+      reason: "explicit_override",
+    });
+  });
+
+  it("carries the isolated mode to the child without the parent's tree", () => {
+    expect(
+      buildInheritedExecutionWorkspaceSettings({
+        sourceSettings: { mode: "isolated_workspace", workspaceRuntime: { profile: "agent" } },
+        sourceWorkspaceMode: "isolated_workspace",
+        bindSourceWorkspace: false,
+      }),
+    ).toEqual({
+      mode: "isolated_workspace",
+      workspaceRuntime: { profile: "agent" },
+    });
+  });
+
+  it("drops a pinned exact branch from an inherited strategy, because a branch is shared", () => {
+    expect(
+      buildInheritedExecutionWorkspaceSettings({
+        sourceSettings: {
+          mode: "isolated_workspace",
+          workspaceStrategy: { type: "git_worktree", existingBranch: "NEXA-415-thing", branchTemplate: "{{issue.identifier}}-{{slug}}" },
+        },
+        sourceWorkspaceMode: "isolated_workspace",
+        bindSourceWorkspace: false,
+      }),
+    ).toEqual({
+      mode: "isolated_workspace",
+      workspaceStrategy: { type: "git_worktree", branchTemplate: "{{issue.identifier}}-{{slug}}" },
+    });
+  });
+
+  it("keeps the pinned branch when the workspace itself is inherited", () => {
+    expect(
+      buildInheritedExecutionWorkspaceSettings({
+        sourceSettings: {
+          mode: "isolated_workspace",
+          workspaceStrategy: { type: "git_worktree", existingBranch: "NEXA-415-thing" },
+        },
+        sourceWorkspaceMode: "isolated_workspace",
+        bindSourceWorkspace: true,
+      }),
+    ).toEqual({
+      mode: "isolated_workspace",
+      workspaceStrategy: { type: "git_worktree", existingBranch: "NEXA-415-thing" },
+    });
+  });
+
+  it("falls back to the source mode when the source has no settings of its own", () => {
+    expect(
+      buildInheritedExecutionWorkspaceSettings({
+        sourceSettings: null,
+        sourceWorkspaceMode: "shared_workspace",
+        bindSourceWorkspace: true,
+      }),
+    ).toEqual({ mode: "shared_workspace" });
   });
 });

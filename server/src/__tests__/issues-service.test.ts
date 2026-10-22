@@ -3063,7 +3063,12 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     await tempDb?.cleanup();
   });
 
-  it("inherits the parent issue workspace linkage when child workspace fields are omitted", async () => {
+  // NEXA-424: this is the shape that was measured on NEXA-415. Six children
+  // of one parent were dispatched into the parent's worktree, four runs were
+  // live in it at once, and the tree did not compile for reasons that
+  // belonged to neither run. A child of a decomposed parent gets the parent's
+  // *mode* and its own workspace, never the parent's tree.
+  it("does not inherit the parent's isolated workspace linkage when child workspace fields are omitted", async () => {
     const companyId = randomUUID();
     const projectId = randomUUID();
     const parentIssueId = randomUUID();
@@ -3121,12 +3126,72 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     expect(child.parentId).toBe(parentIssueId);
     expect(child.projectWorkspaceId).toBe(projectWorkspaceId);
-    expect(child.executionWorkspaceId).toBe(executionWorkspaceId);
-    expect(child.executionWorkspacePreference).toBe("reuse_existing");
+    // The parent's worktree is the parent's. The child is still an isolated
+    // task, so it keeps the mode -- but it resolves a workspace of its own.
+    expect(child.executionWorkspaceId).toBeNull();
+    expect(child.executionWorkspacePreference).toBeNull();
     expect(child.executionWorkspaceSettings).toEqual({
       mode: "isolated_workspace",
       workspaceRuntime: { profile: "agent" },
     });
+  });
+
+  it("inherits a shared workspace linkage, which is shared by design", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const parentIssueId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+
+    await seedIssueCompany(db, companyId);
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+
+    await seedWorkspaceProject(db, companyId, projectId);
+
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "Primary workspace",
+      isPrimary: true,
+      sharedWorkspaceKey: "workspace-key",
+    });
+
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      mode: "shared_workspace",
+      strategyType: "project_primary",
+      name: "Shared project workspace",
+      status: "active",
+      providerType: "project_primary",
+      providerRef: `/tmp/${executionWorkspaceId}`,
+    });
+
+    await db.insert(issues).values({
+      id: parentIssueId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      title: "Parent issue",
+      status: "in_progress",
+      priority: "medium",
+      executionWorkspaceId,
+      executionWorkspacePreference: "reuse_existing",
+      executionWorkspaceSettings: { mode: "shared_workspace" },
+    });
+
+    const child = await svc.create(companyId, {
+      parentId: parentIssueId,
+      projectId,
+      title: "Child issue",
+    });
+
+    expect(child.executionWorkspaceId).toBe(executionWorkspaceId);
+    expect(child.executionWorkspacePreference).toBe("reuse_existing");
+    expect(child.executionWorkspaceSettings).toEqual({ mode: "shared_workspace" });
   });
 
   it("inherits responsible user for agent-created child issues", async () => {
@@ -3875,8 +3940,11 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     expect(child.description).toContain("## Acceptance Criteria");
     expect(child.description).toContain("- Uses the parent issue as parentId");
     expect(child.projectWorkspaceId).toBe(projectWorkspaceId);
-    expect(child.executionWorkspaceId).toBe(executionWorkspaceId);
-    expect(child.executionWorkspacePreference).toBe("reuse_existing");
+    // The parent's workspace is an isolated per-issue worktree, so the child
+    // inherits the mode and resolves a workspace of its own (NEXA-424).
+    expect(child.executionWorkspaceId).toBeNull();
+    expect(child.executionWorkspacePreference).toBeNull();
+    expect(child.executionWorkspaceSettings).toEqual({ mode: "isolated_workspace" });
 
     const parentRelations = await svc.getRelationSummaries(parentIssueId);
     expect(parentRelations.blockedBy).toEqual([
@@ -4947,7 +5015,9 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     expect(child.parentId).toBe(parentIssueId);
     expect(child.projectId).toBe(projectId);
     expect(child.projectWorkspaceId).toBe(projectWorkspaceId);
-    expect(child.executionWorkspaceId).toBe(executionWorkspaceId);
+    // The project is inherited; the parent's isolated worktree is not.
+    expect(child.executionWorkspaceId).toBeNull();
+    expect(child.executionWorkspaceSettings).toEqual({ mode: "isolated_workspace" });
   });
 
   it("uses the target project's own workspaces for a cross-project child instead of inheriting the parent's", async () => {
