@@ -57,6 +57,7 @@ import { isRuntimeOwnedGitBranch } from "../execution-workspace-branch-ownership
 import {
   issueExecutionWorkspaceModeForPersistedWorkspace,
   resolveEffectiveWorkspaceStrategyType,
+  resolveExecutionWorkspaceStrategyConfig,
 } from "../execution-workspace-policy.js";
 import { evaluateExecutionAllowlist } from "../execution-allowlist.js";
 import type { Db, agents } from "@paperclipai/db";
@@ -195,7 +196,7 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
     environmentResolution,
     resolvedInstanceSettings,
   } = input.environment;
-  const { mergedConfig, configSnapshot, secretManifest } = input.config;
+  const { mergedConfig: rawMergedConfig, configSnapshot, secretManifest } = input.config;
   const {
     requestedShouldReuseExisting,
     existingExecutionWorkspace,
@@ -206,6 +207,10 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
     isDotRun,
     runOptions,
   } = input.reuse;
+  const mergedConfig = resolveExecutionWorkspaceStrategyConfig({
+    config: rawMergedConfig,
+    conflictingWorkspaceOwnerIssueId: workspaceReuseRequest.conflictingWorkspaceOwnerIssueId,
+  });
   // An ordinary clean task directory already has a new per-attempt identity.
   // It is not a repository source and must not pass through Git copy admission.
   const freshNeedsSeed = fresh && !isDotRun && !useIsolatedTaskDirectory &&

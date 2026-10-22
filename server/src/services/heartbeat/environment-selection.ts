@@ -153,10 +153,6 @@ export async function selectHeartbeatEnvironment(db: Db, input: HeartbeatEnviron
       existingExecutionWorkspaceMode: existingExecutionWorkspace?.mode ?? null,
       existingExecutionWorkspaceSourceIssueId:
         existingExecutionWorkspace?.sourceIssueId ?? null,
-      // A recovered run continues work that already happened in the workspace
-      // it was dispatched into, so it restores that workspace even when the
-      // row is owned by another issue. A fresh dispatch is the case the
-      // per-issue rule is about.
       allowForeignIsolatedWorkspaceReuse: Boolean(
         nativeRecoveryExecutionWorkspaceId,
       ),

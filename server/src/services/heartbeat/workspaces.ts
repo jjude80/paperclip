@@ -2205,14 +2205,6 @@ export type ExecutionWorkspaceReuseRequestForIssue = {
   requestedExecutionWorkspaceId: string | null;
   requestedShouldReuseExisting: boolean;
   existingExecutionWorkspaceAvailable: boolean;
-  /**
-   * The issue that owns the isolated workspace this run was about to reuse.
-   *
-   * Non-null means the reuse was refused because the workspace belongs to
-   * another issue, and the run is going to realize a workspace of its own
-   * instead. It is the holder's id, so the refusal can name the holder rather
-   * than saying only that something went wrong.
-   */
   conflictingWorkspaceOwnerIssueId: string | null;
 };
 
@@ -2235,17 +2227,9 @@ export function resolveExecutionWorkspaceReuseRequestForIssue(input: {
   existingExecutionWorkspaceStatus?: string | null;
   requestedExistingBranch?: string | null;
   existingExecutionWorkspaceBranchName?: string | null;
-  /** The issue this run is for. Used to decide whether a workspace is its own. */
   issueId?: string | null;
-  /** The mode of the workspace row the issue points at. */
   existingExecutionWorkspaceMode?: string | null;
-  /** The issue that owns the workspace row, when it was created for one. */
   existingExecutionWorkspaceSourceIssueId?: string | null;
-  /**
-   * Recovery restores the workspace a run was already dispatched into, even
-   * when that workspace belongs to another issue: the run is a continuation
-   * of work that already happened in that tree, not a second issue joining it.
-   */
   allowForeignIsolatedWorkspaceReuse?: boolean;
 }): ExecutionWorkspaceReuseRequestForIssue {
   const requestedExecutionWorkspaceId = readNonEmptyString(
@@ -2261,14 +2245,6 @@ export function resolveExecutionWorkspaceReuseRequestForIssue(input: {
     requestedExistingBranch === null ||
     readNonEmptyString(input.existingExecutionWorkspaceBranchName) ===
       requestedExistingBranch;
-  // An isolated workspace is one issue's worktree: one directory, one branch,
-  // one index. Reusing it from another issue is not a shared-workspace
-  // arrangement, it is two runs writing one tree -- the measured NEXA-415
-  // failure, where six children of a decomposed parent were dispatched into
-  // one worktree and four runs were live in it at once. So the refusal is
-  // keyed on the workspace's own owner, not on the relationship between the
-  // two issues: a child that legitimately continues its parent's *shared*
-  // workspace is untouched.
   const workspaceOwnerIssueId = readNonEmptyString(
     input.existingExecutionWorkspaceSourceIssueId,
   );

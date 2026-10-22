@@ -3762,11 +3762,6 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             const hasResolvablePriorSessionWorkspace =
               await resolveHasResolvablePriorSessionWorkspace();
 
-            // The refusal is loud on purpose. An isolated workspace is one
-            // issue's worktree, so a run that would land in another issue's
-            // tree is told so -- and told whose tree it is -- instead of
-            // quietly sharing a directory with somebody who is already
-            // writing in it.
             if (reuseRequest.conflictingWorkspaceOwnerIssueId) {
               const ownerIssueId = reuseRequest.conflictingWorkspaceOwnerIssueId;
               const owner = await tx

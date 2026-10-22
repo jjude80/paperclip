@@ -10139,11 +10139,6 @@ export function issueService(db: Db) {
               )
               .then((rows) => rows[0] ?? null);
             if (sourceWorkspace) {
-              // An isolated workspace belongs to the issue that owns it. A
-              // child of a decomposed parent inherits the parent's *mode* --
-              // it is still an isolated task -- but not the parent's tree,
-              // because two issues in one worktree is the failure this
-              // decision exists to prevent (NEXA-424).
               const inheritance = resolveExecutionWorkspaceInheritanceDecision({
                 sourceWorkspaceMode: sourceWorkspace.mode,
                 hasExplicitExecutionWorkspaceOverride,

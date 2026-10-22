@@ -20,6 +20,7 @@ import {
   resolveExecutionWorkspaceInheritanceDecision,
   resolvePinnedIssueWorkspaceStrategyType,
   resolveExecutionWorkspaceMode,
+  resolveExecutionWorkspaceStrategyConfig,
   resolveSharedWorkspaceConcurrency,
   selectEnvironmentExecutionWorkspaceSettings,
 } from "../services/execution-workspace-policy.ts";
@@ -790,10 +791,6 @@ describe("operator default isolated execution workspaces", () => {
   });
 });
 
-// NEXA-424: a child of a decomposed parent must not inherit the parent's
-// isolated worktree. The failure this covers was measured on NEXA-415, where
-// six children of one parent were dispatched into one worktree and four runs
-// were live in it at once.
 describe("execution workspace inheritance", () => {
   it("does not bind a child to the parent's isolated workspace", () => {
     expect(
@@ -887,5 +884,42 @@ describe("execution workspace inheritance", () => {
         bindSourceWorkspace: true,
       }),
     ).toEqual({ mode: "shared_workspace" });
+  });
+
+  it("drops a pinned branch from the strategy when another issue owns the workspace", () => {
+    expect(
+      resolveExecutionWorkspaceStrategyConfig({
+        config: {
+          mode: "isolated_workspace",
+          workspaceStrategy: { type: "git_worktree", existingBranch: "NEXA-415-thing" },
+        },
+        conflictingWorkspaceOwnerIssueId: "issue-parent",
+      }),
+    ).toEqual({
+      mode: "isolated_workspace",
+      workspaceStrategy: { type: "git_worktree" },
+    });
+  });
+
+  it("keeps the pinned branch when the workspace is the issue's own", () => {
+    expect(
+      resolveExecutionWorkspaceStrategyConfig({
+        config: {
+          workspaceStrategy: { type: "git_worktree", existingBranch: "NEXA-424-thing" },
+        },
+        conflictingWorkspaceOwnerIssueId: null,
+      }),
+    ).toEqual({
+      workspaceStrategy: { type: "git_worktree", existingBranch: "NEXA-424-thing" },
+    });
+  });
+
+  it("drops the whole strategy when the pinned branch was all it held", () => {
+    expect(
+      resolveExecutionWorkspaceStrategyConfig({
+        config: { workspaceStrategy: { existingBranch: "NEXA-415-thing" } },
+        conflictingWorkspaceOwnerIssueId: "issue-parent",
+      }),
+    ).toEqual({});
   });
 });
