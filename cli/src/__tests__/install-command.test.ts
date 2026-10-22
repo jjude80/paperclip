@@ -115,7 +115,7 @@ describe("managed install commands", () => {
     expect(runCommand.mock.calls[0]?.[0]).toBe(process.execPath);
   });
 
-  const createGitCheckoutRunCommand = (sha: string) =>
+  const createGitCheckoutRunCommand = (sha: string, options?: { uiDistScript?: boolean }) =>
     vi.fn(async (file: string, args: string[], _options?: Parameters<CommandRunner>[2]) => {
       if (file === "curl" && !args.includes("--output")) return { stdout: JSON.stringify({ sha }), stderr: "" };
       if (file === "curl") { fs.writeFileSync(args[args.indexOf("--output") + 1], "archive"); return { stdout: "", stderr: "" }; }
@@ -129,6 +129,9 @@ describe("managed install commands", () => {
         fs.mkdirSync(path.join(checkout, "cli"), { recursive: true });
         fs.writeFileSync(path.join(checkout, "cli", "package.json"), JSON.stringify({ version: "0.3.1" }));
         fs.mkdirSync(path.join(checkout, "scripts"), { recursive: true });
+        if (options?.uiDistScript) {
+          fs.writeFileSync(path.join(checkout, "scripts", "prepare-server-ui-dist.sh"), "#!/usr/bin/env bash\n");
+        }
         fs.writeFileSync(path.join(checkout, "scripts", "release-package-manifest.json"), JSON.stringify(packages.map(({ dir, name }) => ({ dir, name }))));
         for (const workspacePackage of packages) {
           fs.mkdirSync(path.join(checkout, workspacePackage.dir), { recursive: true });
@@ -176,6 +179,22 @@ describe("managed install commands", () => {
     expect(runCommand.mock.calls.filter(([command, args]) => command === "npm" && args[0] === "pack")).toHaveLength(2);
     const installCall = runCommand.mock.calls.find(([command, args]) => command === "npm" && args[0] === "install");
     expect(installCall?.[1].filter((arg) => arg.endsWith(".tgz"))).toHaveLength(4);
+  });
+
+  it("prepares the server UI dist before it stages a bundled workspace package", async () => {
+    const sha = "e".repeat(40);
+    const runCommand = createGitCheckoutRunCommand(sha, { uiDistScript: true });
+    await expect(installGitPayload("paperclipai/paperclip", sha, runCommand, resolveInstallStorePaths())).resolves.toMatchObject({ version: "0.3.1", reused: false });
+    const uiCall = runCommand.mock.calls.find(([file, args]) =>
+      file === "bash" && args.some((arg) => arg.endsWith("prepare-server-ui-dist.sh")),
+    );
+    expect(uiCall).toBeTruthy();
+    const stagedCall = runCommand.mock.calls.findIndex(([file, args]) =>
+      file === process.execPath && args[0]?.endsWith("prepare-bundled-package.mjs"),
+    );
+    expect(runCommand.mock.calls.findIndex(([file, args]) =>
+      file === "bash" && args.some((arg) => arg.endsWith("prepare-server-ui-dist.sh")),
+    )).toBeLessThan(stagedCall);
   });
 
   it("builds git checkouts with NODE_ENV cleared so ambient production mode keeps devDependencies", async () => {
