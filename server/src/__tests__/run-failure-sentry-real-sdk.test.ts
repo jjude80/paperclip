@@ -1,5 +1,10 @@
+import { enableRunFailureReporting } from "./helpers/run-failure-reporting.js";
 import { captureEnvironmentAcquisitionDiagnostic } from "../services/environment-acquisition-diagnostics.js";
 import { createRequire } from "node:module";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { buildHeartbeatRunStopMetadata, mergeHeartbeatRunStopMetadata } from "../services/heartbeat-stop-metadata.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { collectRunFailureDiagnostics, sanitizeRunFailureDiagnostics } from "../services/run-failure-diagnostics.js";
 import type { heartbeatRuns } from "@paperclipai/db";
@@ -39,10 +44,90 @@ afterEach(async () => {
   vi.unstubAllEnvs();
   vi.doUnmock("@sentry/node");
   vi.doUnmock("../peer-version-check.js");
+  vi.doUnmock("@paperclipai/adapter-utils/execution-target");
   vi.resetModules();
 });
 
 describe.skipIf(!sentryPackage)("run failure context with the real Sentry SDK", () => {
+  it("captures an early OpenCode timeout without inventing a deadline or exporting provider output", async () => {
+    const Sentry = sentryPackage!;
+    const events: Array<Record<string, unknown>> = [];
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-sentry-"));
+    const restore = vi.fn(async () => {});
+    const stop = vi.fn(async () => {});
+    const processResult = {
+      exitCode: null, signal: null, timedOut: true, pid: null,
+      startedAt: "2020-01-01T00:00:00.000Z", durationMs: 100,
+      stdout: "private-timeout-output-canary",
+      stderr: "<html>504 Gateway Time-out private-timeout-credential-canary</html>",
+    };
+    const runProcess = vi.fn(async () => processResult);
+    vi.stubEnv("XDG_CONFIG_HOME", root);
+    vi.stubEnv("SENTRY_DSN_BACKEND", "https://public@example.invalid/1");
+    vi.doMock("../peer-version-check.js", () => ({ checkExactPeerVersions: () => ({ ok: true }) }));
+    vi.doMock("@sentry/node", () => ({ ...Sentry,
+      init: (options: Record<string, unknown>) => Sentry.init({ ...options,
+        transport: () => ({ send: async (envelope: [unknown, Array<[{ type: string }, Record<string, unknown>]>]) => {
+          for (const [header, payload] of envelope[1]) if (header.type === "event") events.push(payload);
+          return {};
+        }, flush: async () => true }),
+      }),
+    }));
+    // Only external execution/setup seams are replaced. The real adapter owns
+    // the message/policy, and the real finalization/collector/SDK send the event.
+    vi.doMock("@paperclipai/adapter-utils/execution-target", async (importOriginal) => ({
+      ...await importOriginal<typeof import("@paperclipai/adapter-utils/execution-target")>(),
+      ensureAdapterExecutionTargetRuntimeCommandInstalled: vi.fn(),
+      ensureAdapterExecutionTargetCommandResolvable: vi.fn(),
+      prepareAdapterExecutionTargetRuntime: vi.fn(async () => ({
+        runtimeRootDir: "/workspace/runtime", workspaceRemoteDir: "/workspace",
+        assetDirs: {}, restoreWorkspace: restore,
+      })),
+      readAdapterExecutionTargetHomeDir: vi.fn(async () => "/home/fixture"),
+      startAdapterExecutionTargetPaperclipBridge: vi.fn(async () => ({ env: {}, stop })),
+      runAdapterExecutionTargetProcess: runProcess,
+    }));
+    vi.resetModules();
+    try {
+      const { execute } = await import("@paperclipai/adapter-opencode-local/server");
+      const { sentryReady, captureRunFailure, captureException } = await import("../sentry.js");
+      await sentryReady;
+      const result = await execute({
+        runId: "22222222-2222-4222-8222-222222222222",
+        agent: { id: "agent-fixture", companyId: "company-fixture", name: "Fixture", adapterType: "opencode_local", adapterConfig: {} },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: { command: "opencode", model: "openai/fixture", cwd: root, timeoutSec: 0,
+          env: { OPENCODE_ALLOW_ALL_MODELS: "1" } },
+        context: {}, onLog: async () => {},
+        executionTarget: { kind: "remote", transport: "sandbox", remoteCwd: "/workspace" },
+      });
+      expect(result).toMatchObject({ timedOut: true, exitCode: null, signal: null });
+      expect(runProcess).toHaveBeenCalledTimes(1);
+      expect(restore).toHaveBeenCalledTimes(1);
+      expect(stop).toHaveBeenCalledTimes(1);
+      const resultJson = mergeHeartbeatRunStopMetadata(result.resultJson,
+        buildHeartbeatRunStopMetadata({ adapterType: "opencode_local", adapterConfig: { timeoutSec: 0 }, outcome: "timed_out" }));
+      const diagnostics = sanitizeRunFailureDiagnostics(collectRunFailureDiagnostics({
+        errorCode: "timeout", resultJson,
+        startedAt: new Date("2020-01-01T00:00:00.000Z"), finishedAt: new Date("2020-01-01T00:00:00.100Z"),
+      } as typeof heartbeatRuns.$inferSelect, { phase: "execute" }));
+      captureRunFailure({ taskId: "11111111-1111-4111-8111-111111111111", runId: "22222222-2222-4222-8222-222222222222",
+        errorMessage: result.errorMessage!, errorCode: "timeout", agentAdapter: "opencode_local",
+        runStatus: "timed_out", exitCode: result.exitCode, signal: result.signal, diagnostics });
+      captureException(new Error("Unrelated timeout fixture"));
+      await Sentry.flush(2000);
+      expect(events).toHaveLength(2);
+      const event = events.find(entry => (entry.tags as Record<string, unknown>)?.error_code === "timeout");
+      expect(event).toMatchObject({ exception: { values: [{ value: "OpenCode execution timed out" }] },
+        contexts: { run_execution: { durationMs: 100, effectiveTimeoutSec: 14400,
+          timeoutSource: "sandbox_default", timeoutConfigured: false, timeoutFired: true, stopReason: "timeout" } } });
+      expect(JSON.stringify(events)).not.toMatch(/private-timeout-|<html>|504 Gateway|Timed out after/);
+      expect(events.find(entry => entry !== event)).not.toHaveProperty("contexts.run_execution");
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("sends only owned acquisition observations and isolates unrelated captures", async () => {
     const Sentry = sentryPackage!;
     const events: Array<Record<string, unknown>> = [];
@@ -278,11 +363,10 @@ describe.skipIf(!sentryPackage)("run failure context with the real Sentry SDK", 
       ...Sentry,
       init: (options: Record<string, unknown>) => Sentry.init({
         ...options,
-        transport: () => ({ send: async () => ({}), flush: async () => true }),
-        beforeSend: (event: Record<string, unknown>) => {
-          events.push(event);
-          return event;
-        },
+        transport: () => ({ send: async (envelope: [unknown, Array<[{ type: string }, Record<string, unknown>]>]) => {
+          for (const [header, payload] of envelope[1]) if (header.type === "event") events.push(payload);
+          return {};
+        }, flush: async () => true }),
       }),
     }));
     vi.resetModules();
@@ -290,6 +374,8 @@ describe.skipIf(!sentryPackage)("run failure context with the real Sentry SDK", 
     await sentryReady;
 
     const first = {
+      companyId: "55555555-5555-4555-8555-555555555555",
+      agentId: "66666666-6666-4666-8666-666666666666",
       taskId: "11111111-1111-4111-8111-111111111111",
       runId: "22222222-2222-4222-8222-222222222222",
       errorMessage: "first run failed",
@@ -299,6 +385,13 @@ describe.skipIf(!sentryPackage)("run failure context with the real Sentry SDK", 
       exitCode: 1,
       signal: null,
     };
+    vi.stubEnv("PAPERCLIP_PUBLIC_URL", "https://paperclip.example.com");
+    const { setSentryRunLinkResolver } = await import("../sentry-links.js");
+    setSentryRunLinkResolver(async ({ runId }) => ({
+      companyId: first.companyId, companyPrefix: "TEAM", agentId: first.agentId,
+      taskId: runId === first.runId ? first.taskId : "33333333-3333-4333-8333-333333333333",
+      taskIdentifier: runId === first.runId ? "TEAM-42" : "TEAM-43",
+    }));
     const second = {
       ...first,
       taskId: "33333333-3333-4333-8333-333333333333",
@@ -335,9 +428,14 @@ describe.skipIf(!sentryPackage)("run failure context with the real Sentry SDK", 
       signal: "private-signal-payload",
     });
     captureException(new Error("unrelated filesystem error"));
+    captureException(new Error("run-related request error"), {
+      runId: first.runId, companyId: first.companyId, agentId: first.agentId,
+    });
+    const { AdapterStopTimeoutError } = await import("../services/adapter-stop-timeout.js");
+    captureException(new AdapterStopTimeoutError(60_000, { runId: first.runId }));
     await Sentry.flush(2000);
 
-    expect(events).toHaveLength(5);
+    expect(events).toHaveLength(7);
     const captured = (message: string) => events.find((event) =>
       (event.exception as { values: Array<{ value: string }> }).values.some((value) => value.value === message),
     );
@@ -348,7 +446,7 @@ describe.skipIf(!sentryPackage)("run failure context with the real Sentry SDK", 
         contexts: { run_failure: { runId: run.runId, taskId: run.taskId,
           errorMessage: run.errorMessage, errorCode: run.errorCode, agentAdapter: run.agentAdapter,
           exitCode: run.exitCode, signal: run.signal } },
-        fingerprint: [run.errorCode, run.agentAdapter],
+        fingerprint: [run.errorCode, run.agentAdapter, ...(run === first ? ["execute", "ECONNRESET"] : [])],
       });
     }
     expect(captured("malformed process metadata")).toMatchObject({
@@ -357,6 +455,15 @@ describe.skipIf(!sentryPackage)("run failure context with the real Sentry SDK", 
     });
     expect(JSON.stringify(events)).not.toContain("private-signal-payload");
     const firstCapture = captured(first.errorMessage)!;
+    expect(firstCapture).toHaveProperty("contexts.paperclip.runPath", `/api/heartbeat-runs/${first.runId}`);
+    expect(firstCapture).toMatchObject({ tags: {
+      task_url: "https://paperclip.example.com/TEAM/issues/TEAM-42",
+      run_url: `https://paperclip.example.com/TEAM/agents/${first.agentId}/runs/${first.runId}`,
+    }, contexts: { paperclip: { taskUrl: "https://paperclip.example.com/TEAM/issues/TEAM-42" } } });
+    expect(captured(second.errorMessage)).toHaveProperty("tags.task_url", "https://paperclip.example.com/TEAM/issues/TEAM-43");
+    expect(captured("run-related request error")).toHaveProperty("tags.task_url", "https://paperclip.example.com/TEAM/issues/TEAM-42");
+    expect(events.find(event => (event.tags as Record<string, unknown>)?.error_code === "adapter_stop_unconfirmed"))
+      .toHaveProperty("tags.task_url", "https://paperclip.example.com/TEAM/issues/TEAM-42");
     const exceptions = (firstCapture.exception as { values: Array<Record<string, unknown>> }).values;
     expect(exceptions).toHaveLength(2);
     expect(JSON.stringify(exceptions)).toContain("originalAdapter");
@@ -379,7 +486,7 @@ describe.skipIf(!sentryPackage)("run failure context with the real Sentry SDK", 
         expect(event).not.toHaveProperty(`contexts.${context}`);
       }
       expect(event).not.toHaveProperty("fingerprint");
-      for (const tag of ["run_id", "task_id", "error_code", "agent_adapter", "run_status"]) {
+      for (const tag of ["run_id", "task_id", "error_code", "agent_adapter", "run_status", "task_url", "run_url", "task_identifier"]) {
         expect(event).not.toHaveProperty(`tags.${tag}`);
       }
     }
@@ -526,3 +633,6 @@ describe.skipIf(!sentryPackage)("run failure context with the real Sentry SDK", 
   });
 
 });
+
+
+enableRunFailureReporting();

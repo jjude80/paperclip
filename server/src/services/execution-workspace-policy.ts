@@ -130,6 +130,7 @@ export function parseProjectExecutionWorkspacePolicy(raw: unknown): ProjectExecu
   })();
   return {
     enabled,
+    ...(typeof parsed.storageProviderPluginId === "string" ? { storageProviderPluginId: parsed.storageProviderPluginId } : {}),
     ...(sharedWorkspaceConcurrency ? { sharedWorkspaceConcurrency } : {}),
     ...(normalizedDefaultMode ? { defaultMode: normalizedDefaultMode } : {}),
     ...(allowIssueOverride !== undefined ? { allowIssueOverride } : {}),
@@ -272,6 +273,7 @@ export function selectEnvironmentExecutionWorkspaceSettings(
 }
 
 export type ExecutionWorkspaceEnvironmentSource =
+  | "issue"
   | "agent"
   | "instance"
   | "default"
@@ -294,6 +296,8 @@ export class ManagedSandboxUnavailableError extends Error {
 }
 
 export function resolveExecutionWorkspaceEnvironmentId(input: {
+  /** Explicit operator-selected sandbox for a task with a low-trust boundary. */
+  lowTrustIssueEnvironmentId?: string | null;
   agentDefaultEnvironmentId: string | null;
   instanceDefaultEnvironmentId: string | null;
   localDefaultEnvironmentId: string;
@@ -309,6 +313,9 @@ export function resolveExecutionWorkspaceEnvironmentId(input: {
   managedSandboxEnvironmentId?: string | null;
 }): ExecutionWorkspaceEnvironmentResolution {
   const resolved = ((): ExecutionWorkspaceEnvironmentResolution => {
+    if (input.lowTrustIssueEnvironmentId) {
+      return {environmentId: input.lowTrustIssueEnvironmentId, source: "issue"};
+    }
     if (input.agentDefaultEnvironmentId) {
       return {
         environmentId: input.agentDefaultEnvironmentId,
@@ -366,6 +373,108 @@ export function issueExecutionWorkspaceModeForPersistedWorkspace(
   return "shared_workspace";
 }
 
+export type ExecutionWorkspaceInheritanceDecision = {
+  bindSourceWorkspace: boolean;
+  inheritSourceSettings: boolean;
+  reason:
+    | "explicit_override"
+    | "source_workspace_isolated_per_issue"
+    | "source_workspace_shared";
+};
+
+export function resolveExecutionWorkspaceInheritanceDecision(input: {
+  sourceWorkspaceMode: string | null | undefined;
+  hasExplicitExecutionWorkspaceOverride: boolean;
+}): ExecutionWorkspaceInheritanceDecision {
+  if (input.hasExplicitExecutionWorkspaceOverride) {
+    return {
+      bindSourceWorkspace: false,
+      inheritSourceSettings: false,
+      reason: "explicit_override",
+    };
+  }
+  if (input.sourceWorkspaceMode === "isolated_workspace") {
+    return {
+      bindSourceWorkspace: false,
+      inheritSourceSettings: true,
+      reason: "source_workspace_isolated_per_issue",
+    };
+  }
+  return {
+    bindSourceWorkspace: true,
+    inheritSourceSettings: true,
+    reason: "source_workspace_shared",
+  };
+}
+
+export function buildInheritedExecutionWorkspaceSettings(input: {
+  sourceSettings: Record<string, unknown> | null | undefined;
+  sourceWorkspaceMode: string | null | undefined;
+  bindSourceWorkspace: boolean;
+}): Record<string, unknown> {
+  const settings: Record<string, unknown> = { ...(input.sourceSettings ?? {}) };
+  settings.mode = issueExecutionWorkspaceModeForPersistedWorkspace(
+    input.sourceWorkspaceMode,
+  );
+  if (!input.bindSourceWorkspace) {
+    const strategy = parseObject(settings.workspaceStrategy);
+    if (typeof strategy.existingBranch === "string") {
+      const nextStrategy = { ...strategy };
+      delete nextStrategy.existingBranch;
+      if (Object.keys(nextStrategy).length > 0) {
+        settings.workspaceStrategy = nextStrategy;
+      } else {
+        delete settings.workspaceStrategy;
+      }
+    }
+  }
+  return settings;
+}
+
+export function resolveExecutionWorkspaceStrategyConfig(input: {
+  config: Record<string, unknown> | null | undefined;
+  conflictingWorkspaceOwnerIssueId: string | null | undefined;
+}): Record<string, unknown> {
+  const config = { ...(input.config ?? {}) };
+  if (!input.conflictingWorkspaceOwnerIssueId) return config;
+  const strategy = parseObject(config.workspaceStrategy);
+  if (typeof strategy.existingBranch !== "string") return config;
+  const nextStrategy = { ...strategy };
+  delete nextStrategy.existingBranch;
+  if (Object.keys(nextStrategy).length > 0) {
+    config.workspaceStrategy = nextStrategy;
+  } else {
+    delete config.workspaceStrategy;
+  }
+  return config;
+}
+
+export function resolveExecutionWorkspaceReuseWorkspaceId(input: {
+  reusableWorkspaceId: string | null | undefined;
+  requestedWorkspaceId: string | null | undefined;
+  conflictingWorkspaceOwnerIssueId: string | null | undefined;
+}): string | null {
+  if (input.reusableWorkspaceId) return input.reusableWorkspaceId;
+  if (input.conflictingWorkspaceOwnerIssueId) return null;
+  return input.requestedWorkspaceId ?? null;
+}
+
+export function resolveExecutionWorkspaceConflictNotice(input: {
+  conflictingWorkspaceOwnerIssueId: string | null | undefined;
+  executionWorkspacePreference: string | null | undefined;
+  requestedExecutionWorkspaceId: string | null | undefined;
+  executionWorkspaceId: string | null | undefined;
+}): { shouldNotify: boolean; ownerIssueId: string | null; marker: string } {
+  const ownerIssueId = input.conflictingWorkspaceOwnerIssueId ?? null;
+  const marker = `workspace_conflict:${input.executionWorkspaceId ?? "none"}`;
+  const shouldNotify = Boolean(
+    ownerIssueId &&
+      input.executionWorkspacePreference === "reuse_existing" &&
+      input.requestedExecutionWorkspaceId,
+  );
+  return { shouldNotify, ownerIssueId, marker };
+}
+
 export function resolveExecutionWorkspaceMode(input: {
   projectPolicy: ProjectExecutionWorkspacePolicy | null;
   issueSettings: IssueExecutionWorkspaceSettings | null;
@@ -387,6 +496,31 @@ export function resolveExecutionWorkspaceMode(input: {
   return "shared_workspace";
 }
 
+interface ParsedIssueAssigneeAdapterOverrides {
+  adapterConfig: Record<string, unknown> | null;
+  useProjectWorkspace: boolean | null;
+}
+
+export function parseIssueAssigneeAdapterOverrides(
+  raw: unknown,
+): ParsedIssueAssigneeAdapterOverrides | null {
+  const parsed = parseObject(raw);
+  const parsedAdapterConfig = Object.fromEntries(
+    Object.entries(parseObject(parsed.adapterConfig)).filter(([key]) => key !== "homeMode"),
+  );
+  const adapterConfig =
+    Object.keys(parsedAdapterConfig).length > 0 ? parsedAdapterConfig : null;
+  const useProjectWorkspace =
+    typeof parsed.useProjectWorkspace === "boolean"
+      ? parsed.useProjectWorkspace
+      : null;
+  if (!adapterConfig && useProjectWorkspace === null) return null;
+  return {
+    adapterConfig,
+    useProjectWorkspace,
+  };
+}
+
 function parseSharedWorkspaceConcurrency(raw: unknown): SharedWorkspaceConcurrency | undefined {
   return raw === "auto" || raw === "serialize" || raw === "allow" ? raw : undefined;
 }
@@ -402,6 +536,7 @@ export function resolveSharedWorkspaceConcurrency(input: {
 
 export function buildExecutionWorkspaceAdapterConfig(input: {
   agentConfig: Record<string, unknown>;
+  adapterConfigOverrides?: Record<string, unknown> | null;
   projectPolicy: ProjectExecutionWorkspacePolicy | null;
   issueSettings: IssueExecutionWorkspaceSettings | null;
   mode: ParsedExecutionWorkspaceMode;
@@ -444,5 +579,21 @@ export function buildExecutionWorkspaceAdapterConfig(input: {
     }
   }
 
-  return nextConfig;
+  return { ...nextConfig, ...input.adapterConfigOverrides };
+}
+
+export function taskWorkspaceRuntimeSelectionEnabled(input: {
+  legacyUiEnabled: boolean;
+  hasTypedSelection: boolean;
+  hasBinding: boolean;
+}): boolean {
+  return input.legacyUiEnabled || input.hasTypedSelection || input.hasBinding;
+}
+
+export function canApplyTaskWorkspaceSelectionAtAdmission(input: {
+  admittedInput: unknown;
+  restarting: boolean;
+  hasLeaseOwner: boolean;
+}): boolean {
+  return input.admittedInput == null && !input.restarting && !input.hasLeaseOwner;
 }

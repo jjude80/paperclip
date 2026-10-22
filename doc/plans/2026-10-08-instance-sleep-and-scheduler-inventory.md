@@ -76,6 +76,21 @@ Implementation: `packages/db/src/work-signals.ts`,
 `server/src/services/work-scheduler.ts`, `delivery-work-coordinator.ts`, and
 `delivery-work-notifications.ts`.
 
+## Routine external-wake contract
+
+Updated: 2026-10-13. Signed Cloud control callers can request the earliest
+supported future routine deadline during an owned idle hold. The report binds
+its generation to the process, hold and routine/trigger catalog. Cloud must
+commit a durable alarm and revalidate the same generation before stopping.
+See [idle-sleep safety](../idle-sleep-safety.md#scheduled-routine-wake-protocol).
+
+This is a bounded routine-only slice of external waking. Existing routine
+execution, catch-up and local ticking remain unchanged. It does not expose the
+whole work scheduler's deadline or migrate other loops. Unknown triggers,
+pending work, agent timers, plugin jobs and other unsupported sources remain
+sleep blockers. Full provider sleep/wake qualification and fleet enablement
+remain open; route and embedded-Postgres tests establish the local contract.
+
 ## Using this checklist
 
 Items have stable IDs so they can become separate issues or PRs. All boxes start
@@ -399,6 +414,13 @@ flowchart LR
   explicit deep readiness still tests DB health, and signed claim/bootstrap
   mutations retain their existing validation and tracking.
 
+  Implementation progress: `/api/liveness` reports startup state and the public
+  commit without auth/session resolution, SQL, or provider I/O. It is mounted
+  after hostname and signed-bootstrap validation, before standby/auth, and its
+  exact GET/HEAD route stays reachable without adding a sleep hold. `/api/health`
+  retains database readiness and signed bootstrap. Callers must opt into the
+  liveness endpoint; this does not claim all external probes are migrated.
+
 - [ ] **DB-05 — Audit external probes and configured endpoints.** Inspect the
   fleet gateway, uptime monitors, deployment checks, DB pool settings, and Neon
   suspend configuration. The [ECS example](../../docker/ecs-task-definition.json)
@@ -415,12 +437,63 @@ from event-driven normal paths and route only real deadlines through the interna
 scheduler. Preserve durable delivery, startup recovery, and domain-level claims.
 Longer polling intervals alone do not complete an item.
 
-- [ ] **JOB-01 — Chat reconciliation.** Current: every **1s**, with multiple
-  runtime/delivery/publication lanes and SQL even without connectors. Change:
-  disarm empty lanes and activate on committed events or deadlines. **Complete
-  when:** a tenant with no chat obligations issues no chat SQL and new inbound,
-  publication, and recovery work still runs. Sources:
+- [ ] **JOB-01 — Chat reconciliation.** Partially migrated on 2026-10-10.
+  Inbound deliveries, outbound publications, and Slack upload receipt recovery
+  now use transaction-aware commit wakes and durable retry/claim deadlines.
+  Empty queues disarm after startup. Publication deadlines use the dispatch
+  eligibility predicate so paused endpoints, unknown outcomes, blocked followers,
+  and receipts owned by a live sender do not cause empty scans. Completion wakes
+  refill free endpoint slots without waiting for slow peers. No new tables.
+  Five additional queues now use independent commit/deadline workers:
+  Slack Board messages, slash-command task starts, setup verification messages,
+  receipt reactions, and Slack session stops. Their producers and foreground
+  claim/retry/settlement writes signal inside the owning transaction. The same
+  eligibility predicates drive dispatch and deadline selection. Paused task
+  starts/Board messages and uncertain sends have no recurring deadline.
+  Verification waits for account linking, welcome completion, and a verified
+  callback; those state changes wake it. Failed confirmed task admission saves
+  a retry deadline so its commit cannot cause an immediate retry loop.
+  Startup restores existing rows, and empty workers disarm. No new tables.
+  Tests cover an idle hour, real producer notifications, PostgreSQL deadline
+  selection, stale claims, outer-transaction wakes, and callback-driven setup.
+  Three more existing action queues now use commit/deadline workers: provider
+  messages/notices, accepted GitHub webhook receipts, and Slack session sync.
+  Foreground claims, retries, operator resolution, and settlement writes signal
+  in their transaction. Shared predicates select pending rows and deadlines;
+  terminal history and uncertain provider sends have no deadline. Stale provider
+  sends remain quarantined, while GitHub receipts retain bounded replay and
+  their existing attempt fences. Slack sync retains the 30-minute refresh for
+  running sessions and pauses without rescheduling until an endpoint change.
+  Tests exercise real producers with deferred fast paths disabled, retry and
+  startup recovery, stale-send quarantine, and zero scans after settlement.
+  Failed chat-run retries now also use commit wakes and durable deadlines from
+  existing action rows. Issued retries honor `retryAt`; processing claims wait
+  for both stale-claim expiry and any saved retry time. Startup recovers unfinished
+  requests. Claim and settlement writes signal in their own short transactions,
+  with agent wakeup outside those transactions. Empty and terminal queues disarm.
+  Telegram maintenance now has separate commit-driven discovery and action
+  workers. Discovery restores legacy subscription obligations on startup and
+  after endpoint or chat-connection configuration commits, without recurring
+  empty scans. Startup walks keyset pages with at most 100 endpoints per run,
+  so endpoints beyond the first page remain discoverable. Configuration commits
+  carry connection hints through outer settlement and uncertainty recovery;
+  they only revisit the changed connection. Failed discovery retains its page,
+  and concurrent edits queue a fresh scoped pass. Existing action rows provide retry and stale-claim
+  deadlines. Stop-subscription repair parks while the endpoint or connection
+  is inactive; registration and removal keep their existing eligibility.
+  The explicit bounded recovery helper remains available. Provider subscription
+  proof, credential ownership, and idempotent provider mutations stay in the
+  Telegram service. Provider responses are simulated in the PostgreSQL tests.
+  Remaining **1s** maintenance: provider runtimes,
+  run milestone/wake-notice projection, GitHub operation
+  recovery, and Teams protocol maintenance. GitHub pre-ingress recovery
+  must still inspect provider history: a lost callback has no local queue row.
+  This slice does **not** yet make the whole chat subsystem quiet. Independent
+  DB roots/direct SQL require startup recovery, as with the other migrated queues.
+  **Complete when:** all remaining lanes are demand/deadline-driven and a tenant
+  with no chat obligations issues no chat SQL. Sources:
   [app.ts](../../server/src/app.ts),
+  [chat-delivery-work.ts](../../server/src/services/chat-delivery-work.ts),
   [chat-channels.ts](../../server/src/services/chat-channels.ts).
 
 - [x] **JOB-02 — Email reconciliation.** Replaced the unconditional **1s**
@@ -438,10 +511,14 @@ Longer polling intervals alone do not complete an item.
   catch-up remain the recovery boundaries. Source:
   [email-channels.ts](../../server/src/services/email-channels.ts).
 
-- [ ] **JOB-03 — Browser-use cleanup.** Current: every **3s** with due-session
-  queries even when empty. Change: register actual session reconciliation/expiry
-  deadlines. **Complete when:** no sessions means no queries, while active leases,
-  expiry, and failed cleanup remain recoverable. Sources:
+- [x] **JOB-03 — Browser-use cleanup.** Replaced the empty **3s** scan with
+  transaction-aware session signals and deadlines from existing `nextPollAt` and
+  `leaseUntil` columns. Startup restores unfinished work; no live sessions means
+  no recurring browser SQL or timer. Active and idle sessions retain provider
+  polling, expiry checks, lease renewal, and cleanup retries. Credential-removal
+  sweeps signal lease release so background cleanup resumes promptly. Standby
+  suppresses SQL; idle drain defers dispatch with a memory-only wake. No new
+  tables. Independent DB roots/direct SQL require restart recovery. Sources:
   [app.ts](../../server/src/app.ts),
   [browser-use.ts](../../server/src/services/browser-use.ts).
 
@@ -459,13 +536,13 @@ Longer polling intervals alone do not complete an item.
   retain subscription scope, expiry, and replay safety. Source:
   [events.ts](../../server/src/services/public-mcp/events.ts).
 
-- [ ] **JOB-06 — Execution-control reconciliation.** Current: independent
-  **15s** recovery/delivery lanes, including when the main heartbeat is disabled.
-  Change: activate lanes from durable pending work and deadlines. **Complete
-  when:** empty lanes are quiet and abandoned finalizations, replacements,
-  continuations, status/disposition delivery, and login expiry still recover.
-  Sources: [index.ts](../../server/src/index.ts),
-  [execution-control-deadline.ts](../../server/src/services/execution-control-deadline.ts).
+- [x] **JOB-06 — Execution-control reconciliation.** Implemented in
+  [PR #17094](https://github.com/paperclipai/paperclip/pull/17094): six independent
+  workers wake from committed writes, saved control/login deadlines, or concrete
+  unfinished obligations. Empty queues and completed history no longer cause
+  recurring SQL. Existing 15s retries remain for pending work; Cloud sleep
+  eligibility and external alarm coverage are unchanged. See the
+  [worker and producer contract](../idle-execution-control.md).
 
 - [ ] **JOB-07 — Plugin job scheduling.** Current: **30s** SQL even without jobs.
   Change: register nearest `nextRunAt` and signal registration/update/removal.
@@ -543,12 +620,16 @@ Longer polling intervals alone do not complete an item.
   malformed/unpersisted spool entries. Source:
   [heartbeat.ts](../../server/src/services/heartbeat.ts), `sweepPendingCleanupLeases`.
 
-- [ ] **JOB-18 — Adapter login and setup-token reapers.** Current: **30s**
-  durable-session/lease scans, alongside local one-shot timers. Change: register
-  actual expiry and cleanup retry times. **Complete when:** abandoned logins and
-  interrupted teardown still release sandboxes across restart, without scans
-  when no obligations exist. Source:
-  [index.ts](../../server/src/index.ts), adapter and setup-token reaper wiring.
+- [x] **JOB-18 — Adapter login and setup-token reapers.** Replaced the default
+  **30s** empty scans with commit-aware workers, session/promotion expiry
+  deadlines, and retries for concrete failed cleanup. Existing session and lease
+  rows remain authoritative; no queue table was added. Startup reconstructs work,
+  and drain retains deferred generations. Tagged orphan recovery protects live
+  acquisitions and includes terminal/missing-session orphans. Local-subscription
+  rows remain owned by their separate worker. General failed-acquisition spool
+  recovery and host-sleep blockers are unchanged. See
+  [idle-login-cleanup.md](../idle-login-cleanup.md) for producer coverage,
+  verification and remaining provider-orphan boundaries.
 
 - [ ] **JOB-19 — Custom-image setup expiry.** Current: **30s** active-session
   expiry scans. Change: register `expiresAt` and cleanup attempts. **Complete

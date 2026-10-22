@@ -26,6 +26,7 @@ import {
 import type { Db } from "@paperclipai/db";
 import {
   agents,
+  chatVoiceSessions,
   authUsers,
   companySecretProposals,
   companies,
@@ -2738,6 +2739,7 @@ export function issueThreadInteractionService(
         }
         await touchIssue(tx, issue.id);
         inserted = true;
+        await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
         return row;
       });
 
@@ -3643,6 +3645,7 @@ export function issueThreadInteractionService(
                     isNotNull(issueComments.authorUserId),
                     ne(issueComments.authorUserId, "board-concierge"),
                     isNull(issueComments.createdByRunId),
+              eq(issueComments.origin, "comment"),
                     isNull(issueComments.deletedAt),
                     gte(issueComments.createdAt, sourceRunCreatedAt),
                   ),
@@ -3673,6 +3676,15 @@ export function issueThreadInteractionService(
               target: data.payload.target ?? null,
               lockForUpdate: true,
             });
+          }
+          // An unverified phone caller has no authenticated human identity.
+          // Their clarifications use the ordinary task-comment/follow-up queue;
+          // a protected native question would otherwise wait indefinitely.
+          if (data.kind === "ask_user_questions" && !actor.userId) {
+            const [guest] = await tx.select({id: chatVoiceSessions.id}).from(chatVoiceSessions)
+              .where(and(eq(chatVoiceSessions.companyId, issue.companyId), eq(chatVoiceSessions.issueId, issue.id),
+                eq(chatVoiceSessions.callerAuthority, "guest_intake"))).limit(1);
+            if (guest) throw unprocessable("Ask this unverified caller a clarification in a task comment; submit_request will deliver their spoken follow-up. Protected human-input questions require authenticated access.", {code: "voice_guest_use_task_comment"});
           }
           const [row] = await tx
             .insert(issueThreadInteractions)
@@ -4332,10 +4344,11 @@ export function issueThreadInteractionService(
         createdAt: Date | string;
         authorUserId?: string | null;
         createdByRunId?: string | null;
+        origin?: string | null;
       },
       actor: InteractionActor,
     ) => {
-      if (!comment.authorUserId) return [];
+      if (!comment.authorUserId || comment.origin === "fast_response") return [];
       // Local-CLI adapters post under user auth, so authorUserId can't tell a human from a
       // machine; createdByRunId can. Only genuine human comments (no run context) supersede.
       if (comment.createdByRunId) return [];
@@ -4446,6 +4459,7 @@ export function issueThreadInteractionService(
               isNotNull(issueComments.authorUserId),
               // Only genuine human comments supersede; machine-originated ones carry createdByRunId.
               isNull(issueComments.createdByRunId),
+              eq(issueComments.origin, "comment"),
             ),
           )
           .orderBy(asc(issueComments.createdAt)),
@@ -4732,12 +4746,46 @@ export function issueThreadInteractionService(
     },
 
     expireConnectionIntentsForOwnershipChange: async (issue: { id: string; companyId: string }) => {
-      const expired = await db.update(issueThreadInteractions).set({
-        status: "expired", result: { version: 1, outcome: "expired", reason: "The task assignment changed" },
-        resolvedAt: now(), updatedAt: now(),
-      }).where(and(eq(issueThreadInteractions.companyId, issue.companyId), eq(issueThreadInteractions.issueId, issue.id),
-        eq(issueThreadInteractions.kind, "connection_intent"), eq(issueThreadInteractions.status, "pending"))).returning();
-      if (expired.length) await db.delete(toolOauthStates).where(inArray(toolOauthStates.interactionId, expired.map((row) => row.id)));
+      // A pending connection_intent asks for either an AI account or a tool
+      // account, and the two leave different things broken. One bulk write gave
+      // every row the AI wording, so an expired Notion request told the reader
+      // the AI account was missing. Read the pending rows first and name the
+      // subject each row actually asked for.
+      const pending = await db
+        .select({ id: issueThreadInteractions.id, payload: issueThreadInteractions.payload })
+        .from(issueThreadInteractions)
+        .where(and(
+          eq(issueThreadInteractions.companyId, issue.companyId),
+          eq(issueThreadInteractions.issueId, issue.id),
+          eq(issueThreadInteractions.kind, "connection_intent"),
+          eq(issueThreadInteractions.status, "pending"),
+        ));
+      const expired: typeof issueThreadInteractions.$inferSelect[] = [];
+      for (const row of pending) {
+        const payload = row.payload as { purpose?: string; serviceName?: string } | null;
+        const subject = payload?.purpose === "ai"
+          ? "the AI account"
+          : `the ${payload?.serviceName?.trim() || "requested"} connection`;
+        const [updated] = await db
+          .update(issueThreadInteractions)
+          .set({
+            status: "expired",
+            result: {
+              version: 1,
+              outcome: "expired",
+              reason: `The task was reassigned before the connection request was answered, so ${subject} is still not connected. Reconnect it or choose an available connection.`,
+            },
+            resolvedAt: now(),
+            updatedAt: now(),
+          })
+          .where(and(
+            eq(issueThreadInteractions.id, row.id),
+            eq(issueThreadInteractions.status, "pending"),
+          ))
+          .returning();
+        if (updated) expired.push(updated);
+      }
+      if (expired.length) await db.delete(toolOauthStates).where(inArray(toolOauthStates.interactionId, expired.map((item) => item.id)));
       return expired;
     },
     expirePendingInteractionsForTerminalIssue: async (
