@@ -48,6 +48,7 @@ import {
   type ResolvedWorkspaceForRun,
 } from "../services/heartbeat.ts";
 import { stripHostWorkspaceProvision } from "../services/heartbeat/workspaces.js";
+import { resolveExecutionWorkspaceStrategyConfig } from "../services/execution-workspace-policy.js";
 import type { TrustPresetResolution } from "../services/trust-preset-resolver.ts";
 
 const execFile = promisify(execFileCallback);
@@ -1916,8 +1917,6 @@ describe("effective run execution workspace config freshness", () => {
     });
   });
 
-  // NEXA-424: an isolated workspace is one issue's worktree. A second issue
-  // that points at it is refused, and the refusal names the holder.
   it("refuses to reuse another issue's isolated workspace and names the holder", () => {
     expect(resolveExecutionWorkspaceReuseRequestForIssue({
       issueExecutionWorkspaceId: "workspace-parent",
@@ -1931,6 +1930,28 @@ describe("effective run execution workspace config freshness", () => {
       requestedShouldReuseExisting: false,
       existingExecutionWorkspaceAvailable: false,
       conflictingWorkspaceOwnerIssueId: "issue-parent",
+    });
+  });
+
+  it("drops the inherited branch so a refused child cannot realize into the holder's checkout", () => {
+    const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
+      issueExecutionWorkspaceId: "workspace-parent",
+      issueExecutionWorkspacePreference: "reuse_existing",
+      existingExecutionWorkspaceStatus: "active",
+      issueId: "issue-child",
+      existingExecutionWorkspaceMode: "isolated_workspace",
+      existingExecutionWorkspaceSourceIssueId: "issue-parent",
+    });
+    expect(reuseRequest.requestedShouldReuseExisting).toBe(false);
+    expect(resolveExecutionWorkspaceStrategyConfig({
+      config: {
+        mode: "isolated_workspace",
+        workspaceStrategy: { type: "git_worktree", existingBranch: "NEXA-415-thing" },
+      },
+      conflictingWorkspaceOwnerIssueId: reuseRequest.conflictingWorkspaceOwnerIssueId,
+    })).toEqual({
+      mode: "isolated_workspace",
+      workspaceStrategy: { type: "git_worktree" },
     });
   });
 
