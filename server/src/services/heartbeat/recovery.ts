@@ -1109,12 +1109,14 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
   async function captureShutdownSnapshot(
     signal: "SIGINT" | "SIGTERM",
     now = new Date(),
+    runIdsToCapture: readonly string[] | null = null,
   ) {
     const capturedAt = now.toISOString();
+    const restriction = runIdsToCapture ? new Set(runIdsToCapture) : null;
     const inMemoryRunIds = [...new Set([
       ...runningProcesses.keys(),
       ...activeRunExecutions,
-    ])];
+    ])].filter((id) => !restriction || restriction.has(id));
     // Write the in-memory evidence first. The database may already be going
     // down, and a query that waits behind a lock must not keep even this
     // partial snapshot off disk.
@@ -1174,6 +1176,11 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         { err, signal },
         "failed to read running runs for the shutdown snapshot; using in-memory executions only",
       );
+    }
+    if (restriction) {
+      for (const id of [...runIds]) {
+        if (!restriction.has(id)) runIds.delete(id);
+      }
     }
     const finalRunIds = [...runIds].sort();
     await writeShutdownSnapshot({

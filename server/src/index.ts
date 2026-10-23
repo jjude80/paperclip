@@ -2116,7 +2116,7 @@ async function startServerWithDatabaseTeardown(
       // down with it; this snapshot is what lets the next boot classify the
       // run as a service interruption instead of an adapter failure.
       try {
-        const snapshot = await heartbeat.captureShutdownSnapshot(signal);
+        const snapshot = await heartbeat.captureShutdownSnapshot(signal, new Date(), selectiveDrainRunIds);
         logger.info(
           { signal, capturedAt: snapshot.capturedAt, runIds: snapshot.runIds },
           "captured durable shutdown run snapshot",

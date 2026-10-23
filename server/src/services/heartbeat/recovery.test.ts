@@ -626,6 +626,25 @@ describePostgres("heartbeat recovery module ownership", () => {
     await db.delete(heartbeatRuns).where(inArray(heartbeatRuns.id, [foreign.id, nativeRun.id]));
   });
 
+  it("limits a selective restart snapshot to the runs the drain will stop", async () => {
+    const drained = await seedRun();
+    const surviving = await seedRun();
+    await db.update(heartbeatRuns)
+      .set({ controllerBootId: legacyControllerBootId })
+      .where(inArray(heartbeatRuns.id, [drained.id, surviving.id]));
+    const deps = callbacks(db);
+
+    const snapshot = await createHeartbeatRecovery(db, deps).captureShutdownSnapshot(
+      "SIGTERM",
+      new Date("2026-10-22T07:42:45.000Z"),
+      [drained.id],
+    );
+
+    expect(snapshot.runIds).toEqual([drained.id]);
+    expect(shutdownSnapshot.write).toHaveBeenLastCalledWith(expect.objectContaining({ runIds: [drained.id] }));
+    await db.delete(heartbeatRuns).where(inArray(heartbeatRuns.id, [drained.id, surviving.id]));
+  });
+
   it("retains unfinished shutdown ids and resumes their settlement on the next pass", async () => {
     const run = await seedRun();
     await db.update(heartbeatRuns).set({
