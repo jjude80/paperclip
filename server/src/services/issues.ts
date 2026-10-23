@@ -10204,6 +10204,8 @@ export function issueService(db: Db) {
               .select({
                 id: executionWorkspaces.id,
                 mode: executionWorkspaces.mode,
+                strategyType: executionWorkspaces.strategyType,
+                branchName: executionWorkspaces.branchName,
               })
               .from(executionWorkspaces)
               .where(
@@ -10223,6 +10225,8 @@ export function issueService(db: Db) {
                   sourceSettings: workspaceSource.executionWorkspaceSettings as
                     Record<string, unknown> | null | undefined,
                   sourceWorkspaceMode: sourceWorkspace.mode,
+                  sourceWorkspaceStrategyType: sourceWorkspace.strategyType,
+                  sourceWorkspaceBranchName: sourceWorkspace.branchName,
                   bindSourceWorkspace: inheritance.bindSourceWorkspace,
                 });
               }

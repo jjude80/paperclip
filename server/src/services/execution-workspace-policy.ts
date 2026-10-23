@@ -407,9 +407,28 @@ export function resolveExecutionWorkspaceInheritanceDecision(input: {
   };
 }
 
+function retargetPinnedBranchAsBaseRef(
+  strategy: Record<string, unknown>,
+  fallbackBaseRef: string | null,
+): Record<string, unknown> {
+  const nextStrategy = { ...strategy };
+  const pinnedBranch =
+    typeof nextStrategy.existingBranch === "string"
+      ? nextStrategy.existingBranch.trim()
+      : "";
+  delete nextStrategy.existingBranch;
+  if (typeof nextStrategy.baseRef !== "string" || nextStrategy.baseRef.trim().length === 0) {
+    const baseRef = fallbackBaseRef ?? (pinnedBranch.length > 0 ? pinnedBranch : null);
+    if (baseRef) nextStrategy.baseRef = baseRef;
+  }
+  return nextStrategy;
+}
+
 export function buildInheritedExecutionWorkspaceSettings(input: {
   sourceSettings: Record<string, unknown> | null | undefined;
   sourceWorkspaceMode: string | null | undefined;
+  sourceWorkspaceStrategyType?: string | null;
+  sourceWorkspaceBranchName?: string | null;
   bindSourceWorkspace: boolean;
 }): Record<string, unknown> {
   const settings: Record<string, unknown> = { ...(input.sourceSettings ?? {}) };
@@ -417,15 +436,26 @@ export function buildInheritedExecutionWorkspaceSettings(input: {
     input.sourceWorkspaceMode,
   );
   if (!input.bindSourceWorkspace) {
-    const strategy = parseObject(settings.workspaceStrategy);
-    if (typeof strategy.existingBranch === "string") {
-      const nextStrategy = { ...strategy };
-      delete nextStrategy.existingBranch;
-      if (Object.keys(nextStrategy).length > 0) {
-        settings.workspaceStrategy = nextStrategy;
-      } else {
-        delete settings.workspaceStrategy;
+    const sourceStrategy = parseObject(settings.workspaceStrategy);
+    const sourceWorkspaceBranchName =
+      typeof input.sourceWorkspaceBranchName === "string"
+        ? input.sourceWorkspaceBranchName.trim()
+        : "";
+    const parentIntegrationBranch =
+      input.sourceWorkspaceStrategyType === "git_worktree" && sourceWorkspaceBranchName.length > 0
+        ? sourceWorkspaceBranchName
+        : null;
+    const nextStrategy = retargetPinnedBranchAsBaseRef(sourceStrategy, parentIntegrationBranch);
+    if (parentIntegrationBranch) {
+      nextStrategy.baseRef = parentIntegrationBranch;
+      if (nextStrategy.type === undefined) {
+        nextStrategy.type = "git_worktree";
       }
+    }
+    if (Object.keys(nextStrategy).length > 0) {
+      settings.workspaceStrategy = nextStrategy;
+    } else {
+      delete settings.workspaceStrategy;
     }
   }
   return settings;
@@ -439,8 +469,7 @@ export function resolveExecutionWorkspaceStrategyConfig(input: {
   if (!input.conflictingWorkspaceOwnerIssueId) return config;
   const strategy = parseObject(config.workspaceStrategy);
   if (typeof strategy.existingBranch !== "string") return config;
-  const nextStrategy = { ...strategy };
-  delete nextStrategy.existingBranch;
+  const nextStrategy = retargetPinnedBranchAsBaseRef(strategy, null);
   if (Object.keys(nextStrategy).length > 0) {
     config.workspaceStrategy = nextStrategy;
   } else {
