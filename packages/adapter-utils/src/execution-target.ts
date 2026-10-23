@@ -1763,13 +1763,35 @@ export async function prepareGitHubOperationLaunchers(input: {
   const managedPath = basePath ? `${directory}:${basePath}` : directory;
   // Login shells may reorder PATH through /etc/profile or path_helper. Restore
   // the managed launchers after startup without loading a host user's profile.
+  // Prepend the launcher directory to the inherited PATH instead of replacing
+  // it: build steps routinely provision a tool by prepending a shim directory
+  // before starting a child shell, and a replacement here silently drops it
+  // (the failure reads as "command not found" for a tool that is installed).
+  // The `case` guard keeps a shell nested under an already-restored PATH from
+  // duplicating the directory on every nesting level.
+  const launcherDirPattern = directory.replace(/[\\*?[\]]/g, "\\$&");
+  const fallbackPath = basePath || "/usr/bin:/bin";
+  const restoreLauncherPath = [
+    `_paperclip_launcher_dir=${shellQuote(directory)}`,
+    `case ":\${PATH-}:" in`,
+    `  *:${launcherDirPattern}:*) ;;`,
+    `  *) if [ -n "\${PATH-}" ]; then`,
+    `       PATH="\${_paperclip_launcher_dir}:\${PATH}"`,
+    `     else`,
+    `       PATH="\${_paperclip_launcher_dir}":${shellQuote(fallbackPath)}`,
+    `     fi`,
+    `     export PATH ;;`,
+    `esac`,
+    `unset _paperclip_launcher_dir`,
+    ``,
+  ].join("\n");
   // Empty merge overrides clear host identity before launch, but Git treats
   // them as an explicit empty author. Remove them once the shell has inherited
   // its final environment; preserve nonempty per-operation identity values.
   const clearEmptyGitIdentity = ["GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"]
     .map((key) => `if [ -z "\${${key}-}" ]; then unset ${key}; fi\n`)
     .join("");
-  const profile = `export PATH=${shellQuote(managedPath)}\n${clearEmptyGitIdentity}`;
+  const profile = `${restoreLauncherPath}${clearEmptyGitIdentity}`;
   const files: Record<string, string> = Object.fromEntries([
     // Remote launchers live beneath the checkout. Pin their own package scope
     // so an enclosing project's "type": "module" cannot reinterpret require().
