@@ -1933,7 +1933,7 @@ describe("effective run execution workspace config freshness", () => {
     });
   });
 
-  it("drops the inherited branch so a refused child cannot realize into the holder's checkout", () => {
+  it("drops the inherited branch pin and keeps it as the refused child's base ref", () => {
     const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
       issueExecutionWorkspaceId: "workspace-parent",
       issueExecutionWorkspacePreference: "reuse_existing",
@@ -1951,7 +1951,7 @@ describe("effective run execution workspace config freshness", () => {
       conflictingWorkspaceOwnerIssueId: reuseRequest.conflictingWorkspaceOwnerIssueId,
     })).toEqual({
       mode: "isolated_workspace",
-      workspaceStrategy: { type: "git_worktree" },
+      workspaceStrategy: { type: "git_worktree", baseRef: "holder-branch" },
     });
   });
 
