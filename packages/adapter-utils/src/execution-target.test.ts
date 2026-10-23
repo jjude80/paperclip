@@ -1,5 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { access, readFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import { access, mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as ssh from "./ssh.js";
 import * as serverUtils from "./server-utils.js";
@@ -387,5 +390,65 @@ describe("GitHub launcher lifecycle", () => {
       cwd: "/remote/workspace", timeoutMs: 5_000 });
     await expect(cleanupGitHubOperationLaunchers({ runId: "../other", target })).rejects.toThrow("Invalid GitHub launcher run ID");
     expect(runner.execute).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("GitHub launcher PATH inheritance", () => {
+  it("keeps a directory the caller prepended to PATH in child shells", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-launcher-path-"));
+    const runId = randomUUID();
+    try {
+      // A build step provisions a tool by prepending a shim directory and then
+      // starts a shell script. The staged BASH_ENV must keep that entry.
+      const shim = path.join(root, "pnpm-bin");
+      await mkdir(shim, { recursive: true });
+      const env = await prepareGitHubOperationLaunchers({
+        runId, target: null, cwd: root, env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
+      });
+      const callerPath = [shim, env.PATH].join(path.delimiter);
+      // stdin must not be a pipe: bash skips startup files for `bash -c` when
+      // stdin is a pipe on this host, which would hide the regression.
+      const readPath = 'printf %s "$PATH"';
+      const child = spawnSync("bash", ["-c", readPath], {
+        env: { ...process.env, ...env, PATH: callerPath },
+        stdio: ["ignore", "pipe", "pipe"], encoding: "utf8",
+      });
+      expect(child.status, child.stderr).toBe(0);
+      const entries = child.stdout.split(path.delimiter);
+      expect(entries[0]).toBe(shim);
+      expect(entries.filter((entry) => entry === env.PAPERCLIP_GITHUB_LAUNCHER_DIR)).toHaveLength(1);
+
+      const nested = spawnSync("bash", ["-c", `bash -c 'printf %s "$PATH"'`], {
+        env: { ...process.env, ...env, PATH: callerPath },
+        stdio: ["ignore", "pipe", "pipe"], encoding: "utf8",
+      });
+      expect(nested.status, nested.stderr).toBe(0);
+      const nestedEntries = nested.stdout.split(path.delimiter);
+      expect(nestedEntries[0]).toBe(shim);
+      expect(nestedEntries.filter((entry) => entry === env.PAPERCLIP_GITHUB_LAUNCHER_DIR)).toHaveLength(1);
+    } finally {
+      await cleanupGitHubOperationLaunchers({ runId, target: null });
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("falls back to the launch PATH when a shell has no PATH", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-launcher-path-"));
+    const runId = randomUUID();
+    try {
+      const launchPath = `${root}${path.delimiter}/usr/bin${path.delimiter}/bin`;
+      const env = await prepareGitHubOperationLaunchers({ runId, target: null, cwd: root, env: { PATH: launchPath } });
+      const profile = await readFile(path.join(env.PAPERCLIP_GITHUB_LAUNCHER_DIR, ".bashrc"), "utf8");
+      // Invoke by absolute path: the child has no PATH to resolve a command name.
+      const child = spawnSync(process.env.BASH || "/bin/bash", ["--noprofile", "--norc", "-c", `${profile}\nprintf %s "$PATH"`], {
+        env: { HOME: root, PATH: "" },
+        stdio: ["ignore", "pipe", "pipe"], encoding: "utf8",
+      });
+      expect(child.status, child.stderr).toBe(0);
+      expect(child.stdout.split(path.delimiter)).toEqual([env.PAPERCLIP_GITHUB_LAUNCHER_DIR, root, "/usr/bin", "/bin"]);
+    } finally {
+      await cleanupGitHubOperationLaunchers({ runId, target: null });
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });
