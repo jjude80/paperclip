@@ -1079,6 +1079,26 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     };
   }
 
+  function withDeadline<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error(`shutdown deadline exceeded after ${timeoutMs}ms`)),
+        timeoutMs,
+      );
+      timer.unref?.();
+      promise.then(
+        (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        (error) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      );
+    });
+  }
+
   /**
    * Persist the set of runs this server had in flight before the drain tries
    * to write to a database that may be shutting down with it. Runs still
@@ -1090,30 +1110,80 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     signal: "SIGINT" | "SIGTERM",
     now = new Date(),
   ) {
-    const runIds = new Set<string>([
+    const capturedAt = now.toISOString();
+    const inMemoryRunIds = [...new Set([
       ...runningProcesses.keys(),
       ...activeRunExecutions,
-    ]);
+    ])];
+    // Write the in-memory evidence first. The database may already be going
+    // down, and a query that waits behind a lock must not keep even this
+    // partial snapshot off disk.
+    await writeShutdownSnapshot({
+      version: 1,
+      capturedAt,
+      signal,
+      serverPid: process.pid,
+      runIds: [...inMemoryRunIds].sort(),
+    });
+
+    const runIds = new Set(inMemoryRunIds);
+    const inMemorySet = new Set(inMemoryRunIds);
+    const queryableInMemoryRunIds = inMemoryRunIds.filter((id) =>
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id),
+    );
     try {
-      const rows = await db
-        .select({ id: heartbeatRuns.id })
-        .from(heartbeatRuns)
-        .where(eq(heartbeatRuns.status, "running"));
-      for (const row of rows) runIds.add(row.id);
+      const rows = await withDeadline(
+        db
+          .select({
+            id: heartbeatRuns.id,
+            runtimeMode: heartbeatRuns.runtimeMode,
+            controllerBootId: heartbeatRuns.controllerBootId,
+          })
+          .from(heartbeatRuns)
+          .where(
+            and(
+              eq(heartbeatRuns.status, "running"),
+              or(
+                eq(heartbeatRuns.controllerBootId, legacyControllerBootId),
+                queryableInMemoryRunIds.length > 0
+                  ? inArray(heartbeatRuns.id, queryableInMemoryRunIds)
+                  : sql`false`,
+              ),
+            ),
+          ),
+        2_000,
+      );
+      // Keep only runs this boot owns. Another server on a shared database has
+      // a different controller boot id, and native runs are owned by their
+      // runner and recovered by the native restart path, not by this drain.
+      const ownedRows = rows.filter(
+        (row) =>
+          row.runtimeMode === "legacy" &&
+          row.controllerBootId === legacyControllerBootId,
+      );
+      const knownIds = new Set(rows.map((row) => row.id));
+      runIds.clear();
+      for (const row of ownedRows) runIds.add(row.id);
+      // An in-memory execution with no row is already gone; retaining its id
+      // is harmless and preserves the case where the write never landed.
+      for (const id of inMemorySet) {
+        if (!knownIds.has(id)) runIds.add(id);
+      }
     } catch (err) {
       logger.warn(
         { err, signal },
         "failed to read running runs for the shutdown snapshot; using in-memory executions only",
       );
     }
+    const finalRunIds = [...runIds].sort();
     await writeShutdownSnapshot({
       version: 1,
-      capturedAt: now.toISOString(),
+      capturedAt,
       signal,
       serverPid: process.pid,
-      runIds: [...runIds].sort(),
+      runIds: finalRunIds,
     });
-    return { capturedAt: now.toISOString(), runIds: [...runIds].sort() };
+    return { capturedAt, runIds: finalRunIds };
   }
 
   const SHUTDOWN_INFRA_ERROR_CODES = new Set([
@@ -1123,6 +1193,50 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     "setup_failed",
     "timeout",
   ]);
+
+  async function settleShutdownCapturedRun(
+    run: typeof heartbeatRuns.$inferSelect,
+    agent: typeof agents.$inferSelect,
+    snapshot: { signal: "SIGINT" | "SIGTERM"; capturedAt: string },
+    now: Date,
+    previousErrorCode: string | null,
+  ) {
+    const message =
+      `Interrupted by server shutdown (${snapshot.signal} at ${snapshot.capturedAt})` +
+      (previousErrorCode
+        ? `; the recorded ${previousErrorCode} was infrastructure, not an adapter failure`
+        : "");
+    await releaseEnvironmentLeasesForRun({
+      runId: run.id,
+      companyId: run.companyId,
+      agentId: run.agentId,
+      status: run.status,
+      failureReason: run.error ?? undefined,
+    });
+    const retry = await enqueueProcessLossRetry(run, agent, now, {
+      retryReason: SERVER_SHUTDOWN_RETRY_REASON,
+      wakeReason: SERVER_SHUTDOWN_RETRY_WAKE_REASON,
+    });
+    if (!retry) {
+      await releaseIssueExecutionAndPromote(run);
+    }
+    await appendRunEvent(run, {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "warn",
+      message,
+      payload: {
+        signal: snapshot.signal,
+        shutdownSnapshotCapturedAt: snapshot.capturedAt,
+        ...(previousErrorCode ? { previousErrorCode } : {}),
+        ...(retry ? { retryRunId: retry.id } : {}),
+      },
+    });
+    await finalizeAgentStatus(run.agentId, "interrupted", message, {
+      wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
+    });
+    return retry;
+  }
 
   /**
    * Finalize the runs a previous service stop found in flight.
@@ -1144,7 +1258,9 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       present: snapshot !== null,
       reclassifiedRunIds: [] as string[],
       interruptedRunIds: [] as string[],
+      resumedRunIds: [] as string[],
       retryRunIds: [] as string[],
+      retainedRunIds: [] as string[],
     };
     if (!snapshot) return result;
     if (snapshot.runIds.length === 0) {
@@ -1152,13 +1268,22 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       return result;
     }
 
-    const rows = await db
-      .select({ run: heartbeatRuns, agent: agents })
-      .from(heartbeatRuns)
-      .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
-      .where(inArray(heartbeatRuns.id, snapshot.runIds));
+    let rows: Array<{ run: typeof heartbeatRuns.$inferSelect; agent: typeof agents.$inferSelect }>;
+    try {
+      rows = await db
+        .select({ run: heartbeatRuns, agent: agents })
+        .from(heartbeatRuns)
+        .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
+        .where(inArray(heartbeatRuns.id, snapshot.runIds));
+    } catch (err) {
+      // Keep the evidence for the next boot instead of letting the orphan
+      // reaper turn these rows into adapter failures without it.
+      logger.warn({ err }, "failed to read shutdown-captured runs; retaining the snapshot");
+      return { ...result, retainedRunIds: [...snapshot.runIds] };
+    }
     const byRunId = new Map(rows.map((row) => [row.run.id, row]));
     const stillRunningRunIds: string[] = [];
+    const unfinishedRunIds = new Set<string>();
 
     for (const runId of snapshot.runIds) {
       const row = byRunId.get(runId);
@@ -1168,94 +1293,115 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         stillRunningRunIds.push(run.id);
         continue;
       }
-      if (run.status !== "failed" && run.status !== "timed_out") continue;
-      const recordedErrorCode = run.errorCode;
-      if (!recordedErrorCode || !SHUTDOWN_INFRA_ERROR_CODES.has(recordedErrorCode)) continue;
+      try {
+        if (
+          run.status === "interrupted" &&
+          run.errorCode === "server_shutdown_interrupted"
+        ) {
+          // A previous pass reclassified the row but did not finish its
+          // cleanup. Resume the remaining work instead of skipping it.
+          const retry = await settleShutdownCapturedRun(
+            run,
+            agent,
+            snapshot,
+            now,
+            null,
+          );
+          result.resumedRunIds.push(run.id);
+          if (retry) result.retryRunIds.push(retry.id);
+          continue;
+        }
+        if (run.status !== "failed" && run.status !== "timed_out") continue;
+        const recordedErrorCode = run.errorCode;
+        if (!recordedErrorCode || !SHUTDOWN_INFRA_ERROR_CODES.has(recordedErrorCode)) continue;
 
-      const message =
-        `Interrupted by server shutdown (${snapshot.signal} at ${snapshot.capturedAt}); ` +
-        `the recorded ${recordedErrorCode} was infrastructure, not an adapter failure`;
-      const [updated] = await db
-        .update(heartbeatRuns)
-        .set({
-          status: "interrupted",
-          error: message,
-          errorCode: "server_shutdown_interrupted",
-          finishedAt: run.finishedAt ?? now,
-          resultJson: mergeRunStopMetadataForAgent(agent, "interrupted", {
-            conversationContinuationEligible: await runUsedConversationAdapter(db, run),
-            resultJson: parseObject(run.resultJson),
+        const message =
+          `Interrupted by server shutdown (${snapshot.signal} at ${snapshot.capturedAt}); ` +
+          `the recorded ${recordedErrorCode} was infrastructure, not an adapter failure`;
+        const [updated] = await db
+          .update(heartbeatRuns)
+          .set({
+            status: "interrupted",
+            error: message,
             errorCode: "server_shutdown_interrupted",
-            errorMessage: message,
-          }),
-          updatedAt: now,
-        })
-        .where(
-          and(
-            eq(heartbeatRuns.id, run.id),
-            inArray(heartbeatRuns.status, ["failed", "timed_out"]),
-            eq(heartbeatRuns.errorCode, recordedErrorCode),
-          ),
-        )
-        .returning();
-      if (!updated) continue;
+            finishedAt: run.finishedAt ?? now,
+            resultJson: mergeRunStopMetadataForAgent(agent, "interrupted", {
+              conversationContinuationEligible: await runUsedConversationAdapter(db, run),
+              resultJson: parseObject(run.resultJson),
+              errorCode: "server_shutdown_interrupted",
+              errorMessage: message,
+            }),
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(heartbeatRuns.id, run.id),
+              inArray(heartbeatRuns.status, ["failed", "timed_out"]),
+              eq(heartbeatRuns.errorCode, recordedErrorCode),
+            ),
+          )
+          .returning();
+        if (!updated) continue;
 
-      result.reclassifiedRunIds.push(updated.id);
-      await releaseEnvironmentLeasesForRun({
-        runId: updated.id,
-        companyId: updated.companyId,
-        agentId: updated.agentId,
-        status: updated.status,
-        failureReason: updated.error ?? undefined,
-      });
-      const retry = await enqueueProcessLossRetry(updated, agent, now, {
-        retryReason: SERVER_SHUTDOWN_RETRY_REASON,
-        wakeReason: SERVER_SHUTDOWN_RETRY_WAKE_REASON,
-      });
-      if (retry) {
-        result.retryRunIds.push(retry.id);
-      } else {
-        await releaseIssueExecutionAndPromote(updated);
+        result.reclassifiedRunIds.push(updated.id);
+        const retry = await settleShutdownCapturedRun(
+          updated,
+          agent,
+          snapshot,
+          now,
+          recordedErrorCode,
+        );
+        if (retry) result.retryRunIds.push(retry.id);
+      } catch (err) {
+        unfinishedRunIds.add(runId);
+        logger.warn(
+          { err, runId },
+          "shutdown snapshot settlement is incomplete; retaining the run id for the next pass",
+        );
       }
-      await appendRunEvent(updated, {
-        eventType: "lifecycle",
-        stream: "system",
-        level: "warn",
-        message,
-        payload: {
-          signal: snapshot.signal,
-          shutdownSnapshotCapturedAt: snapshot.capturedAt,
-          previousErrorCode: recordedErrorCode,
-          ...(retry ? { retryRunId: retry.id } : {}),
-        },
-      });
-      await finalizeAgentStatus(updated.agentId, "interrupted", message, {
-        wasFirstHeartbeat: timerClaimWasFirstHeartbeat(updated),
-      });
     }
 
     if (stillRunningRunIds.length > 0) {
       // The snapshot is proof these rows belonged to the server that wrote
       // it, so the new boot may finalize them even though the controller boot
       // id changed.
-      const drain = await drainRunningRunsForShutdown(
-        snapshot.signal,
-        now,
-        stillRunningRunIds,
-        { allowPreviousBootOwnership: true },
-      );
-      result.interruptedRunIds.push(...drain.interruptedRunIds);
-      result.retryRunIds.push(...drain.retryRunIds);
+      try {
+        const drain = await drainRunningRunsForShutdown(
+          snapshot.signal,
+          now,
+          stillRunningRunIds,
+          { allowPreviousBootOwnership: true },
+        );
+        result.interruptedRunIds.push(...drain.interruptedRunIds);
+        result.retryRunIds.push(...drain.retryRunIds);
+        for (const runId of drain.failedRunIds) unfinishedRunIds.add(runId);
+      } catch (err) {
+        logger.warn(
+          { err },
+          "shutdown snapshot drain failed; retaining the unfinished run ids",
+        );
+        for (const runId of stillRunningRunIds) unfinishedRunIds.add(runId);
+      }
     }
 
-    await removeShutdownSnapshot();
+    result.retainedRunIds = [...unfinishedRunIds].sort();
+    if (result.retainedRunIds.length > 0) {
+      await writeShutdownSnapshot({
+        ...snapshot,
+        runIds: result.retainedRunIds,
+      });
+    } else {
+      await removeShutdownSnapshot();
+    }
     logger.warn(
       {
         signal: snapshot.signal,
         capturedAt: snapshot.capturedAt,
         reclassifiedRunIds: result.reclassifiedRunIds,
         interruptedRunIds: result.interruptedRunIds,
+        resumedRunIds: result.resumedRunIds,
         retryRunIds: result.retryRunIds,
+        retainedRunIds: result.retainedRunIds,
       },
       "reconciled runs captured by a service stop",
     );
@@ -1275,6 +1421,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         interruptedRunIds: [],
         retryRunIds: [],
         restartSuspendedRunIds: [],
+        failedRunIds: [],
       };
     }
     const activeRuns = await db
@@ -1296,6 +1443,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     const interruptedRunIds: string[] = [];
     const retryRunIds: string[] = [];
     const restartSuspendedRunIds: string[] = [];
+    const failedRunIds: string[] = [];
 
     const settlementDeadline = new Date(Date.now() + 30_000);
     const settlements = await Promise.allSettled(activeRuns.map(async ({ run, agent }) => {
@@ -1497,8 +1645,12 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       }
     }));
     for (const [index, settlement] of settlements.entries()) {
-      if (settlement.status === "rejected") logger.warn({ runId: activeRuns[index]!.run.id,
-        errorKind: "shutdown_settlement_failed" }, "Shutdown settlement failed; durable cleanup protection remains in place");
+      if (settlement.status === "rejected") {
+        const runId = activeRuns[index]!.run.id;
+        failedRunIds.push(runId);
+        logger.warn({ runId,
+          errorKind: "shutdown_settlement_failed" }, "Shutdown settlement failed; durable cleanup protection remains in place");
+      }
     }
 
     if (interruptedRunIds.length > 0) {
@@ -1518,6 +1670,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       interruptedRunIds,
       retryRunIds,
       restartSuspendedRunIds,
+      failedRunIds,
     };
   }
 

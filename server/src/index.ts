@@ -1584,6 +1584,22 @@ async function startServerWithDatabaseTeardown(
         // Legacy remote recovery releases sandbox leases. Wait for provider
         // workers before cleanup or retry admission, including unmanaged installs.
         await timeStartupRecovery("plugin_workers", () => app.locals.bundledPluginsStartup);
+        // Classify runs captured by the previous stop before native recovery,
+        // hot-restart adoption, or the orphan reaper can claim or rewrite them.
+        try {
+          const shutdownRecovery = await heartbeat.reconcileShutdownSnapshot();
+          if (shutdownRecovery.present) {
+            logger.warn(
+              shutdownRecovery,
+              "reconciled runs left in flight by a service stop",
+            );
+          }
+        } catch (err) {
+          logger.error(
+            { err },
+            "startup reconciliation of the shutdown snapshot failed - the orphan reaper will serve as degraded backstop",
+          );
+        }
         try {
           const nativeRecovery = await timeStartupRecovery("native_recovery", () => heartbeat.recoverNativeRunsAfterRestart());
           if (nativeRecovery.dispositions.length > 0) {
@@ -1621,21 +1637,6 @@ async function startServerWithDatabaseTeardown(
           logger.error(
             { err },
             "startup hot-restart adoption reconciliation failed - orphan reaper will serve as degraded backstop",
-          );
-        }
-
-        try {
-          const shutdownRecovery = await heartbeat.reconcileShutdownSnapshot();
-          if (shutdownRecovery.present) {
-            logger.warn(
-              shutdownRecovery,
-              "reconciled runs left in flight by a service stop",
-            );
-          }
-        } catch (err) {
-          logger.error(
-            { err },
-            "startup reconciliation of the shutdown snapshot failed - the orphan reaper will serve as degraded backstop",
           );
         }
 
