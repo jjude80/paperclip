@@ -2015,7 +2015,7 @@ const INVALID_AGENT_IN_REVIEW_DISPOSITION_MESSAGE =
   "invalid_issue_disposition: Agent-authored updates that move an issue to in_review must include a real review path. " +
   "This request would leave the issue in_review without anyone or anything owning the next action. " +
   "Keep working instead of moving to review, create a request_confirmation or ask_user_questions interaction, " +
-  "link or request a pending approval, assign a human reviewer with assigneeUserId, set a typed executionState.currentParticipant through an execution policy, " +
+  "link or request a pending approval, assign a human reviewer with assigneeUserId, hand the issue to an agent reviewer with assigneeAgentId (it must be a different agent, which wakes it), set a typed executionState.currentParticipant through an execution policy, " +
   "or schedule an issue monitor for an external review/check. After creating one of those review paths, retry the status update.";
 
 function executionPrincipalsEqual(
@@ -4619,6 +4619,21 @@ export function issueRoutes(
     )
       return null;
 
+    // An agent reviewer can own the next action just as a human reviewer can.
+    // Assigning the issue to a different agent names that reviewer, shows them
+    // as the owner, and wakes them through the ordinary assignee-change wake.
+    // A self-assignment is not a hand-off and stays on the paths below.
+    const nextAssigneeAgentId =
+      input.updateFields.assigneeAgentId === undefined
+        ? input.existing.assigneeAgentId
+        : input.updateFields.assigneeAgentId;
+    if (
+      typeof nextAssigneeAgentId === "string" &&
+      nextAssigneeAgentId.trim().length > 0 &&
+      nextAssigneeAgentId !== input.actorAgentId
+    )
+      return null;
+
     const nextExecutionState =
       input.updateFields.executionState === undefined
         ? input.existing.executionState
@@ -4655,6 +4670,7 @@ export function issueRoutes(
         "pending_issue_thread_interaction",
         "linked_pending_approval",
         "human_assignee_user_id",
+        "agent_assignee_agent_id",
         "typed_execution_state_current_participant",
         "scheduled_issue_monitor",
       ],
