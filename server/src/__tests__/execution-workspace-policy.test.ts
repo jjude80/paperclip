@@ -829,7 +829,7 @@ describe("execution workspace inheritance", () => {
     });
   });
 
-  it("drops a pinned exact branch from an inherited strategy, because a branch is shared", () => {
+  it("retargets a pinned exact branch as the child's base ref instead of dropping the target", () => {
     expect(
       buildInheritedExecutionWorkspaceSettings({
         sourceSettings: {
@@ -841,8 +841,53 @@ describe("execution workspace inheritance", () => {
       }),
     ).toEqual({
       mode: "isolated_workspace",
-      workspaceStrategy: { type: "git_worktree", branchTemplate: "{{issue.identifier}}-{{slug}}" },
+      workspaceStrategy: { type: "git_worktree", baseRef: "holder-branch", branchTemplate: "{{issue.identifier}}-{{slug}}" },
     });
+  });
+
+  it("bases a child on the parent workspace's integration branch, not the project default", () => {
+    expect(
+      buildInheritedExecutionWorkspaceSettings({
+        sourceSettings: { mode: "isolated_workspace" },
+        sourceWorkspaceMode: "isolated_workspace",
+        sourceWorkspaceStrategyType: "git_worktree",
+        sourceWorkspaceBranchName: "NEXA-415-integration",
+        bindSourceWorkspace: false,
+      }),
+    ).toEqual({
+      mode: "isolated_workspace",
+      workspaceStrategy: { type: "git_worktree", baseRef: "NEXA-415-integration" },
+    });
+  });
+
+  it("prefers the parent workspace's integration branch over an older inherited base ref", () => {
+    expect(
+      buildInheritedExecutionWorkspaceSettings({
+        sourceSettings: {
+          mode: "isolated_workspace",
+          workspaceStrategy: { type: "git_worktree", baseRef: "origin/main", existingBranch: "older-target" },
+        },
+        sourceWorkspaceMode: "isolated_workspace",
+        sourceWorkspaceStrategyType: "git_worktree",
+        sourceWorkspaceBranchName: "NEXA-415-integration",
+        bindSourceWorkspace: false,
+      }),
+    ).toEqual({
+      mode: "isolated_workspace",
+      workspaceStrategy: { type: "git_worktree", baseRef: "NEXA-415-integration" },
+    });
+  });
+
+  it("does not invent a base ref from a non-git-workspace source", () => {
+    expect(
+      buildInheritedExecutionWorkspaceSettings({
+        sourceSettings: { mode: "isolated_workspace" },
+        sourceWorkspaceMode: "isolated_workspace",
+        sourceWorkspaceStrategyType: "project_primary",
+        sourceWorkspaceBranchName: "unrelated-branch",
+        bindSourceWorkspace: false,
+      }),
+    ).toEqual({ mode: "isolated_workspace" });
   });
 
   it("keeps the pinned branch when the workspace itself is inherited", () => {
@@ -871,7 +916,7 @@ describe("execution workspace inheritance", () => {
     ).toEqual({ mode: "shared_workspace" });
   });
 
-  it("drops a pinned branch from the strategy when another issue owns the workspace", () => {
+  it("retargets a pinned branch as the base ref when another issue owns the workspace", () => {
     expect(
       resolveExecutionWorkspaceStrategyConfig({
         config: {
@@ -882,7 +927,7 @@ describe("execution workspace inheritance", () => {
       }),
     ).toEqual({
       mode: "isolated_workspace",
-      workspaceStrategy: { type: "git_worktree" },
+      workspaceStrategy: { type: "git_worktree", baseRef: "holder-branch" },
     });
   });
 
@@ -899,13 +944,13 @@ describe("execution workspace inheritance", () => {
     });
   });
 
-  it("drops the whole strategy when the pinned branch was all it held", () => {
+  it("keeps the target branch as a base ref when the pinned branch was all the strategy held", () => {
     expect(
       resolveExecutionWorkspaceStrategyConfig({
         config: { workspaceStrategy: { existingBranch: "holder-branch" } },
         conflictingWorkspaceOwnerIssueId: "issue-parent",
       }),
-    ).toEqual({});
+    ).toEqual({ workspaceStrategy: { baseRef: "holder-branch" } });
   });
 
   it("keeps the requested workspace when no other issue owns it", () => {
