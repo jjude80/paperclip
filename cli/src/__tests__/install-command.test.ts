@@ -12,6 +12,7 @@ import {
   resolveNpmInstallRequest,
   resolvePublishedVersion,
   runCommandWithDiagnostics,
+  stageGitInstallSkills,
 } from "../commands/install.js";
 import { uninstallCommand } from "../commands/uninstall.js";
 import { resolvePaperclipInstanceId } from "../config/home.js";
@@ -115,7 +116,16 @@ describe("managed install commands", () => {
     expect(runCommand.mock.calls[0]?.[0]).toBe(process.execPath);
   });
 
-  const createGitCheckoutRunCommand = (sha: string, options?: { uiDistScript?: boolean }) =>
+  const createGitCheckoutRunCommand = (
+    sha: string,
+    options?: {
+      uiDistScript?: boolean;
+      rootSkills?: boolean;
+      releasePackageMap?: boolean;
+      serverBundled?: boolean;
+      onPrepareBundled?: (packageDir: string) => void;
+    },
+  ) =>
     vi.fn(async (file: string, args: string[], _options?: Parameters<CommandRunner>[2]) => {
       if (file === "curl" && !args.includes("--output")) return { stdout: JSON.stringify({ sha }), stderr: "" };
       if (file === "curl") { fs.writeFileSync(args[args.indexOf("--output") + 1], "archive"); return { stdout: "", stderr: "" }; }
@@ -124,13 +134,20 @@ describe("managed install commands", () => {
         const packages = [
           { dir: "packages/shared", name: "@paperclipai/shared", packageJson: { name: "@paperclipai/shared", version: "0.3.1" } },
           { dir: "packages/db", name: "@paperclipai/db", packageJson: { name: "@paperclipai/db", version: "0.3.1", dependencies: { "@paperclipai/shared": "workspace:*" }, bundleDependencies: ["embedded-postgres"] } },
-          { dir: "server", name: "@paperclipai/server", packageJson: { name: "@paperclipai/server", version: "0.3.1", dependencies: { "@paperclipai/db": "workspace:*" } } },
+          { dir: "server", name: "@paperclipai/server", packageJson: { name: "@paperclipai/server", version: "0.3.1", dependencies: { "@paperclipai/db": "workspace:*" }, ...(options?.serverBundled ? { bundleDependencies: ["acpx"] } : {}) } },
         ];
         fs.mkdirSync(path.join(checkout, "cli"), { recursive: true });
         fs.writeFileSync(path.join(checkout, "cli", "package.json"), JSON.stringify({ version: "0.3.1" }));
         fs.mkdirSync(path.join(checkout, "scripts"), { recursive: true });
         if (options?.uiDistScript) {
           fs.writeFileSync(path.join(checkout, "scripts", "prepare-server-ui-dist.sh"), "#!/usr/bin/env bash\n");
+        }
+        if (options?.releasePackageMap) {
+          fs.writeFileSync(path.join(checkout, "scripts", "release-package-map.mjs"), "// stub\n");
+        }
+        if (options?.rootSkills) {
+          fs.mkdirSync(path.join(checkout, "skills", "paperclip"), { recursive: true });
+          fs.writeFileSync(path.join(checkout, "skills", "paperclip", "SKILL.md"), "# skill\n");
         }
         fs.writeFileSync(path.join(checkout, "scripts", "release-package-manifest.json"), JSON.stringify(packages.map(({ dir, name }) => ({ dir, name }))));
         for (const workspacePackage of packages) {
@@ -150,14 +167,19 @@ describe("managed install commands", () => {
       }
       if (file === "bash") return { stdout: "", stderr: "" };
       if (file === "npm" && args[0] === "pack") {
-        const packageName = args[1]?.includes("workspace-package-") ? "paperclipai-db" : "paperclipai";
+        const stagedPackage = args[1] && !args[1].startsWith("--") ? args[1] : undefined;
+        const stagedManifest = stagedPackage ? JSON.parse(fs.readFileSync(path.join(stagedPackage, "package.json"), "utf8")) as { name: string } : undefined;
+        const packageName = stagedManifest ? stagedManifest.name.replace("@paperclipai/", "paperclipai-") : "paperclipai";
         fs.writeFileSync(path.join(args[args.indexOf("--pack-destination") + 1], `${packageName}-0.3.1.tgz`), "package");
         return { stdout: "", stderr: "" };
       }
       if (file === "npm" && args[0] === "install") { const prefix = args[args.indexOf("--prefix") + 1]; const packageRoot = path.join(prefix, "node_modules", "paperclipai"); fs.mkdirSync(path.join(packageRoot, "dist"), { recursive: true }); fs.writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({ version: "0.3.1" })); fs.writeFileSync(path.join(packageRoot, "dist", "index.js"), "#!/usr/bin/env node\n"); return { stdout: "", stderr: "" }; }
+      if (file === process.execPath && args[0]?.endsWith("release-package-map.mjs")) return { stdout: "", stderr: "" };
       if (file === process.execPath && args[0]?.endsWith("prepare-bundled-package.mjs")) {
+        const sourceManifest = JSON.parse(fs.readFileSync(path.join(args[1], "package.json"), "utf8")) as { name: string; version?: string };
         fs.mkdirSync(args[2], { recursive: true });
-        fs.writeFileSync(path.join(args[2], "package.json"), JSON.stringify({ name: "@paperclipai/db", version: "0.3.1" }));
+        fs.writeFileSync(path.join(args[2], "package.json"), JSON.stringify({ name: sourceManifest.name, version: sourceManifest.version ?? "0.3.1" }));
+        options?.onPrepareBundled?.(args[1]);
         return { stdout: "", stderr: "" };
       }
       if (file === process.execPath) return { stdout: "0.3.1\n", stderr: "" };
@@ -195,6 +217,71 @@ describe("managed install commands", () => {
     expect(runCommand.mock.calls.findIndex(([file, args]) =>
       file === "bash" && args.some((arg) => arg.endsWith("prepare-server-ui-dist.sh")),
     )).toBeLessThan(stagedCall);
+  });
+
+  it("stages the repository skills tree into the packages that publish it", () => {
+    const checkout = path.join(root, "skills-checkout");
+    fs.mkdirSync(path.join(checkout, "skills", "paperclip"), { recursive: true });
+    fs.writeFileSync(path.join(checkout, "skills", "paperclip", "SKILL.md"), "# skill\n");
+    const packageDirs = ["server", "packages/adapters/claude-local", "packages/adapters/codex-local", "packages/adapters/opencode-local"];
+    for (const dir of packageDirs) {
+      fs.mkdirSync(path.join(checkout, dir), { recursive: true });
+      fs.writeFileSync(path.join(checkout, dir, "package.json"), JSON.stringify({ name: `@paperclipai/${path.basename(dir)}` }));
+    }
+
+    stageGitInstallSkills(checkout);
+
+    for (const dir of ["server", "packages/adapters/claude-local", "packages/adapters/codex-local"]) {
+      expect(fs.readFileSync(path.join(checkout, dir, "skills", "paperclip", "SKILL.md"), "utf8")).toBe("# skill\n");
+    }
+    // Only packages that list `skills` in their publishable `files` get a copy.
+    expect(fs.existsSync(path.join(checkout, "packages/adapters/opencode-local", "skills"))).toBe(false);
+  });
+
+  it("copies the repository skills tree before staging a bundled server package", async () => {
+    const sha = "f".repeat(40);
+    let serverPackageHadSkills: boolean | undefined;
+    const runCommand = createGitCheckoutRunCommand(sha, {
+      rootSkills: true,
+      serverBundled: true,
+      onPrepareBundled: (packageDir) => {
+        if (packageDir.endsWith(`${path.sep}server`)) {
+          serverPackageHadSkills = fs.existsSync(path.join(packageDir, "skills", "paperclip", "SKILL.md"));
+        }
+      },
+    });
+    await expect(installGitPayload("paperclipai/paperclip", sha, runCommand, resolveInstallStorePaths())).resolves.toMatchObject({ version: "0.3.1", reused: false });
+    expect(serverPackageHadSkills).toBe(true);
+  });
+
+  it("normalizes workspace package versions before packing", async () => {
+    const sha = "a".repeat(40);
+    const runCommand = createGitCheckoutRunCommand(sha, { releasePackageMap: true });
+    await expect(installGitPayload("paperclipai/paperclip", sha, runCommand, resolveInstallStorePaths())).resolves.toMatchObject({ version: "0.3.1", reused: false });
+    const normalizeIndex = runCommand.mock.calls.findIndex(([file, args]) =>
+      file === process.execPath && args[0]?.endsWith("release-package-map.mjs"),
+    );
+    expect(normalizeIndex).toBeGreaterThan(-1);
+    expect(runCommand.mock.calls[normalizeIndex]?.[1]).toEqual([
+      expect.stringContaining("release-package-map.mjs"),
+      "set-version",
+      "0.3.1",
+    ]);
+    const firstPackIndex = runCommand.mock.calls.findIndex(([file, args]) =>
+      (file === "npm" && args[0] === "pack") || (file === "corepack" && args.includes("pack")),
+    );
+    expect(normalizeIndex).toBeLessThan(firstPackIndex);
+  });
+
+  it("skips lifecycle scripts when packing a staged workspace package", async () => {
+    const sha = "9".repeat(40);
+    const runCommand = createGitCheckoutRunCommand(sha);
+    await expect(installGitPayload("paperclipai/paperclip", sha, runCommand, resolveInstallStorePaths())).resolves.toMatchObject({ version: "0.3.1", reused: false });
+    const stagedPacks = runCommand.mock.calls.filter(([file, args]) =>
+      file === "npm" && args[0] === "pack" && args[1]?.includes("workspace-package-"),
+    );
+    expect(stagedPacks).toHaveLength(1);
+    expect(stagedPacks[0]?.[1]).toContain("--ignore-scripts");
   });
 
   it("builds git checkouts with NODE_ENV cleared so ambient production mode keeps devDependencies", async () => {

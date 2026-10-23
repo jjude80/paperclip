@@ -84,6 +84,24 @@ export function resolveGitInstallWorkspacePackages(checkoutPath: string): Releas
   return ordered;
 }
 
+// packages whose publishable manifest lists the repository-level `skills/`
+// tree in `files`. scripts/release.sh copies that tree into each package before
+// packing; a git checkout must do the same or prepare-bundled-package.mjs
+// fails on a missing `server/skills` entry.
+const GIT_INSTALL_SKILL_PACKAGES = ["server", "packages/adapters/claude-local", "packages/adapters/codex-local"];
+
+export function stageGitInstallSkills(checkoutPath: string): void {
+  const rootSkills = path.join(checkoutPath, "skills");
+  if (!fs.existsSync(rootSkills)) return;
+  for (const packageDir of GIT_INSTALL_SKILL_PACKAGES) {
+    const packageRoot = path.join(checkoutPath, packageDir);
+    if (!fs.existsSync(path.join(packageRoot, "package.json"))) continue;
+    const target = path.join(packageRoot, "skills");
+    fs.rmSync(target, { recursive: true, force: true });
+    fs.cpSync(rootSkills, target, { recursive: true });
+  }
+}
+
 export function assertSupportedNodeVersion(): void {
   if (!isSupportedNodeVersion(process.versions.node)) {
     throw new Error(`Installing or updating Paperclip requires Node.js ${MINIMUM_NODE_VERSION} or newer (found ${process.version} at ${process.execPath}). Put a supported Node bin directory first on PATH and run 'npx paperclipai@latest install --yes' to re-pin an existing managed install.`);
@@ -285,6 +303,18 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
       await runCommand("bash", [serverUiDistScript], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
     }
     const metadata = JSON.parse(fs.readFileSync(path.join(checkoutPath, "cli", "package.json"), "utf8")) as { version: string };
+    // stage the repository-level skills tree exactly where scripts/release.sh
+    // puts it before packing the server and adapter packages.
+    stageGitInstallSkills(checkoutPath);
+    // scripts/release.sh normalizes every publishable package to one version
+    // before packing. Without that, a workspace dep materializes to the
+    // depending package's version (e.g. server 0.3.1 -> @paperclipai/plugin-sdk
+    // 1.0.0 becomes 0.3.1), and npm install of the tarballs fails with ETARGET.
+    // Reuse the release map so the version rewrite has one implementation.
+    const releasePackageMap = path.join(checkoutPath, "scripts", "release-package-map.mjs");
+    if (fs.existsSync(releasePackageMap)) {
+      await runCommand(process.execPath, [releasePackageMap, "set-version", metadata.version], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 16 * 1024 * 1024 });
+    }
     const workspacePackages = resolveGitInstallWorkspacePackages(checkoutPath);
     for (const [index, workspacePackage] of workspacePackages.entries()) {
       const packageDir = path.join(checkoutPath, workspacePackage.dir);
@@ -293,7 +323,12 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
       if (bundledDependencies.length > 0) {
         const stagedPackage = path.join(stagingRoot, `workspace-package-${index}`);
         await runCommand(process.execPath, [path.join(checkoutPath, "scripts", "prepare-bundled-package.mjs"), packageDir, stagedPackage], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
-        await runCommand("npm", ["pack", stagedPackage, "--pack-destination", stagingRoot], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 16 * 1024 * 1024 });
+        // The staged manifest keeps the server's `prepack`, which invokes
+        // `bash ../scripts/prepare-server-ui-dist.sh`. That script lives under
+        // source/scripts, not beside workspace-package-N, so lifecycle scripts
+        // must stay off. The UI dist is already prepared above and
+        // prepare-bundled-package.mjs copied it into the staged package.
+        await runCommand("npm", ["pack", stagedPackage, "--pack-destination", stagingRoot, "--ignore-scripts"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 16 * 1024 * 1024 });
       } else {
         await runCommand("corepack", ["pnpm", "--dir", workspacePackage.dir, "pack", "--pack-destination", stagingRoot], { cwd: checkoutPath, env: buildEnv({ PAPERCLIP_RELEASE_REUSE_UI_DIST: "1" }), maxBuffer: 32 * 1024 * 1024 });
       }
