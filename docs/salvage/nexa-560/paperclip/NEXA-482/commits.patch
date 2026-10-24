@@ -1,0 +1,1959 @@
+From a15b68139d1f01c111aa749ac55f2b73c41e1563 Mon Sep 17 00:00:00 2001
+From: jjude80 <18168364+jjude80@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 20:31:39 -0400
+Subject: [PATCH 1/5] feat(workspace): give each issue its own execution
+ workspace
+
+An isolated execution workspace is one issue's worktree: one directory, one
+branch, one index. A child of a decomposed parent inherited the parent's
+workspace row, so six children of one decomposed parent were dispatched into the parent's
+worktree and four runs were live in it at once. The cost was measured: a
+whole-file write deleted another run's edits, git commit published every
+staged path in the tree including another issue's, and the tree did not
+build for reasons that belonged to neither run.
+
+Two layers, because a creation-time rule alone does not cover an issue that
+already points at somebody else's workspace.
+
+1. Creation time (issues.ts). A child inherits the parent's mode and
+   settings, but not the parent's workspace row when that row is an isolated
+   workspace. A shared workspace is still inherited: sharing it is the point
+   of it. A pinned existingBranch is stripped from inherited settings when
+   the workspace is not bound, because a branch is the thing two issues
+   must not share.
+
+2. Dispatch time (heartbeat/workspaces.ts). The reuse request now carries
+   the issue, the workspace mode and the workspace owner. Reusing an
+   isolated workspace owned by a different issue is refused, and the refusal
+   names the holder through conflictingWorkspaceOwnerIssueId. Recovery keeps
+   its own workspace: a run that continues work already done in a tree is
+   not a second issue joining it.
+
+The refusal is loud. The queue preflight posts an issue comment naming the
+holder issue, deduplicated by an HTML marker, so the run learns whose tree
+it was about to write into instead of discovering it in a merge conflict.
+
+Tests: execution-workspace-policy (50 cases), issues-service (32 workspace
+cases), heartbeat-workspace-session (182 cases, including the new
+conflict cases). Typecheck clean.
+---
+ .../execution-workspace-policy.test.ts        | 102 ++++++++++++++++++
+ .../heartbeat-workspace-session.test.ts       |  70 ++++++++++++
+ server/src/__tests__/issues-service.test.ts   |  82 ++++++++++++--
+ .../services/execution-workspace-policy.ts    |  90 ++++++++++++++++
+ .../heartbeat/environment-selection.ts        |  11 ++
+ server/src/services/heartbeat/queue.ts        |  69 +++++++++++-
+ server/src/services/heartbeat/workspaces.ts   |  45 +++++++-
+ server/src/services/issues.ts                 |  35 ++++--
+ 8 files changed, 483 insertions(+), 21 deletions(-)
+
+diff --git a/server/src/__tests__/execution-workspace-policy.test.ts b/server/src/__tests__/execution-workspace-policy.test.ts
+index 77da199b..c788b7fc 100644
+--- a/server/src/__tests__/execution-workspace-policy.test.ts
++++ b/server/src/__tests__/execution-workspace-policy.test.ts
+@@ -6,6 +6,7 @@ import {
+ import {
+   applyDefaultIsolatedExecutionWorkspacePolicy,
+   buildExecutionWorkspaceAdapterConfig,
++  buildInheritedExecutionWorkspaceSettings,
+   defaultIssueExecutionWorkspaceSettingsForProject,
+   gateProjectExecutionWorkspacePolicy,
+   isUnrunnableWorktreeCombo,
+@@ -16,6 +17,7 @@ import {
+   ManagedSandboxUnavailableError,
+   resolveEffectiveWorkspaceStrategyType,
+   resolveExecutionWorkspaceEnvironmentId,
++  resolveExecutionWorkspaceInheritanceDecision,
+   resolvePinnedIssueWorkspaceStrategyType,
+   resolveExecutionWorkspaceMode,
+   resolveSharedWorkspaceConcurrency,
+@@ -770,3 +772,103 @@ describe("operator default isolated execution workspaces", () => {
+     expect(resolveExecutionWorkspaceEnvironmentId(defaults)).toEqual({environmentId: "agent-env", source: "agent"});
+   });
+ });
++
++// NEXA-424: a child of a decomposed parent must not inherit the parent's
++// isolated worktree. The failure this covers was measured on NEXA-415, where
++// six children of one parent were dispatched into one worktree and four runs
++// were live in it at once.
++describe("execution workspace inheritance", () => {
++  it("does not bind a child to the parent's isolated workspace", () => {
++    expect(
++      resolveExecutionWorkspaceInheritanceDecision({
++        sourceWorkspaceMode: "isolated_workspace",
++        hasExplicitExecutionWorkspaceOverride: false,
++      }),
++    ).toEqual({
++      bindSourceWorkspace: false,
++      inheritSourceSettings: true,
++      reason: "source_workspace_isolated_per_issue",
++    });
++  });
++
++  it("keeps inheriting a shared workspace, which is shared by design", () => {
++    expect(
++      resolveExecutionWorkspaceInheritanceDecision({
++        sourceWorkspaceMode: "shared_workspace",
++        hasExplicitExecutionWorkspaceOverride: false,
++      }),
++    ).toEqual({
++      bindSourceWorkspace: true,
++      inheritSourceSettings: true,
++      reason: "source_workspace_shared",
++    });
++  });
++
++  it("inherits nothing when the caller named its own workspace", () => {
++    expect(
++      resolveExecutionWorkspaceInheritanceDecision({
++        sourceWorkspaceMode: "isolated_workspace",
++        hasExplicitExecutionWorkspaceOverride: true,
++      }),
++    ).toEqual({
++      bindSourceWorkspace: false,
++      inheritSourceSettings: false,
++      reason: "explicit_override",
++    });
++  });
++
++  it("carries the isolated mode to the child without the parent's tree", () => {
++    expect(
++      buildInheritedExecutionWorkspaceSettings({
++        sourceSettings: { mode: "isolated_workspace", workspaceRuntime: { profile: "agent" } },
++        sourceWorkspaceMode: "isolated_workspace",
++        bindSourceWorkspace: false,
++      }),
++    ).toEqual({
++      mode: "isolated_workspace",
++      workspaceRuntime: { profile: "agent" },
++    });
++  });
++
++  it("drops a pinned exact branch from an inherited strategy, because a branch is shared", () => {
++    expect(
++      buildInheritedExecutionWorkspaceSettings({
++        sourceSettings: {
++          mode: "isolated_workspace",
++          workspaceStrategy: { type: "git_worktree", existingBranch: "NEXA-415-thing", branchTemplate: "{{issue.identifier}}-{{slug}}" },
++        },
++        sourceWorkspaceMode: "isolated_workspace",
++        bindSourceWorkspace: false,
++      }),
++    ).toEqual({
++      mode: "isolated_workspace",
++      workspaceStrategy: { type: "git_worktree", branchTemplate: "{{issue.identifier}}-{{slug}}" },
++    });
++  });
++
++  it("keeps the pinned branch when the workspace itself is inherited", () => {
++    expect(
++      buildInheritedExecutionWorkspaceSettings({
++        sourceSettings: {
++          mode: "isolated_workspace",
++          workspaceStrategy: { type: "git_worktree", existingBranch: "NEXA-415-thing" },
++        },
++        sourceWorkspaceMode: "isolated_workspace",
++        bindSourceWorkspace: true,
++      }),
++    ).toEqual({
++      mode: "isolated_workspace",
++      workspaceStrategy: { type: "git_worktree", existingBranch: "NEXA-415-thing" },
++    });
++  });
++
++  it("falls back to the source mode when the source has no settings of its own", () => {
++    expect(
++      buildInheritedExecutionWorkspaceSettings({
++        sourceSettings: null,
++        sourceWorkspaceMode: "shared_workspace",
++        bindSourceWorkspace: true,
++      }),
++    ).toEqual({ mode: "shared_workspace" });
++  });
++});
+diff --git a/server/src/__tests__/heartbeat-workspace-session.test.ts b/server/src/__tests__/heartbeat-workspace-session.test.ts
+index 5df8621b..2711e220 100644
+--- a/server/src/__tests__/heartbeat-workspace-session.test.ts
++++ b/server/src/__tests__/heartbeat-workspace-session.test.ts
+@@ -1818,6 +1818,7 @@ describe("effective run execution workspace config freshness", () => {
+       requestedExecutionWorkspaceId: "workspace-old",
+       requestedShouldReuseExisting: true,
+       existingExecutionWorkspaceAvailable: false,
++      conflictingWorkspaceOwnerIssueId: null,
+     });
+ 
+     const metadata = buildWorkspaceConfigMetadata();
+@@ -1872,6 +1873,7 @@ describe("effective run execution workspace config freshness", () => {
+         requestedExecutionWorkspaceId: "workspace-old",
+         requestedShouldReuseExisting: false,
+         existingExecutionWorkspaceAvailable: false,
++        conflictingWorkspaceOwnerIssueId: null,
+       });
+ 
+       const metadata = buildWorkspaceConfigMetadata();
+@@ -1910,6 +1912,74 @@ describe("effective run execution workspace config freshness", () => {
+       requestedExecutionWorkspaceId: "workspace-old",
+       requestedShouldReuseExisting: true,
+       existingExecutionWorkspaceAvailable: true,
++      conflictingWorkspaceOwnerIssueId: null,
++    });
++  });
++
++  // NEXA-424: an isolated workspace is one issue's worktree. A second issue
++  // that points at it is refused, and the refusal names the holder.
++  it("refuses to reuse another issue's isolated workspace and names the holder", () => {
++    expect(resolveExecutionWorkspaceReuseRequestForIssue({
++      issueExecutionWorkspaceId: "workspace-parent",
++      issueExecutionWorkspacePreference: "reuse_existing",
++      existingExecutionWorkspaceStatus: "active",
++      issueId: "issue-child",
++      existingExecutionWorkspaceMode: "isolated_workspace",
++      existingExecutionWorkspaceSourceIssueId: "issue-parent",
++    })).toEqual({
++      requestedExecutionWorkspaceId: "workspace-parent",
++      requestedShouldReuseExisting: false,
++      existingExecutionWorkspaceAvailable: false,
++      conflictingWorkspaceOwnerIssueId: "issue-parent",
++    });
++  });
++
++  it("reuses an issue's own isolated workspace", () => {
++    expect(resolveExecutionWorkspaceReuseRequestForIssue({
++      issueExecutionWorkspaceId: "workspace-own",
++      issueExecutionWorkspacePreference: "reuse_existing",
++      existingExecutionWorkspaceStatus: "active",
++      issueId: "issue-parent",
++      existingExecutionWorkspaceMode: "isolated_workspace",
++      existingExecutionWorkspaceSourceIssueId: "issue-parent",
++    })).toEqual({
++      requestedExecutionWorkspaceId: "workspace-own",
++      requestedShouldReuseExisting: true,
++      existingExecutionWorkspaceAvailable: true,
++      conflictingWorkspaceOwnerIssueId: null,
++    });
++  });
++
++  it("still reuses another issue's shared workspace, which is shared by design", () => {
++    expect(resolveExecutionWorkspaceReuseRequestForIssue({
++      issueExecutionWorkspaceId: "workspace-shared",
++      issueExecutionWorkspacePreference: "reuse_existing",
++      existingExecutionWorkspaceStatus: "active",
++      issueId: "issue-child",
++      existingExecutionWorkspaceMode: "shared_workspace",
++      existingExecutionWorkspaceSourceIssueId: "issue-parent",
++    })).toEqual({
++      requestedExecutionWorkspaceId: "workspace-shared",
++      requestedShouldReuseExisting: true,
++      existingExecutionWorkspaceAvailable: true,
++      conflictingWorkspaceOwnerIssueId: null,
++    });
++  });
++
++  it("restores the workspace a recovered run was already dispatched into", () => {
++    expect(resolveExecutionWorkspaceReuseRequestForIssue({
++      issueExecutionWorkspaceId: "workspace-parent",
++      issueExecutionWorkspacePreference: "reuse_existing",
++      existingExecutionWorkspaceStatus: "active",
++      issueId: "issue-child",
++      existingExecutionWorkspaceMode: "isolated_workspace",
++      existingExecutionWorkspaceSourceIssueId: "issue-parent",
++      allowForeignIsolatedWorkspaceReuse: true,
++    })).toEqual({
++      requestedExecutionWorkspaceId: "workspace-parent",
++      requestedShouldReuseExisting: true,
++      existingExecutionWorkspaceAvailable: true,
++      conflictingWorkspaceOwnerIssueId: null,
+     });
+   });
+ 
+diff --git a/server/src/__tests__/issues-service.test.ts b/server/src/__tests__/issues-service.test.ts
+index 737039c5..2138b9e2 100644
+--- a/server/src/__tests__/issues-service.test.ts
++++ b/server/src/__tests__/issues-service.test.ts
+@@ -3063,7 +3063,12 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
+     await tempDb?.cleanup();
+   });
+ 
+-  it("inherits the parent issue workspace linkage when child workspace fields are omitted", async () => {
++  // NEXA-424: this is the shape that was measured on NEXA-415. Six children
++  // of one parent were dispatched into the parent's worktree, four runs were
++  // live in it at once, and the tree did not compile for reasons that
++  // belonged to neither run. A child of a decomposed parent gets the parent's
++  // *mode* and its own workspace, never the parent's tree.
++  it("does not inherit the parent's isolated workspace linkage when child workspace fields are omitted", async () => {
+     const companyId = randomUUID();
+     const projectId = randomUUID();
+     const parentIssueId = randomUUID();
+@@ -3121,14 +3126,74 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
+ 
+     expect(child.parentId).toBe(parentIssueId);
+     expect(child.projectWorkspaceId).toBe(projectWorkspaceId);
+-    expect(child.executionWorkspaceId).toBe(executionWorkspaceId);
+-    expect(child.executionWorkspacePreference).toBe("reuse_existing");
++    // The parent's worktree is the parent's. The child is still an isolated
++    // task, so it keeps the mode -- but it resolves a workspace of its own.
++    expect(child.executionWorkspaceId).toBeNull();
++    expect(child.executionWorkspacePreference).toBeNull();
+     expect(child.executionWorkspaceSettings).toEqual({
+       mode: "isolated_workspace",
+       workspaceRuntime: { profile: "agent" },
+     });
+   });
+ 
++  it("inherits a shared workspace linkage, which is shared by design", async () => {
++    const companyId = randomUUID();
++    const projectId = randomUUID();
++    const parentIssueId = randomUUID();
++    const projectWorkspaceId = randomUUID();
++    const executionWorkspaceId = randomUUID();
++
++    await seedIssueCompany(db, companyId);
++    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
++
++    await seedWorkspaceProject(db, companyId, projectId);
++
++    await db.insert(projectWorkspaces).values({
++      id: projectWorkspaceId,
++      companyId,
++      projectId,
++      name: "Primary workspace",
++      isPrimary: true,
++      sharedWorkspaceKey: "workspace-key",
++    });
++
++    await db.insert(executionWorkspaces).values({
++      id: executionWorkspaceId,
++      companyId,
++      projectId,
++      projectWorkspaceId,
++      mode: "shared_workspace",
++      strategyType: "project_primary",
++      name: "Shared project workspace",
++      status: "active",
++      providerType: "project_primary",
++      providerRef: `/tmp/${executionWorkspaceId}`,
++    });
++
++    await db.insert(issues).values({
++      id: parentIssueId,
++      companyId,
++      projectId,
++      projectWorkspaceId,
++      title: "Parent issue",
++      status: "in_progress",
++      priority: "medium",
++      executionWorkspaceId,
++      executionWorkspacePreference: "reuse_existing",
++      executionWorkspaceSettings: { mode: "shared_workspace" },
++    });
++
++    const child = await svc.create(companyId, {
++      parentId: parentIssueId,
++      projectId,
++      title: "Child issue",
++    });
++
++    expect(child.executionWorkspaceId).toBe(executionWorkspaceId);
++    expect(child.executionWorkspacePreference).toBe("reuse_existing");
++    expect(child.executionWorkspaceSettings).toEqual({ mode: "shared_workspace" });
++  });
++
+   it("inherits responsible user for agent-created child issues", async () => {
+     const companyId = randomUUID();
+     const agentId = randomUUID();
+@@ -3875,8 +3940,11 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
+     expect(child.description).toContain("## Acceptance Criteria");
+     expect(child.description).toContain("- Uses the parent issue as parentId");
+     expect(child.projectWorkspaceId).toBe(projectWorkspaceId);
+-    expect(child.executionWorkspaceId).toBe(executionWorkspaceId);
+-    expect(child.executionWorkspacePreference).toBe("reuse_existing");
++    // The parent's workspace is an isolated per-issue worktree, so the child
++    // inherits the mode and resolves a workspace of its own (NEXA-424).
++    expect(child.executionWorkspaceId).toBeNull();
++    expect(child.executionWorkspacePreference).toBeNull();
++    expect(child.executionWorkspaceSettings).toEqual({ mode: "isolated_workspace" });
+ 
+     const parentRelations = await svc.getRelationSummaries(parentIssueId);
+     expect(parentRelations.blockedBy).toEqual([
+@@ -4947,7 +5015,9 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
+     expect(child.parentId).toBe(parentIssueId);
+     expect(child.projectId).toBe(projectId);
+     expect(child.projectWorkspaceId).toBe(projectWorkspaceId);
+-    expect(child.executionWorkspaceId).toBe(executionWorkspaceId);
++    // The project is inherited; the parent's isolated worktree is not.
++    expect(child.executionWorkspaceId).toBeNull();
++    expect(child.executionWorkspaceSettings).toEqual({ mode: "isolated_workspace" });
+   });
+ 
+   it("uses the target project's own workspaces for a cross-project child instead of inheriting the parent's", async () => {
+diff --git a/server/src/services/execution-workspace-policy.ts b/server/src/services/execution-workspace-policy.ts
+index 37fc7a7f..159a4f94 100644
+--- a/server/src/services/execution-workspace-policy.ts
++++ b/server/src/services/execution-workspace-policy.ts
+@@ -373,6 +373,96 @@ export function issueExecutionWorkspaceModeForPersistedWorkspace(
+   return "shared_workspace";
+ }
+ 
++/**
++ * Whether a child issue may be bound to the execution workspace its parent
++ * already owns.
++ *
++ * An `isolated_workspace` is a *per-issue* workspace: it is one git worktree,
++ * with one branch and one index, cut for one issue. Binding a second issue to
++ * it does not make the tree shared in some softer sense -- it puts two runs in
++ * the same working tree, where a whole-file write destroys the other run's
++ * edit, `git commit` publishes the other run's staged paths, and the tree does
++ * not build for reasons that belong to neither run. That was measured on
++ * NEXA-415 (six children of one parent, four runs live in one worktree at
++ * once), so the rule here is not a preference: a child of a decomposed parent
++ * gets its own workspace.
++ *
++ * A `shared_workspace` is a different animal. It is shared *by design*, it is
++ * not a per-issue branch, and inheriting it is how a child continues its
++ * parent's work in the project checkout. So the rule keys on the mode of the
++ * workspace being inherited, not on the relationship between the two issues.
++ */
++export type ExecutionWorkspaceInheritanceDecision = {
++  /** Bind the child to the source issue's persisted execution workspace row. */
++  bindSourceWorkspace: boolean;
++  /** Copy the source issue's workspace settings (mode, runtime) onto the child. */
++  inheritSourceSettings: boolean;
++  reason:
++    | "explicit_override"
++    | "source_workspace_isolated_per_issue"
++    | "source_workspace_shared";
++};
++
++export function resolveExecutionWorkspaceInheritanceDecision(input: {
++  sourceWorkspaceMode: string | null | undefined;
++  hasExplicitExecutionWorkspaceOverride: boolean;
++}): ExecutionWorkspaceInheritanceDecision {
++  if (input.hasExplicitExecutionWorkspaceOverride) {
++    // The caller named its own workspace. Nothing is inherited, and nothing
++    // is inferred on its behalf.
++    return {
++      bindSourceWorkspace: false,
++      inheritSourceSettings: false,
++      reason: "explicit_override",
++    };
++  }
++  if (input.sourceWorkspaceMode === "isolated_workspace") {
++    return {
++      bindSourceWorkspace: false,
++      inheritSourceSettings: true,
++      reason: "source_workspace_isolated_per_issue",
++    };
++  }
++  return {
++    bindSourceWorkspace: true,
++    inheritSourceSettings: true,
++    reason: "source_workspace_shared",
++  };
++}
++
++/**
++ * The workspace settings a child carries when it inherits from a source issue.
++ *
++ * The mode always travels: a child of an isolated parent is still an isolated
++ * task, it just gets an isolated workspace of its own rather than the parent's
++ * tree. A pinned exact branch does not travel with it, for the same reason the
++ * workspace row does not: `existingBranch` names one branch, and a branch is
++ * the thing two issues must not share.
++ */
++export function buildInheritedExecutionWorkspaceSettings(input: {
++  sourceSettings: Record<string, unknown> | null | undefined;
++  sourceWorkspaceMode: string | null | undefined;
++  bindSourceWorkspace: boolean;
++}): Record<string, unknown> {
++  const settings: Record<string, unknown> = { ...(input.sourceSettings ?? {}) };
++  settings.mode = issueExecutionWorkspaceModeForPersistedWorkspace(
++    input.sourceWorkspaceMode,
++  );
++  if (!input.bindSourceWorkspace) {
++    const strategy = parseObject(settings.workspaceStrategy);
++    if (typeof strategy.existingBranch === "string") {
++      const nextStrategy = { ...strategy };
++      delete nextStrategy.existingBranch;
++      if (Object.keys(nextStrategy).length > 0) {
++        settings.workspaceStrategy = nextStrategy;
++      } else {
++        delete settings.workspaceStrategy;
++      }
++    }
++  }
++  return settings;
++}
++
+ export function resolveExecutionWorkspaceMode(input: {
+   projectPolicy: ProjectExecutionWorkspacePolicy | null;
+   issueSettings: IssueExecutionWorkspaceSettings | null;
+diff --git a/server/src/services/heartbeat/environment-selection.ts b/server/src/services/heartbeat/environment-selection.ts
+index f8e001e5..a5427859 100644
+--- a/server/src/services/heartbeat/environment-selection.ts
++++ b/server/src/services/heartbeat/environment-selection.ts
+@@ -123,6 +123,17 @@ export async function selectHeartbeatEnvironment(db: Db, input: HeartbeatEnviron
+         : (issueRef?.executionWorkspacePreference ?? null),
+       existingExecutionWorkspaceStatus:
+         existingExecutionWorkspace?.status ?? null,
++      issueId,
++      existingExecutionWorkspaceMode: existingExecutionWorkspace?.mode ?? null,
++      existingExecutionWorkspaceSourceIssueId:
++        existingExecutionWorkspace?.sourceIssueId ?? null,
++      // A recovered run continues work that already happened in the workspace
++      // it was dispatched into, so it restores that workspace even when the
++      // row is owned by another issue. A fresh dispatch is the case the
++      // per-issue rule is about.
++      allowForeignIsolatedWorkspaceReuse: Boolean(
++        nativeRecoveryExecutionWorkspaceId,
++      ),
+     });
+   const requestedShouldReuseExisting =
+     workspaceReuseRequest.requestedShouldReuseExisting;
+diff --git a/server/src/services/heartbeat/queue.ts b/server/src/services/heartbeat/queue.ts
+index a0ff4a08..ec944b46 100644
+--- a/server/src/services/heartbeat/queue.ts
++++ b/server/src/services/heartbeat/queue.ts
+@@ -3714,9 +3714,13 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
+               resolvedMode,
+               workspaceManagedConfig,
+             );
+-            const existingExecutionWorkspaceStatus = issue.executionWorkspaceId
++            const existingExecutionWorkspaceRow = issue.executionWorkspaceId
+               ? await tx
+-                  .select({ status: executionWorkspaces.status })
++                  .select({
++                    status: executionWorkspaces.status,
++                    mode: executionWorkspaces.mode,
++                    sourceIssueId: executionWorkspaces.sourceIssueId,
++                  })
+                   .from(executionWorkspaces)
+                   .where(
+                     and(
+@@ -3724,17 +3728,76 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
+                       eq(executionWorkspaces.companyId, issue.companyId),
+                     ),
+                   )
+-                  .then((rows) => rows[0]?.status ?? null)
++                  .then((rows) => rows[0] ?? null)
+               : null;
++            const existingExecutionWorkspaceStatus =
++              existingExecutionWorkspaceRow?.status ?? null;
+             const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
+               issueExecutionWorkspaceId: issue.executionWorkspaceId,
+               issueExecutionWorkspacePreference:
+                 issue.executionWorkspacePreference,
+               existingExecutionWorkspaceStatus,
++              issueId: issue.id,
++              existingExecutionWorkspaceMode:
++                existingExecutionWorkspaceRow?.mode ?? null,
++              existingExecutionWorkspaceSourceIssueId:
++                existingExecutionWorkspaceRow?.sourceIssueId ?? null,
+             });
+             const hasResolvablePriorSessionWorkspace =
+               await resolveHasResolvablePriorSessionWorkspace();
+ 
++            // The refusal is loud on purpose. An isolated workspace is one
++            // issue's worktree, so a run that would land in another issue's
++            // tree is told so -- and told whose tree it is -- instead of
++            // quietly sharing a directory with somebody who is already
++            // writing in it.
++            if (reuseRequest.conflictingWorkspaceOwnerIssueId) {
++              const ownerIssueId = reuseRequest.conflictingWorkspaceOwnerIssueId;
++              const owner = await tx
++                .select({ identifier: issues.identifier })
++                .from(issues)
++                .where(
++                  and(
++                    eq(issues.id, ownerIssueId),
++                    eq(issues.companyId, issue.companyId),
++                  ),
++                )
++                .then((rows) => rows[0] ?? null);
++              const ownerLabel = owner?.identifier ?? ownerIssueId;
++              const marker = `workspace_conflict:${issue.executionWorkspaceId ?? "none"}`;
++              const alreadyNotified = await tx
++                .select({ body: issueComments.body })
++                .from(issueComments)
++                .where(
++                  and(
++                    eq(issueComments.companyId, issue.companyId),
++                    eq(issueComments.issueId, issue.id),
++                    isNull(issueComments.deletedAt),
++                  ),
++                )
++                .then((rows) =>
++                  rows.some((row) => (row.body ?? "").includes(marker)),
++                );
++              if (!alreadyNotified) {
++                const now = new Date();
++                await insertIssueComment(tx, {
++                  companyId: issue.companyId,
++                  issueId: issue.id,
++                  body: [
++                    `Paperclip refused to run ${issue.identifier} in the execution workspace it points at.`,
++                    "",
++                    `- That workspace is an isolated per-issue worktree owned by ${ownerLabel}.`,
++                    "- Isolation is per issue, not per tree: two issues sharing one worktree is the failure this refuses.",
++                    "- This run realizes a workspace of its own instead.",
++                    "",
++                    `<!-- ${marker} -->`,
++                  ].join("\n"),
++                  createdAt: now,
++                  updatedAt: now,
++                });
++              }
++            }
++
+             if (
+               isUnrunnableWorktreeCombo({
+                 issue: {
+diff --git a/server/src/services/heartbeat/workspaces.ts b/server/src/services/heartbeat/workspaces.ts
+index fa12c394..464c3bc0 100644
+--- a/server/src/services/heartbeat/workspaces.ts
++++ b/server/src/services/heartbeat/workspaces.ts
+@@ -2204,6 +2204,15 @@ export type ExecutionWorkspaceReuseRequestForIssue = {
+   requestedExecutionWorkspaceId: string | null;
+   requestedShouldReuseExisting: boolean;
+   existingExecutionWorkspaceAvailable: boolean;
++  /**
++   * The issue that owns the isolated workspace this run was about to reuse.
++   *
++   * Non-null means the reuse was refused because the workspace belongs to
++   * another issue, and the run is going to realize a workspace of its own
++   * instead. It is the holder's id, so the refusal can name the holder rather
++   * than saying only that something went wrong.
++   */
++  conflictingWorkspaceOwnerIssueId: string | null;
+ };
+ 
+ /**
+@@ -2225,6 +2234,18 @@ export function resolveExecutionWorkspaceReuseRequestForIssue(input: {
+   existingExecutionWorkspaceStatus?: string | null;
+   requestedExistingBranch?: string | null;
+   existingExecutionWorkspaceBranchName?: string | null;
++  /** The issue this run is for. Used to decide whether a workspace is its own. */
++  issueId?: string | null;
++  /** The mode of the workspace row the issue points at. */
++  existingExecutionWorkspaceMode?: string | null;
++  /** The issue that owns the workspace row, when it was created for one. */
++  existingExecutionWorkspaceSourceIssueId?: string | null;
++  /**
++   * Recovery restores the workspace a run was already dispatched into, even
++   * when that workspace belongs to another issue: the run is a continuation
++   * of work that already happened in that tree, not a second issue joining it.
++   */
++  allowForeignIsolatedWorkspaceReuse?: boolean;
+ }): ExecutionWorkspaceReuseRequestForIssue {
+   const requestedExecutionWorkspaceId = readNonEmptyString(
+     input.issueExecutionWorkspaceId,
+@@ -2239,10 +2260,31 @@ export function resolveExecutionWorkspaceReuseRequestForIssue(input: {
+     requestedExistingBranch === null ||
+     readNonEmptyString(input.existingExecutionWorkspaceBranchName) ===
+       requestedExistingBranch;
++  // An isolated workspace is one issue's worktree: one directory, one branch,
++  // one index. Reusing it from another issue is not a shared-workspace
++  // arrangement, it is two runs writing one tree -- the measured NEXA-415
++  // failure, where six children of a decomposed parent were dispatched into
++  // one worktree and four runs were live in it at once. So the refusal is
++  // keyed on the workspace's own owner, not on the relationship between the
++  // two issues: a child that legitimately continues its parent's *shared*
++  // workspace is untouched.
++  const workspaceOwnerIssueId = readNonEmptyString(
++    input.existingExecutionWorkspaceSourceIssueId,
++  );
++  const currentIssueId = readNonEmptyString(input.issueId);
++  const conflictingWorkspaceOwnerIssueId =
++    input.allowForeignIsolatedWorkspaceReuse === true ||
++    input.existingExecutionWorkspaceMode !== "isolated_workspace" ||
++    workspaceOwnerIssueId === null ||
++    currentIssueId === null ||
++    workspaceOwnerIssueId === currentIssueId
++      ? null
++      : workspaceOwnerIssueId;
+   const requestedShouldReuseExisting =
+     input.issueExecutionWorkspacePreference === "reuse_existing" &&
+     requestedExecutionWorkspaceId !== null &&
+-    existingWorkspaceMatchesRequestedBranch;
++    existingWorkspaceMatchesRequestedBranch &&
++    conflictingWorkspaceOwnerIssueId === null;
+ 
+   return {
+     requestedExecutionWorkspaceId,
+@@ -2252,6 +2294,7 @@ export function resolveExecutionWorkspaceReuseRequestForIssue(input: {
+       input.existingExecutionWorkspaceStatus !== null &&
+       input.existingExecutionWorkspaceStatus !== undefined &&
+       input.existingExecutionWorkspaceStatus !== "archived",
++    conflictingWorkspaceOwnerIssueId,
+   };
+ }
+ 
+diff --git a/server/src/services/issues.ts b/server/src/services/issues.ts
+index 9acfdf86..1f2b5351 100644
+--- a/server/src/services/issues.ts
++++ b/server/src/services/issues.ts
+@@ -135,12 +135,13 @@ import {
+   SUCCESSFUL_RUN_HANDOFF_LIVE_WAKE_STATUSES,
+ } from "./successful-run-handoff-state.js";
+ import {
++  buildInheritedExecutionWorkspaceSettings,
+   defaultIssueExecutionWorkspaceSettingsForProject,
+   gateProjectExecutionWorkspacePolicy,
+-  issueExecutionWorkspaceModeForPersistedWorkspace,
+   isUnrunnableWorktreeCombo,
+   parseIssueExecutionWorkspaceSettings,
+   parseProjectExecutionWorkspacePolicy,
++  resolveExecutionWorkspaceInheritanceDecision,
+   resolvePinnedIssueWorkspaceStrategyType,
+   WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
+   WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE,
+@@ -10132,16 +10133,28 @@ export function issueService(db: Db) {
+               )
+               .then((rows) => rows[0] ?? null);
+             if (sourceWorkspace) {
+-              executionWorkspaceId = sourceWorkspace.id;
+-              inheritedWorkspaceSelection = true;
+-              executionWorkspacePreference = "reuse_existing";
+-              executionWorkspaceSettings = {
+-                ...((workspaceSource.executionWorkspaceSettings as
+-                  Record<string, unknown> | null | undefined) ?? {}),
+-                mode: issueExecutionWorkspaceModeForPersistedWorkspace(
+-                  sourceWorkspace.mode,
+-                ),
+-              };
++              // An isolated workspace belongs to the issue that owns it. A
++              // child of a decomposed parent inherits the parent's *mode* --
++              // it is still an isolated task -- but not the parent's tree,
++              // because two issues in one worktree is the failure this
++              // decision exists to prevent (NEXA-424).
++              const inheritance = resolveExecutionWorkspaceInheritanceDecision({
++                sourceWorkspaceMode: sourceWorkspace.mode,
++                hasExplicitExecutionWorkspaceOverride,
++              });
++              if (inheritance.inheritSourceSettings) {
++                executionWorkspaceSettings = buildInheritedExecutionWorkspaceSettings({
++                  sourceSettings: workspaceSource.executionWorkspaceSettings as
++                    Record<string, unknown> | null | undefined,
++                  sourceWorkspaceMode: sourceWorkspace.mode,
++                  bindSourceWorkspace: inheritance.bindSourceWorkspace,
++                });
++              }
++              if (inheritance.bindSourceWorkspace) {
++                executionWorkspaceId = sourceWorkspace.id;
++                inheritedWorkspaceSelection = true;
++                executionWorkspacePreference = "reuse_existing";
++              }
+             }
+           }
+         }
+-- 
+2.47.3
+
+
+From 266e2a1c5c15d448fab1abe1ca72e365e56e0cb8 Mon Sep 17 00:00:00 2001
+From: jjude80 <18168364+jjude80@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 22:19:29 -0400
+Subject: [PATCH 2/5] fix(install): prepare the server UI dist before staging a
+ git payload
+
+`paperclipai install --repo <owner/name> --ref <branch>` could not build a
+payload at all: the server package ships the built UI inside it, and
+prepare-bundled-package.mjs copies server/ui-dist into the staged package.
+A fresh git checkout has no server/ui-dist -- it is produced by
+scripts/prepare-server-ui-dist.sh, which the server package's own prepack
+hook runs, and prepack only runs on `pnpm pack`. This flow stages the server
+package directly, so the hook never fires and the packaging step died with
+
+    Error: ENOENT: no such file or directory, lstat '.../source/server/ui-dist'
+
+after the whole build had already run (~20 minutes).
+
+Build the UI before the workspace packages are staged, the same way
+scripts/release.sh does it before it packs. Without this, a fork branch
+cannot be installed on an instance at all, which is the only supported way
+to ship a fork build, and the managed install store's git source cannot be
+used.
+
+Test: cli/src/__tests__/install-command.test.ts now asserts the UI
+preparation runs, and that it runs before prepare-bundled-package.mjs
+stages the bundled package.
+---
+ cli/src/__tests__/install-command.test.ts | 21 ++++++++++++++++++++-
+ cli/src/commands/install.ts               |  4 ++++
+ 2 files changed, 24 insertions(+), 1 deletion(-)
+
+diff --git a/cli/src/__tests__/install-command.test.ts b/cli/src/__tests__/install-command.test.ts
+index 9c8c06c1..5204c735 100644
+--- a/cli/src/__tests__/install-command.test.ts
++++ b/cli/src/__tests__/install-command.test.ts
+@@ -115,7 +115,7 @@ describe("managed install commands", () => {
+     expect(runCommand.mock.calls[0]?.[0]).toBe(process.execPath);
+   });
+ 
+-  const createGitCheckoutRunCommand = (sha: string) =>
++  const createGitCheckoutRunCommand = (sha: string, options?: { uiDistScript?: boolean }) =>
+     vi.fn(async (file: string, args: string[], _options?: Parameters<CommandRunner>[2]) => {
+       if (file === "curl" && !args.includes("--output")) return { stdout: JSON.stringify({ sha }), stderr: "" };
+       if (file === "curl") { fs.writeFileSync(args[args.indexOf("--output") + 1], "archive"); return { stdout: "", stderr: "" }; }
+@@ -129,6 +129,9 @@ describe("managed install commands", () => {
+         fs.mkdirSync(path.join(checkout, "cli"), { recursive: true });
+         fs.writeFileSync(path.join(checkout, "cli", "package.json"), JSON.stringify({ version: "0.3.1" }));
+         fs.mkdirSync(path.join(checkout, "scripts"), { recursive: true });
++        if (options?.uiDistScript) {
++          fs.writeFileSync(path.join(checkout, "scripts", "prepare-server-ui-dist.sh"), "#!/usr/bin/env bash\n");
++        }
+         fs.writeFileSync(path.join(checkout, "scripts", "release-package-manifest.json"), JSON.stringify(packages.map(({ dir, name }) => ({ dir, name }))));
+         for (const workspacePackage of packages) {
+           fs.mkdirSync(path.join(checkout, workspacePackage.dir), { recursive: true });
+@@ -178,6 +181,22 @@ describe("managed install commands", () => {
+     expect(installCall?.[1].filter((arg) => arg.endsWith(".tgz"))).toHaveLength(4);
+   });
+ 
++  it("prepares the server UI dist before it stages a bundled workspace package", async () => {
++    const sha = "e".repeat(40);
++    const runCommand = createGitCheckoutRunCommand(sha, { uiDistScript: true });
++    await expect(installGitPayload("paperclipai/paperclip", sha, runCommand, resolveInstallStorePaths())).resolves.toMatchObject({ version: "0.3.1", reused: false });
++    const uiCall = runCommand.mock.calls.find(([file, args]) =>
++      file === "bash" && args.some((arg) => arg.endsWith("prepare-server-ui-dist.sh")),
++    );
++    expect(uiCall).toBeTruthy();
++    const stagedCall = runCommand.mock.calls.findIndex(([file, args]) =>
++      file === process.execPath && args[0]?.endsWith("prepare-bundled-package.mjs"),
++    );
++    expect(runCommand.mock.calls.findIndex(([file, args]) =>
++      file === "bash" && args.some((arg) => arg.endsWith("prepare-server-ui-dist.sh")),
++    )).toBeLessThan(stagedCall);
++  });
++
+   it("builds git checkouts with NODE_ENV cleared so ambient production mode keeps devDependencies", async () => {
+     process.env.NODE_ENV = "production";
+     const sha = "d".repeat(40);
+diff --git a/cli/src/commands/install.ts b/cli/src/commands/install.ts
+index b8083a14..c81d6a66 100644
+--- a/cli/src/commands/install.ts
++++ b/cli/src/commands/install.ts
+@@ -280,6 +280,10 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
+     await runCommand("corepack", ["pnpm", "install", "--frozen-lockfile"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
+     await runCommand("bash", ["scripts/build-npm.sh", "--skip-checks", "--skip-typecheck"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
+     await runCommand("corepack", ["pnpm", "-r", "--filter", "@paperclipai/server...", "--if-present", "run", "build"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
++    const serverUiDistScript = path.join(checkoutPath, "scripts", "prepare-server-ui-dist.sh");
++    if (fs.existsSync(serverUiDistScript)) {
++      await runCommand("bash", [serverUiDistScript], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
++    }
+     const metadata = JSON.parse(fs.readFileSync(path.join(checkoutPath, "cli", "package.json"), "utf8")) as { version: string };
+     const workspacePackages = resolveGitInstallWorkspacePackages(checkoutPath);
+     for (const [index, workspacePackage] of workspacePackages.entries()) {
+-- 
+2.47.3
+
+
+From c4b7e7418049356ae07f89caf05d814998087140 Mon Sep 17 00:00:00 2001
+From: jjude80 <18168364+jjude80@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 23:05:32 -0400
+Subject: [PATCH 3/5] fix(workspace): keep a refused child out of the holder's
+ checkout
+
+A review found a hole in the refusal: refusing the reuse of another issue's
+isolated workspace is not enough on its own. A child that carries a pinned
+workspaceStrategy.existingBranch still realizes into the holder's checkout,
+because realization finds the worktree registered for that branch and reuses
+it. The run was refused a workspace and then given the same tree by another
+door.
+
+The dispatch path now drops the pinned branch when the reuse was refused
+because the workspace belongs to another issue, so the child derives its own
+branch and its own worktree. The strategy config is resolved through
+resolveExecutionWorkspaceStrategyConfig, which the workspace preparation uses
+for the effective run config, the plugin preparation and the realization.
+
+Tests: execution-workspace-policy covers the strategy resolution (a pinned
+branch is dropped for a foreign owner, kept for the issue's own workspace, and
+the whole strategy is dropped when the branch was all it held);
+heartbeat-workspace-session covers the dispatch path, from the refusal through
+the effective strategy the run realizes with.
+---
+ .../execution-workspace-policy.test.ts        | 42 ++++++++++++++--
+ .../heartbeat-workspace-session.test.ts       | 25 +++++++++-
+ server/src/__tests__/issues-service.test.ts   | 10 ----
+ .../services/execution-workspace-policy.ts    | 50 +++++++------------
+ .../heartbeat/environment-selection.ts        |  4 --
+ server/src/services/heartbeat/queue.ts        |  5 --
+ .../heartbeat/workspace-preparation.ts        |  7 ++-
+ server/src/services/heartbeat/workspaces.ts   | 24 ---------
+ server/src/services/issues.ts                 |  5 --
+ 9 files changed, 85 insertions(+), 87 deletions(-)
+
+diff --git a/server/src/__tests__/execution-workspace-policy.test.ts b/server/src/__tests__/execution-workspace-policy.test.ts
+index c788b7fc..d2862b26 100644
+--- a/server/src/__tests__/execution-workspace-policy.test.ts
++++ b/server/src/__tests__/execution-workspace-policy.test.ts
+@@ -20,6 +20,7 @@ import {
+   resolveExecutionWorkspaceInheritanceDecision,
+   resolvePinnedIssueWorkspaceStrategyType,
+   resolveExecutionWorkspaceMode,
++  resolveExecutionWorkspaceStrategyConfig,
+   resolveSharedWorkspaceConcurrency,
+   selectEnvironmentExecutionWorkspaceSettings,
+ } from "../services/execution-workspace-policy.ts";
+@@ -773,10 +774,6 @@ describe("operator default isolated execution workspaces", () => {
+   });
+ });
+ 
+-// NEXA-424: a child of a decomposed parent must not inherit the parent's
+-// isolated worktree. The failure this covers was measured on NEXA-415, where
+-// six children of one parent were dispatched into one worktree and four runs
+-// were live in it at once.
+ describe("execution workspace inheritance", () => {
+   it("does not bind a child to the parent's isolated workspace", () => {
+     expect(
+@@ -871,4 +868,41 @@ describe("execution workspace inheritance", () => {
+       }),
+     ).toEqual({ mode: "shared_workspace" });
+   });
++
++  it("drops a pinned branch from the strategy when another issue owns the workspace", () => {
++    expect(
++      resolveExecutionWorkspaceStrategyConfig({
++        config: {
++          mode: "isolated_workspace",
++          workspaceStrategy: { type: "git_worktree", existingBranch: "NEXA-415-thing" },
++        },
++        conflictingWorkspaceOwnerIssueId: "issue-parent",
++      }),
++    ).toEqual({
++      mode: "isolated_workspace",
++      workspaceStrategy: { type: "git_worktree" },
++    });
++  });
++
++  it("keeps the pinned branch when the workspace is the issue's own", () => {
++    expect(
++      resolveExecutionWorkspaceStrategyConfig({
++        config: {
++          workspaceStrategy: { type: "git_worktree", existingBranch: "NEXA-424-thing" },
++        },
++        conflictingWorkspaceOwnerIssueId: null,
++      }),
++    ).toEqual({
++      workspaceStrategy: { type: "git_worktree", existingBranch: "NEXA-424-thing" },
++    });
++  });
++
++  it("drops the whole strategy when the pinned branch was all it held", () => {
++    expect(
++      resolveExecutionWorkspaceStrategyConfig({
++        config: { workspaceStrategy: { existingBranch: "NEXA-415-thing" } },
++        conflictingWorkspaceOwnerIssueId: "issue-parent",
++      }),
++    ).toEqual({});
++  });
+ });
+diff --git a/server/src/__tests__/heartbeat-workspace-session.test.ts b/server/src/__tests__/heartbeat-workspace-session.test.ts
+index 2711e220..7ed7a474 100644
+--- a/server/src/__tests__/heartbeat-workspace-session.test.ts
++++ b/server/src/__tests__/heartbeat-workspace-session.test.ts
+@@ -48,6 +48,7 @@ import {
+   type ResolvedWorkspaceForRun,
+ } from "../services/heartbeat.ts";
+ import { stripHostWorkspaceProvision } from "../services/heartbeat/workspaces.js";
++import { resolveExecutionWorkspaceStrategyConfig } from "../services/execution-workspace-policy.js";
+ import type { TrustPresetResolution } from "../services/trust-preset-resolver.ts";
+ 
+ const execFile = promisify(execFileCallback);
+@@ -1916,8 +1917,6 @@ describe("effective run execution workspace config freshness", () => {
+     });
+   });
+ 
+-  // NEXA-424: an isolated workspace is one issue's worktree. A second issue
+-  // that points at it is refused, and the refusal names the holder.
+   it("refuses to reuse another issue's isolated workspace and names the holder", () => {
+     expect(resolveExecutionWorkspaceReuseRequestForIssue({
+       issueExecutionWorkspaceId: "workspace-parent",
+@@ -1934,6 +1933,28 @@ describe("effective run execution workspace config freshness", () => {
+     });
+   });
+ 
++  it("drops the inherited branch so a refused child cannot realize into the holder's checkout", () => {
++    const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
++      issueExecutionWorkspaceId: "workspace-parent",
++      issueExecutionWorkspacePreference: "reuse_existing",
++      existingExecutionWorkspaceStatus: "active",
++      issueId: "issue-child",
++      existingExecutionWorkspaceMode: "isolated_workspace",
++      existingExecutionWorkspaceSourceIssueId: "issue-parent",
++    });
++    expect(reuseRequest.requestedShouldReuseExisting).toBe(false);
++    expect(resolveExecutionWorkspaceStrategyConfig({
++      config: {
++        mode: "isolated_workspace",
++        workspaceStrategy: { type: "git_worktree", existingBranch: "NEXA-415-thing" },
++      },
++      conflictingWorkspaceOwnerIssueId: reuseRequest.conflictingWorkspaceOwnerIssueId,
++    })).toEqual({
++      mode: "isolated_workspace",
++      workspaceStrategy: { type: "git_worktree" },
++    });
++  });
++
+   it("reuses an issue's own isolated workspace", () => {
+     expect(resolveExecutionWorkspaceReuseRequestForIssue({
+       issueExecutionWorkspaceId: "workspace-own",
+diff --git a/server/src/__tests__/issues-service.test.ts b/server/src/__tests__/issues-service.test.ts
+index 2138b9e2..60c06846 100644
+--- a/server/src/__tests__/issues-service.test.ts
++++ b/server/src/__tests__/issues-service.test.ts
+@@ -3063,11 +3063,6 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
+     await tempDb?.cleanup();
+   });
+ 
+-  // NEXA-424: this is the shape that was measured on NEXA-415. Six children
+-  // of one parent were dispatched into the parent's worktree, four runs were
+-  // live in it at once, and the tree did not compile for reasons that
+-  // belonged to neither run. A child of a decomposed parent gets the parent's
+-  // *mode* and its own workspace, never the parent's tree.
+   it("does not inherit the parent's isolated workspace linkage when child workspace fields are omitted", async () => {
+     const companyId = randomUUID();
+     const projectId = randomUUID();
+@@ -3126,8 +3121,6 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
+ 
+     expect(child.parentId).toBe(parentIssueId);
+     expect(child.projectWorkspaceId).toBe(projectWorkspaceId);
+-    // The parent's worktree is the parent's. The child is still an isolated
+-    // task, so it keeps the mode -- but it resolves a workspace of its own.
+     expect(child.executionWorkspaceId).toBeNull();
+     expect(child.executionWorkspacePreference).toBeNull();
+     expect(child.executionWorkspaceSettings).toEqual({
+@@ -3940,8 +3933,6 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
+     expect(child.description).toContain("## Acceptance Criteria");
+     expect(child.description).toContain("- Uses the parent issue as parentId");
+     expect(child.projectWorkspaceId).toBe(projectWorkspaceId);
+-    // The parent's workspace is an isolated per-issue worktree, so the child
+-    // inherits the mode and resolves a workspace of its own (NEXA-424).
+     expect(child.executionWorkspaceId).toBeNull();
+     expect(child.executionWorkspacePreference).toBeNull();
+     expect(child.executionWorkspaceSettings).toEqual({ mode: "isolated_workspace" });
+@@ -5015,7 +5006,6 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
+     expect(child.parentId).toBe(parentIssueId);
+     expect(child.projectId).toBe(projectId);
+     expect(child.projectWorkspaceId).toBe(projectWorkspaceId);
+-    // The project is inherited; the parent's isolated worktree is not.
+     expect(child.executionWorkspaceId).toBeNull();
+     expect(child.executionWorkspaceSettings).toEqual({ mode: "isolated_workspace" });
+   });
+diff --git a/server/src/services/execution-workspace-policy.ts b/server/src/services/execution-workspace-policy.ts
+index 159a4f94..b769c19c 100644
+--- a/server/src/services/execution-workspace-policy.ts
++++ b/server/src/services/execution-workspace-policy.ts
+@@ -373,29 +373,8 @@ export function issueExecutionWorkspaceModeForPersistedWorkspace(
+   return "shared_workspace";
+ }
+ 
+-/**
+- * Whether a child issue may be bound to the execution workspace its parent
+- * already owns.
+- *
+- * An `isolated_workspace` is a *per-issue* workspace: it is one git worktree,
+- * with one branch and one index, cut for one issue. Binding a second issue to
+- * it does not make the tree shared in some softer sense -- it puts two runs in
+- * the same working tree, where a whole-file write destroys the other run's
+- * edit, `git commit` publishes the other run's staged paths, and the tree does
+- * not build for reasons that belong to neither run. That was measured on
+- * NEXA-415 (six children of one parent, four runs live in one worktree at
+- * once), so the rule here is not a preference: a child of a decomposed parent
+- * gets its own workspace.
+- *
+- * A `shared_workspace` is a different animal. It is shared *by design*, it is
+- * not a per-issue branch, and inheriting it is how a child continues its
+- * parent's work in the project checkout. So the rule keys on the mode of the
+- * workspace being inherited, not on the relationship between the two issues.
+- */
+ export type ExecutionWorkspaceInheritanceDecision = {
+-  /** Bind the child to the source issue's persisted execution workspace row. */
+   bindSourceWorkspace: boolean;
+-  /** Copy the source issue's workspace settings (mode, runtime) onto the child. */
+   inheritSourceSettings: boolean;
+   reason:
+     | "explicit_override"
+@@ -408,8 +387,6 @@ export function resolveExecutionWorkspaceInheritanceDecision(input: {
+   hasExplicitExecutionWorkspaceOverride: boolean;
+ }): ExecutionWorkspaceInheritanceDecision {
+   if (input.hasExplicitExecutionWorkspaceOverride) {
+-    // The caller named its own workspace. Nothing is inherited, and nothing
+-    // is inferred on its behalf.
+     return {
+       bindSourceWorkspace: false,
+       inheritSourceSettings: false,
+@@ -430,15 +407,6 @@ export function resolveExecutionWorkspaceInheritanceDecision(input: {
+   };
+ }
+ 
+-/**
+- * The workspace settings a child carries when it inherits from a source issue.
+- *
+- * The mode always travels: a child of an isolated parent is still an isolated
+- * task, it just gets an isolated workspace of its own rather than the parent's
+- * tree. A pinned exact branch does not travel with it, for the same reason the
+- * workspace row does not: `existingBranch` names one branch, and a branch is
+- * the thing two issues must not share.
+- */
+ export function buildInheritedExecutionWorkspaceSettings(input: {
+   sourceSettings: Record<string, unknown> | null | undefined;
+   sourceWorkspaceMode: string | null | undefined;
+@@ -463,6 +431,24 @@ export function buildInheritedExecutionWorkspaceSettings(input: {
+   return settings;
+ }
+ 
++export function resolveExecutionWorkspaceStrategyConfig(input: {
++  config: Record<string, unknown> | null | undefined;
++  conflictingWorkspaceOwnerIssueId: string | null | undefined;
++}): Record<string, unknown> {
++  const config = { ...(input.config ?? {}) };
++  if (!input.conflictingWorkspaceOwnerIssueId) return config;
++  const strategy = parseObject(config.workspaceStrategy);
++  if (typeof strategy.existingBranch !== "string") return config;
++  const nextStrategy = { ...strategy };
++  delete nextStrategy.existingBranch;
++  if (Object.keys(nextStrategy).length > 0) {
++    config.workspaceStrategy = nextStrategy;
++  } else {
++    delete config.workspaceStrategy;
++  }
++  return config;
++}
++
+ export function resolveExecutionWorkspaceMode(input: {
+   projectPolicy: ProjectExecutionWorkspacePolicy | null;
+   issueSettings: IssueExecutionWorkspaceSettings | null;
+diff --git a/server/src/services/heartbeat/environment-selection.ts b/server/src/services/heartbeat/environment-selection.ts
+index a5427859..3f2bae22 100644
+--- a/server/src/services/heartbeat/environment-selection.ts
++++ b/server/src/services/heartbeat/environment-selection.ts
+@@ -127,10 +127,6 @@ export async function selectHeartbeatEnvironment(db: Db, input: HeartbeatEnviron
+       existingExecutionWorkspaceMode: existingExecutionWorkspace?.mode ?? null,
+       existingExecutionWorkspaceSourceIssueId:
+         existingExecutionWorkspace?.sourceIssueId ?? null,
+-      // A recovered run continues work that already happened in the workspace
+-      // it was dispatched into, so it restores that workspace even when the
+-      // row is owned by another issue. A fresh dispatch is the case the
+-      // per-issue rule is about.
+       allowForeignIsolatedWorkspaceReuse: Boolean(
+         nativeRecoveryExecutionWorkspaceId,
+       ),
+diff --git a/server/src/services/heartbeat/queue.ts b/server/src/services/heartbeat/queue.ts
+index ec944b46..1633a464 100644
+--- a/server/src/services/heartbeat/queue.ts
++++ b/server/src/services/heartbeat/queue.ts
+@@ -3746,11 +3746,6 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
+             const hasResolvablePriorSessionWorkspace =
+               await resolveHasResolvablePriorSessionWorkspace();
+ 
+-            // The refusal is loud on purpose. An isolated workspace is one
+-            // issue's worktree, so a run that would land in another issue's
+-            // tree is told so -- and told whose tree it is -- instead of
+-            // quietly sharing a directory with somebody who is already
+-            // writing in it.
+             if (reuseRequest.conflictingWorkspaceOwnerIssueId) {
+               const ownerIssueId = reuseRequest.conflictingWorkspaceOwnerIssueId;
+               const owner = await tx
+diff --git a/server/src/services/heartbeat/workspace-preparation.ts b/server/src/services/heartbeat/workspace-preparation.ts
+index 21e0d0c4..82257867 100644
+--- a/server/src/services/heartbeat/workspace-preparation.ts
++++ b/server/src/services/heartbeat/workspace-preparation.ts
+@@ -54,6 +54,7 @@ import { isRuntimeOwnedGitBranch } from "../execution-workspace-branch-ownership
+ import {
+   issueExecutionWorkspaceModeForPersistedWorkspace,
+   resolveEffectiveWorkspaceStrategyType,
++  resolveExecutionWorkspaceStrategyConfig,
+ } from "../execution-workspace-policy.js";
+ import { evaluateExecutionAllowlist } from "../execution-allowlist.js";
+ import type { Db, agents } from "@paperclipai/db";
+@@ -192,7 +193,7 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
+     environmentResolution,
+     resolvedInstanceSettings,
+   } = input.environment;
+-  const { mergedConfig, configSnapshot, secretManifest } = input.config;
++  const { mergedConfig: rawMergedConfig, configSnapshot, secretManifest } = input.config;
+   const {
+     requestedShouldReuseExisting,
+     existingExecutionWorkspace,
+@@ -203,6 +204,10 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
+     isDotRun,
+     runOptions,
+   } = input.reuse;
++  const mergedConfig = resolveExecutionWorkspaceStrategyConfig({
++    config: rawMergedConfig,
++    conflictingWorkspaceOwnerIssueId: workspaceReuseRequest.conflictingWorkspaceOwnerIssueId,
++  });
+   // An ordinary clean task directory already has a new per-attempt identity.
+   // It is not a repository source and must not pass through Git copy admission.
+   const freshNeedsSeed = fresh && !isDotRun && !useIsolatedTaskDirectory &&
+diff --git a/server/src/services/heartbeat/workspaces.ts b/server/src/services/heartbeat/workspaces.ts
+index 464c3bc0..d8ab6999 100644
+--- a/server/src/services/heartbeat/workspaces.ts
++++ b/server/src/services/heartbeat/workspaces.ts
+@@ -2204,14 +2204,6 @@ export type ExecutionWorkspaceReuseRequestForIssue = {
+   requestedExecutionWorkspaceId: string | null;
+   requestedShouldReuseExisting: boolean;
+   existingExecutionWorkspaceAvailable: boolean;
+-  /**
+-   * The issue that owns the isolated workspace this run was about to reuse.
+-   *
+-   * Non-null means the reuse was refused because the workspace belongs to
+-   * another issue, and the run is going to realize a workspace of its own
+-   * instead. It is the holder's id, so the refusal can name the holder rather
+-   * than saying only that something went wrong.
+-   */
+   conflictingWorkspaceOwnerIssueId: string | null;
+ };
+ 
+@@ -2234,17 +2226,9 @@ export function resolveExecutionWorkspaceReuseRequestForIssue(input: {
+   existingExecutionWorkspaceStatus?: string | null;
+   requestedExistingBranch?: string | null;
+   existingExecutionWorkspaceBranchName?: string | null;
+-  /** The issue this run is for. Used to decide whether a workspace is its own. */
+   issueId?: string | null;
+-  /** The mode of the workspace row the issue points at. */
+   existingExecutionWorkspaceMode?: string | null;
+-  /** The issue that owns the workspace row, when it was created for one. */
+   existingExecutionWorkspaceSourceIssueId?: string | null;
+-  /**
+-   * Recovery restores the workspace a run was already dispatched into, even
+-   * when that workspace belongs to another issue: the run is a continuation
+-   * of work that already happened in that tree, not a second issue joining it.
+-   */
+   allowForeignIsolatedWorkspaceReuse?: boolean;
+ }): ExecutionWorkspaceReuseRequestForIssue {
+   const requestedExecutionWorkspaceId = readNonEmptyString(
+@@ -2260,14 +2244,6 @@ export function resolveExecutionWorkspaceReuseRequestForIssue(input: {
+     requestedExistingBranch === null ||
+     readNonEmptyString(input.existingExecutionWorkspaceBranchName) ===
+       requestedExistingBranch;
+-  // An isolated workspace is one issue's worktree: one directory, one branch,
+-  // one index. Reusing it from another issue is not a shared-workspace
+-  // arrangement, it is two runs writing one tree -- the measured NEXA-415
+-  // failure, where six children of a decomposed parent were dispatched into
+-  // one worktree and four runs were live in it at once. So the refusal is
+-  // keyed on the workspace's own owner, not on the relationship between the
+-  // two issues: a child that legitimately continues its parent's *shared*
+-  // workspace is untouched.
+   const workspaceOwnerIssueId = readNonEmptyString(
+     input.existingExecutionWorkspaceSourceIssueId,
+   );
+diff --git a/server/src/services/issues.ts b/server/src/services/issues.ts
+index 1f2b5351..5d4d7787 100644
+--- a/server/src/services/issues.ts
++++ b/server/src/services/issues.ts
+@@ -10133,11 +10133,6 @@ export function issueService(db: Db) {
+               )
+               .then((rows) => rows[0] ?? null);
+             if (sourceWorkspace) {
+-              // An isolated workspace belongs to the issue that owns it. A
+-              // child of a decomposed parent inherits the parent's *mode* --
+-              // it is still an isolated task -- but not the parent's tree,
+-              // because two issues in one worktree is the failure this
+-              // decision exists to prevent (NEXA-424).
+               const inheritance = resolveExecutionWorkspaceInheritanceDecision({
+                 sourceWorkspaceMode: sourceWorkspace.mode,
+                 hasExplicitExecutionWorkspaceOverride,
+-- 
+2.47.3
+
+
+From 774f7aed6b7472d35f0028000420030d9fd686c2 Mon Sep 17 00:00:00 2001
+From: jjude80 <18168364+jjude80@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 01:32:41 -0400
+Subject: [PATCH 4/5] fix(workspace): keep a refused child out of the holder's
+ plugin workspace
+
+The dispatch-time refusal stopped the local realization path from restoring
+another issue's isolated workspace, and the pinned branch is dropped so the
+child cannot find the holder's registered worktree by name.
+
+The plugin preparation path still adopted the holder's workspace row.
+prepareHeartbeatWorkspace passed issueRef.executionWorkspaceId to
+preparePluginWorkspace, which restores that row and its saved provider
+binding, so a refused child was handed the holder's storage through the
+other door. The refusal now decides the workspace id that both preparation
+paths use: a refused child gets no existing workspace id, and an issue that
+owns its workspace keeps it.
+
+The admission notice is emitted only for a refused reuse request, and it
+states what was observed instead of promising a replacement. The duplicate
+check asks the database for a bounded match instead of loading every
+comment body of the issue into the process.
+
+Tests: the policy suite covers the workspace id decision and the notice
+rule, and the workspace session suite covers the id the plugin preparation
+receives for a refused child and for an issue that owns its workspace.
+---
+ .../execution-workspace-policy.test.ts        | 91 +++++++++++++++++--
+ .../heartbeat-workspace-session.test.ts       | 36 +++++++-
+ .../services/execution-workspace-policy.ts    | 26 ++++++
+ server/src/services/heartbeat/queue.ts        | 24 +++--
+ .../heartbeat/workspace-preparation.ts        |  7 +-
+ 5 files changed, 166 insertions(+), 18 deletions(-)
+
+diff --git a/server/src/__tests__/execution-workspace-policy.test.ts b/server/src/__tests__/execution-workspace-policy.test.ts
+index d2862b26..e19a86df 100644
+--- a/server/src/__tests__/execution-workspace-policy.test.ts
++++ b/server/src/__tests__/execution-workspace-policy.test.ts
+@@ -20,6 +20,8 @@ import {
+   resolveExecutionWorkspaceInheritanceDecision,
+   resolvePinnedIssueWorkspaceStrategyType,
+   resolveExecutionWorkspaceMode,
++  resolveExecutionWorkspaceConflictNotice,
++  resolveExecutionWorkspaceReuseWorkspaceId,
+   resolveExecutionWorkspaceStrategyConfig,
+   resolveSharedWorkspaceConcurrency,
+   selectEnvironmentExecutionWorkspaceSettings,
+@@ -832,7 +834,7 @@ describe("execution workspace inheritance", () => {
+       buildInheritedExecutionWorkspaceSettings({
+         sourceSettings: {
+           mode: "isolated_workspace",
+-          workspaceStrategy: { type: "git_worktree", existingBranch: "NEXA-415-thing", branchTemplate: "{{issue.identifier}}-{{slug}}" },
++          workspaceStrategy: { type: "git_worktree", existingBranch: "holder-branch", branchTemplate: "{{issue.identifier}}-{{slug}}" },
+         },
+         sourceWorkspaceMode: "isolated_workspace",
+         bindSourceWorkspace: false,
+@@ -848,14 +850,14 @@ describe("execution workspace inheritance", () => {
+       buildInheritedExecutionWorkspaceSettings({
+         sourceSettings: {
+           mode: "isolated_workspace",
+-          workspaceStrategy: { type: "git_worktree", existingBranch: "NEXA-415-thing" },
++          workspaceStrategy: { type: "git_worktree", existingBranch: "holder-branch" },
+         },
+         sourceWorkspaceMode: "isolated_workspace",
+         bindSourceWorkspace: true,
+       }),
+     ).toEqual({
+       mode: "isolated_workspace",
+-      workspaceStrategy: { type: "git_worktree", existingBranch: "NEXA-415-thing" },
++      workspaceStrategy: { type: "git_worktree", existingBranch: "holder-branch" },
+     });
+   });
+ 
+@@ -874,7 +876,7 @@ describe("execution workspace inheritance", () => {
+       resolveExecutionWorkspaceStrategyConfig({
+         config: {
+           mode: "isolated_workspace",
+-          workspaceStrategy: { type: "git_worktree", existingBranch: "NEXA-415-thing" },
++          workspaceStrategy: { type: "git_worktree", existingBranch: "holder-branch" },
+         },
+         conflictingWorkspaceOwnerIssueId: "issue-parent",
+       }),
+@@ -888,21 +890,96 @@ describe("execution workspace inheritance", () => {
+     expect(
+       resolveExecutionWorkspaceStrategyConfig({
+         config: {
+-          workspaceStrategy: { type: "git_worktree", existingBranch: "NEXA-424-thing" },
++          workspaceStrategy: { type: "git_worktree", existingBranch: "own-branch" },
+         },
+         conflictingWorkspaceOwnerIssueId: null,
+       }),
+     ).toEqual({
+-      workspaceStrategy: { type: "git_worktree", existingBranch: "NEXA-424-thing" },
++      workspaceStrategy: { type: "git_worktree", existingBranch: "own-branch" },
+     });
+   });
+ 
+   it("drops the whole strategy when the pinned branch was all it held", () => {
+     expect(
+       resolveExecutionWorkspaceStrategyConfig({
+-        config: { workspaceStrategy: { existingBranch: "NEXA-415-thing" } },
++        config: { workspaceStrategy: { existingBranch: "holder-branch" } },
+         conflictingWorkspaceOwnerIssueId: "issue-parent",
+       }),
+     ).toEqual({});
+   });
++
++  it("keeps the requested workspace when no other issue owns it", () => {
++    expect(
++      resolveExecutionWorkspaceReuseWorkspaceId({
++        reusableWorkspaceId: null,
++        requestedWorkspaceId: "workspace-own",
++        conflictingWorkspaceOwnerIssueId: null,
++      }),
++    ).toBe("workspace-own");
++  });
++
++  it("prefers the reusable workspace over the requested one", () => {
++    expect(
++      resolveExecutionWorkspaceReuseWorkspaceId({
++        reusableWorkspaceId: "workspace-own",
++        requestedWorkspaceId: "workspace-own",
++        conflictingWorkspaceOwnerIssueId: null,
++      }),
++    ).toBe("workspace-own");
++  });
++
++  it("does not hand a refused child the holder's workspace", () => {
++    expect(
++      resolveExecutionWorkspaceReuseWorkspaceId({
++        reusableWorkspaceId: null,
++        requestedWorkspaceId: "workspace-parent",
++        conflictingWorkspaceOwnerIssueId: "issue-parent",
++      }),
++    ).toBeNull();
++  });
++
++  it("notifies the holder only for a refused reuse request", () => {
++    expect(
++      resolveExecutionWorkspaceConflictNotice({
++        conflictingWorkspaceOwnerIssueId: "issue-parent",
++        executionWorkspacePreference: "reuse_existing",
++        requestedExecutionWorkspaceId: "workspace-parent",
++        executionWorkspaceId: "workspace-parent",
++      }),
++    ).toEqual({
++      shouldNotify: true,
++      ownerIssueId: "issue-parent",
++      marker: "workspace_conflict:workspace-parent",
++    });
++  });
++
++  it("stays quiet when the issue never asked to reuse the workspace", () => {
++    expect(
++      resolveExecutionWorkspaceConflictNotice({
++        conflictingWorkspaceOwnerIssueId: "issue-parent",
++        executionWorkspacePreference: null,
++        requestedExecutionWorkspaceId: "workspace-parent",
++        executionWorkspaceId: "workspace-parent",
++      }),
++    ).toEqual({
++      shouldNotify: false,
++      ownerIssueId: "issue-parent",
++      marker: "workspace_conflict:workspace-parent",
++    });
++  });
++
++  it("stays quiet when no other issue owns the workspace", () => {
++    expect(
++      resolveExecutionWorkspaceConflictNotice({
++        conflictingWorkspaceOwnerIssueId: null,
++        executionWorkspacePreference: "reuse_existing",
++        requestedExecutionWorkspaceId: "workspace-own",
++        executionWorkspaceId: "workspace-own",
++      }),
++    ).toEqual({
++      shouldNotify: false,
++      ownerIssueId: null,
++      marker: "workspace_conflict:workspace-own",
++    });
++  });
+ });
+diff --git a/server/src/__tests__/heartbeat-workspace-session.test.ts b/server/src/__tests__/heartbeat-workspace-session.test.ts
+index 7ed7a474..89479b46 100644
+--- a/server/src/__tests__/heartbeat-workspace-session.test.ts
++++ b/server/src/__tests__/heartbeat-workspace-session.test.ts
+@@ -48,7 +48,7 @@ import {
+   type ResolvedWorkspaceForRun,
+ } from "../services/heartbeat.ts";
+ import { stripHostWorkspaceProvision } from "../services/heartbeat/workspaces.js";
+-import { resolveExecutionWorkspaceStrategyConfig } from "../services/execution-workspace-policy.js";
++import { resolveExecutionWorkspaceReuseWorkspaceId, resolveExecutionWorkspaceStrategyConfig } from "../services/execution-workspace-policy.js";
+ import type { TrustPresetResolution } from "../services/trust-preset-resolver.ts";
+ 
+ const execFile = promisify(execFileCallback);
+@@ -1946,7 +1946,7 @@ describe("effective run execution workspace config freshness", () => {
+     expect(resolveExecutionWorkspaceStrategyConfig({
+       config: {
+         mode: "isolated_workspace",
+-        workspaceStrategy: { type: "git_worktree", existingBranch: "NEXA-415-thing" },
++        workspaceStrategy: { type: "git_worktree", existingBranch: "holder-branch" },
+       },
+       conflictingWorkspaceOwnerIssueId: reuseRequest.conflictingWorkspaceOwnerIssueId,
+     })).toEqual({
+@@ -1955,6 +1955,38 @@ describe("effective run execution workspace config freshness", () => {
+     });
+   });
+ 
++  it("keeps the holder's workspace out of a refused child's plugin preparation", () => {
++    const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
++      issueExecutionWorkspaceId: "workspace-parent",
++      issueExecutionWorkspacePreference: "reuse_existing",
++      existingExecutionWorkspaceStatus: "active",
++      issueId: "issue-child",
++      existingExecutionWorkspaceMode: "isolated_workspace",
++      existingExecutionWorkspaceSourceIssueId: "issue-parent",
++    });
++    expect(resolveExecutionWorkspaceReuseWorkspaceId({
++      reusableWorkspaceId: null,
++      requestedWorkspaceId: reuseRequest.requestedExecutionWorkspaceId,
++      conflictingWorkspaceOwnerIssueId: reuseRequest.conflictingWorkspaceOwnerIssueId,
++    })).toBeNull();
++  });
++
++  it("still passes the issue's own workspace to the plugin preparation", () => {
++    const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
++      issueExecutionWorkspaceId: "workspace-own",
++      issueExecutionWorkspacePreference: "reuse_existing",
++      existingExecutionWorkspaceStatus: "active",
++      issueId: "issue-child",
++      existingExecutionWorkspaceMode: "isolated_workspace",
++      existingExecutionWorkspaceSourceIssueId: "issue-child",
++    });
++    expect(resolveExecutionWorkspaceReuseWorkspaceId({
++      reusableWorkspaceId: null,
++      requestedWorkspaceId: reuseRequest.requestedExecutionWorkspaceId,
++      conflictingWorkspaceOwnerIssueId: reuseRequest.conflictingWorkspaceOwnerIssueId,
++    })).toBe("workspace-own");
++  });
++
+   it("reuses an issue's own isolated workspace", () => {
+     expect(resolveExecutionWorkspaceReuseRequestForIssue({
+       issueExecutionWorkspaceId: "workspace-own",
+diff --git a/server/src/services/execution-workspace-policy.ts b/server/src/services/execution-workspace-policy.ts
+index b769c19c..ee44a649 100644
+--- a/server/src/services/execution-workspace-policy.ts
++++ b/server/src/services/execution-workspace-policy.ts
+@@ -449,6 +449,32 @@ export function resolveExecutionWorkspaceStrategyConfig(input: {
+   return config;
+ }
+ 
++export function resolveExecutionWorkspaceReuseWorkspaceId(input: {
++  reusableWorkspaceId: string | null | undefined;
++  requestedWorkspaceId: string | null | undefined;
++  conflictingWorkspaceOwnerIssueId: string | null | undefined;
++}): string | null {
++  if (input.reusableWorkspaceId) return input.reusableWorkspaceId;
++  if (input.conflictingWorkspaceOwnerIssueId) return null;
++  return input.requestedWorkspaceId ?? null;
++}
++
++export function resolveExecutionWorkspaceConflictNotice(input: {
++  conflictingWorkspaceOwnerIssueId: string | null | undefined;
++  executionWorkspacePreference: string | null | undefined;
++  requestedExecutionWorkspaceId: string | null | undefined;
++  executionWorkspaceId: string | null | undefined;
++}): { shouldNotify: boolean; ownerIssueId: string | null; marker: string } {
++  const ownerIssueId = input.conflictingWorkspaceOwnerIssueId ?? null;
++  const marker = `workspace_conflict:${input.executionWorkspaceId ?? "none"}`;
++  const shouldNotify = Boolean(
++    ownerIssueId &&
++      input.executionWorkspacePreference === "reuse_existing" &&
++      input.requestedExecutionWorkspaceId,
++  );
++  return { shouldNotify, ownerIssueId, marker };
++}
++
+ export function resolveExecutionWorkspaceMode(input: {
+   projectPolicy: ProjectExecutionWorkspacePolicy | null;
+   issueSettings: IssueExecutionWorkspaceSettings | null;
+diff --git a/server/src/services/heartbeat/queue.ts b/server/src/services/heartbeat/queue.ts
+index 1633a464..fde2ff1b 100644
+--- a/server/src/services/heartbeat/queue.ts
++++ b/server/src/services/heartbeat/queue.ts
+@@ -142,6 +142,7 @@ import {
+   isUnrunnableWorktreeCombo,
+   parseIssueExecutionWorkspaceSettings,
+   resolveEffectiveWorkspaceStrategyType,
++  resolveExecutionWorkspaceConflictNotice,
+   resolveExecutionWorkspaceMode,
+   WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
+   WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE,
+@@ -3746,8 +3747,14 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
+             const hasResolvablePriorSessionWorkspace =
+               await resolveHasResolvablePriorSessionWorkspace();
+ 
+-            if (reuseRequest.conflictingWorkspaceOwnerIssueId) {
+-              const ownerIssueId = reuseRequest.conflictingWorkspaceOwnerIssueId;
++            const conflictNotice = resolveExecutionWorkspaceConflictNotice({
++              conflictingWorkspaceOwnerIssueId: reuseRequest.conflictingWorkspaceOwnerIssueId,
++              executionWorkspacePreference: issue.executionWorkspacePreference,
++              requestedExecutionWorkspaceId: reuseRequest.requestedExecutionWorkspaceId,
++              executionWorkspaceId: issue.executionWorkspaceId,
++            });
++            if (conflictNotice.shouldNotify && conflictNotice.ownerIssueId) {
++              const ownerIssueId = conflictNotice.ownerIssueId;
+               const owner = await tx
+                 .select({ identifier: issues.identifier })
+                 .from(issues)
+@@ -3759,20 +3766,21 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
+                 )
+                 .then((rows) => rows[0] ?? null);
+               const ownerLabel = owner?.identifier ?? ownerIssueId;
+-              const marker = `workspace_conflict:${issue.executionWorkspaceId ?? "none"}`;
++              const marker = conflictNotice.marker;
++              const markerPattern = `%${marker.replace(/([%_\\])/g, "\\$1")}%`;
+               const alreadyNotified = await tx
+-                .select({ body: issueComments.body })
++                .select({ id: issueComments.id })
+                 .from(issueComments)
+                 .where(
+                   and(
+                     eq(issueComments.companyId, issue.companyId),
+                     eq(issueComments.issueId, issue.id),
+                     isNull(issueComments.deletedAt),
++                    sql`${issueComments.body} like ${markerPattern} escape '\\'`,
+                   ),
+                 )
+-                .then((rows) =>
+-                  rows.some((row) => (row.body ?? "").includes(marker)),
+-                );
++                .limit(1)
++                .then((rows) => rows.length > 0);
+               if (!alreadyNotified) {
+                 const now = new Date();
+                 await insertIssueComment(tx, {
+@@ -3783,7 +3791,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
+                     "",
+                     `- That workspace is an isolated per-issue worktree owned by ${ownerLabel}.`,
+                     "- Isolation is per issue, not per tree: two issues sharing one worktree is the failure this refuses.",
+-                    "- This run realizes a workspace of its own instead.",
++                    "- That workspace was not reused for this run.",
+                     "",
+                     `<!-- ${marker} -->`,
+                   ].join("\n"),
+diff --git a/server/src/services/heartbeat/workspace-preparation.ts b/server/src/services/heartbeat/workspace-preparation.ts
+index 82257867..f7fab41c 100644
+--- a/server/src/services/heartbeat/workspace-preparation.ts
++++ b/server/src/services/heartbeat/workspace-preparation.ts
+@@ -54,6 +54,7 @@ import { isRuntimeOwnedGitBranch } from "../execution-workspace-branch-ownership
+ import {
+   issueExecutionWorkspaceModeForPersistedWorkspace,
+   resolveEffectiveWorkspaceStrategyType,
++  resolveExecutionWorkspaceReuseWorkspaceId,
+   resolveExecutionWorkspaceStrategyConfig,
+ } from "../execution-workspace-policy.js";
+ import { evaluateExecutionAllowlist } from "../execution-allowlist.js";
+@@ -396,7 +397,11 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
+   const pluginPrepared = isDotRun ? null : await preparePluginWorkspace(db, input.services.workspaceWorkers, {
+     companyId: agent.companyId, projectId: resolvedWorkspace.projectId, projectWorkspaceId: resolvedWorkspace.workspaceId,
+     issueId, runId: run.id, agentId: agent.id, responsibleUserId,
+-    existingWorkspaceId: reusableExistingExecutionWorkspace?.id ?? issueRef?.executionWorkspaceId ?? null,
++    existingWorkspaceId: resolveExecutionWorkspaceReuseWorkspaceId({
++      reusableWorkspaceId: reusableExistingExecutionWorkspace?.id ?? null,
++      requestedWorkspaceId: issueRef?.executionWorkspaceId ?? null,
++      conflictingWorkspaceOwnerIssueId: workspaceReuseRequest.conflictingWorkspaceOwnerIssueId,
++    }),
+     mode: requestedExecutionWorkspaceMode,
+     strategy: resolveEffectiveWorkspaceStrategyType(requestedExecutionWorkspaceMode, mergedConfig),
+     branchMode: typeof parseObject(mergedConfig.workspaceStrategy).existingBranch === "string" ? "existing" : "create",
+-- 
+2.47.3
+
+
+From c07ee08c54c710a3a02002f626818e4edd8844ce Mon Sep 17 00:00:00 2001
+From: jjude80 <18168364+jjude80@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 02:10:31 -0400
+Subject: [PATCH 5/5] fix(workspace): base a child task on its parent's
+ integration branch
+
+A child task inherits its parent's workspace settings but gets its own
+worktree. The inherited strategy had no base ref, so the new worktree was
+cut from the project default (origin/main). When the parent's work lives on
+an integration branch, the child's tree cannot contain the files the task
+is about, and the child waits on a baseline that can never go red.
+
+Carry the parent workspace's branch to the child as workspaceStrategy.baseRef,
+and keep a pinned existingBranch as the base ref when the pin has to be
+dropped because the workspace belongs to another issue.
+---
+ .../execution-workspace-policy.test.ts        | 57 +++++++++++++++--
+ .../heartbeat-workspace-session.test.ts       |  4 +-
+ server/src/__tests__/issues-service.test.ts   | 61 +++++++++++++++++++
+ .../services/execution-workspace-policy.ts    | 49 ++++++++++++---
+ server/src/services/issues.ts                 |  4 ++
+ 5 files changed, 157 insertions(+), 18 deletions(-)
+
+diff --git a/server/src/__tests__/execution-workspace-policy.test.ts b/server/src/__tests__/execution-workspace-policy.test.ts
+index e19a86df..12cb55fc 100644
+--- a/server/src/__tests__/execution-workspace-policy.test.ts
++++ b/server/src/__tests__/execution-workspace-policy.test.ts
+@@ -829,7 +829,7 @@ describe("execution workspace inheritance", () => {
+     });
+   });
+ 
+-  it("drops a pinned exact branch from an inherited strategy, because a branch is shared", () => {
++  it("retargets a pinned exact branch as the child's base ref instead of dropping the target", () => {
+     expect(
+       buildInheritedExecutionWorkspaceSettings({
+         sourceSettings: {
+@@ -841,10 +841,55 @@ describe("execution workspace inheritance", () => {
+       }),
+     ).toEqual({
+       mode: "isolated_workspace",
+-      workspaceStrategy: { type: "git_worktree", branchTemplate: "{{issue.identifier}}-{{slug}}" },
++      workspaceStrategy: { type: "git_worktree", baseRef: "holder-branch", branchTemplate: "{{issue.identifier}}-{{slug}}" },
+     });
+   });
+ 
++  it("bases a child on the parent workspace's integration branch, not the project default", () => {
++    expect(
++      buildInheritedExecutionWorkspaceSettings({
++        sourceSettings: { mode: "isolated_workspace" },
++        sourceWorkspaceMode: "isolated_workspace",
++        sourceWorkspaceStrategyType: "git_worktree",
++        sourceWorkspaceBranchName: "NEXA-415-integration",
++        bindSourceWorkspace: false,
++      }),
++    ).toEqual({
++      mode: "isolated_workspace",
++      workspaceStrategy: { type: "git_worktree", baseRef: "NEXA-415-integration" },
++    });
++  });
++
++  it("prefers the parent workspace's integration branch over an older inherited base ref", () => {
++    expect(
++      buildInheritedExecutionWorkspaceSettings({
++        sourceSettings: {
++          mode: "isolated_workspace",
++          workspaceStrategy: { type: "git_worktree", baseRef: "origin/main", existingBranch: "older-target" },
++        },
++        sourceWorkspaceMode: "isolated_workspace",
++        sourceWorkspaceStrategyType: "git_worktree",
++        sourceWorkspaceBranchName: "NEXA-415-integration",
++        bindSourceWorkspace: false,
++      }),
++    ).toEqual({
++      mode: "isolated_workspace",
++      workspaceStrategy: { type: "git_worktree", baseRef: "NEXA-415-integration" },
++    });
++  });
++
++  it("does not invent a base ref from a non-git-workspace source", () => {
++    expect(
++      buildInheritedExecutionWorkspaceSettings({
++        sourceSettings: { mode: "isolated_workspace" },
++        sourceWorkspaceMode: "isolated_workspace",
++        sourceWorkspaceStrategyType: "project_primary",
++        sourceWorkspaceBranchName: "unrelated-branch",
++        bindSourceWorkspace: false,
++      }),
++    ).toEqual({ mode: "isolated_workspace" });
++  });
++
+   it("keeps the pinned branch when the workspace itself is inherited", () => {
+     expect(
+       buildInheritedExecutionWorkspaceSettings({
+@@ -871,7 +916,7 @@ describe("execution workspace inheritance", () => {
+     ).toEqual({ mode: "shared_workspace" });
+   });
+ 
+-  it("drops a pinned branch from the strategy when another issue owns the workspace", () => {
++  it("retargets a pinned branch as the base ref when another issue owns the workspace", () => {
+     expect(
+       resolveExecutionWorkspaceStrategyConfig({
+         config: {
+@@ -882,7 +927,7 @@ describe("execution workspace inheritance", () => {
+       }),
+     ).toEqual({
+       mode: "isolated_workspace",
+-      workspaceStrategy: { type: "git_worktree" },
++      workspaceStrategy: { type: "git_worktree", baseRef: "holder-branch" },
+     });
+   });
+ 
+@@ -899,13 +944,13 @@ describe("execution workspace inheritance", () => {
+     });
+   });
+ 
+-  it("drops the whole strategy when the pinned branch was all it held", () => {
++  it("keeps the target branch as a base ref when the pinned branch was all the strategy held", () => {
+     expect(
+       resolveExecutionWorkspaceStrategyConfig({
+         config: { workspaceStrategy: { existingBranch: "holder-branch" } },
+         conflictingWorkspaceOwnerIssueId: "issue-parent",
+       }),
+-    ).toEqual({});
++    ).toEqual({ workspaceStrategy: { baseRef: "holder-branch" } });
+   });
+ 
+   it("keeps the requested workspace when no other issue owns it", () => {
+diff --git a/server/src/__tests__/heartbeat-workspace-session.test.ts b/server/src/__tests__/heartbeat-workspace-session.test.ts
+index 89479b46..4af5684c 100644
+--- a/server/src/__tests__/heartbeat-workspace-session.test.ts
++++ b/server/src/__tests__/heartbeat-workspace-session.test.ts
+@@ -1933,7 +1933,7 @@ describe("effective run execution workspace config freshness", () => {
+     });
+   });
+ 
+-  it("drops the inherited branch so a refused child cannot realize into the holder's checkout", () => {
++  it("drops the inherited branch pin and keeps it as the refused child's base ref", () => {
+     const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
+       issueExecutionWorkspaceId: "workspace-parent",
+       issueExecutionWorkspacePreference: "reuse_existing",
+@@ -1951,7 +1951,7 @@ describe("effective run execution workspace config freshness", () => {
+       conflictingWorkspaceOwnerIssueId: reuseRequest.conflictingWorkspaceOwnerIssueId,
+     })).toEqual({
+       mode: "isolated_workspace",
+-      workspaceStrategy: { type: "git_worktree" },
++      workspaceStrategy: { type: "git_worktree", baseRef: "holder-branch" },
+     });
+   });
+ 
+diff --git a/server/src/__tests__/issues-service.test.ts b/server/src/__tests__/issues-service.test.ts
+index 60c06846..74481351 100644
+--- a/server/src/__tests__/issues-service.test.ts
++++ b/server/src/__tests__/issues-service.test.ts
+@@ -3129,6 +3129,67 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
+     });
+   });
+ 
++  it("bases a child's own workspace on the parent workspace's integration branch", async () => {
++    const companyId = randomUUID();
++    const projectId = randomUUID();
++    const parentIssueId = randomUUID();
++    const projectWorkspaceId = randomUUID();
++    const executionWorkspaceId = randomUUID();
++
++    await seedIssueCompany(db, companyId);
++    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
++
++    await seedWorkspaceProject(db, companyId, projectId);
++
++    await db.insert(projectWorkspaces).values({
++      id: projectWorkspaceId,
++      companyId,
++      projectId,
++      name: "Primary workspace",
++      isPrimary: true,
++      sharedWorkspaceKey: "workspace-key",
++    });
++
++    await db.insert(executionWorkspaces).values({
++      id: executionWorkspaceId,
++      companyId,
++      projectId,
++      projectWorkspaceId,
++      mode: "isolated_workspace",
++      strategyType: "git_worktree",
++      name: "Parent integration worktree",
++      branchName: "NEXA-415-integration",
++      status: "active",
++      providerType: "git_worktree",
++      providerRef: `/tmp/${executionWorkspaceId}`,
++    });
++
++    await db.insert(issues).values({
++      id: parentIssueId,
++      companyId,
++      projectId,
++      projectWorkspaceId,
++      title: "Parent issue",
++      status: "in_progress",
++      priority: "medium",
++      executionWorkspaceId,
++      executionWorkspacePreference: "reuse_existing",
++      executionWorkspaceSettings: { mode: "isolated_workspace" },
++    });
++
++    const child = await svc.create(companyId, {
++      parentId: parentIssueId,
++      projectId,
++      title: "Child issue",
++    });
++
++    expect(child.executionWorkspaceId).toBeNull();
++    expect(child.executionWorkspaceSettings).toEqual({
++      mode: "isolated_workspace",
++      workspaceStrategy: { type: "git_worktree", baseRef: "NEXA-415-integration" },
++    });
++  });
++
+   it("inherits a shared workspace linkage, which is shared by design", async () => {
+     const companyId = randomUUID();
+     const projectId = randomUUID();
+diff --git a/server/src/services/execution-workspace-policy.ts b/server/src/services/execution-workspace-policy.ts
+index ee44a649..e1fba5d1 100644
+--- a/server/src/services/execution-workspace-policy.ts
++++ b/server/src/services/execution-workspace-policy.ts
+@@ -407,9 +407,28 @@ export function resolveExecutionWorkspaceInheritanceDecision(input: {
+   };
+ }
+ 
++function retargetPinnedBranchAsBaseRef(
++  strategy: Record<string, unknown>,
++  fallbackBaseRef: string | null,
++): Record<string, unknown> {
++  const nextStrategy = { ...strategy };
++  const pinnedBranch =
++    typeof nextStrategy.existingBranch === "string"
++      ? nextStrategy.existingBranch.trim()
++      : "";
++  delete nextStrategy.existingBranch;
++  if (typeof nextStrategy.baseRef !== "string" || nextStrategy.baseRef.trim().length === 0) {
++    const baseRef = fallbackBaseRef ?? (pinnedBranch.length > 0 ? pinnedBranch : null);
++    if (baseRef) nextStrategy.baseRef = baseRef;
++  }
++  return nextStrategy;
++}
++
+ export function buildInheritedExecutionWorkspaceSettings(input: {
+   sourceSettings: Record<string, unknown> | null | undefined;
+   sourceWorkspaceMode: string | null | undefined;
++  sourceWorkspaceStrategyType?: string | null;
++  sourceWorkspaceBranchName?: string | null;
+   bindSourceWorkspace: boolean;
+ }): Record<string, unknown> {
+   const settings: Record<string, unknown> = { ...(input.sourceSettings ?? {}) };
+@@ -417,16 +436,27 @@ export function buildInheritedExecutionWorkspaceSettings(input: {
+     input.sourceWorkspaceMode,
+   );
+   if (!input.bindSourceWorkspace) {
+-    const strategy = parseObject(settings.workspaceStrategy);
+-    if (typeof strategy.existingBranch === "string") {
+-      const nextStrategy = { ...strategy };
+-      delete nextStrategy.existingBranch;
+-      if (Object.keys(nextStrategy).length > 0) {
+-        settings.workspaceStrategy = nextStrategy;
+-      } else {
+-        delete settings.workspaceStrategy;
++    const sourceStrategy = parseObject(settings.workspaceStrategy);
++    const sourceWorkspaceBranchName =
++      typeof input.sourceWorkspaceBranchName === "string"
++        ? input.sourceWorkspaceBranchName.trim()
++        : "";
++    const parentIntegrationBranch =
++      input.sourceWorkspaceStrategyType === "git_worktree" && sourceWorkspaceBranchName.length > 0
++        ? sourceWorkspaceBranchName
++        : null;
++    const nextStrategy = retargetPinnedBranchAsBaseRef(sourceStrategy, parentIntegrationBranch);
++    if (parentIntegrationBranch) {
++      nextStrategy.baseRef = parentIntegrationBranch;
++      if (nextStrategy.type === undefined) {
++        nextStrategy.type = "git_worktree";
+       }
+     }
++    if (Object.keys(nextStrategy).length > 0) {
++      settings.workspaceStrategy = nextStrategy;
++    } else {
++      delete settings.workspaceStrategy;
++    }
+   }
+   return settings;
+ }
+@@ -439,8 +469,7 @@ export function resolveExecutionWorkspaceStrategyConfig(input: {
+   if (!input.conflictingWorkspaceOwnerIssueId) return config;
+   const strategy = parseObject(config.workspaceStrategy);
+   if (typeof strategy.existingBranch !== "string") return config;
+-  const nextStrategy = { ...strategy };
+-  delete nextStrategy.existingBranch;
++  const nextStrategy = retargetPinnedBranchAsBaseRef(strategy, null);
+   if (Object.keys(nextStrategy).length > 0) {
+     config.workspaceStrategy = nextStrategy;
+   } else {
+diff --git a/server/src/services/issues.ts b/server/src/services/issues.ts
+index 5d4d7787..be5d3980 100644
+--- a/server/src/services/issues.ts
++++ b/server/src/services/issues.ts
+@@ -10123,6 +10123,8 @@ export function issueService(db: Db) {
+               .select({
+                 id: executionWorkspaces.id,
+                 mode: executionWorkspaces.mode,
++                strategyType: executionWorkspaces.strategyType,
++                branchName: executionWorkspaces.branchName,
+               })
+               .from(executionWorkspaces)
+               .where(
+@@ -10142,6 +10144,8 @@ export function issueService(db: Db) {
+                   sourceSettings: workspaceSource.executionWorkspaceSettings as
+                     Record<string, unknown> | null | undefined,
+                   sourceWorkspaceMode: sourceWorkspace.mode,
++                  sourceWorkspaceStrategyType: sourceWorkspace.strategyType,
++                  sourceWorkspaceBranchName: sourceWorkspace.branchName,
+                   bindSourceWorkspace: inheritance.bindSourceWorkspace,
+                 });
+               }
+-- 
+2.47.3
+
