@@ -1,0 +1,773 @@
+From 3330eb1a09e77daa896d4182a4a7ca8ae430d56a Mon Sep 17 00:00:00 2001
+From: jjude80 <18168364+jjude80@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 00:04:49 +0000
+Subject: [PATCH 1/4] fix(access): keep role-derived grants when a member's
+ grants are replaced
+
+Role-derived permissions are materialized as ordinary
+principal_permission_grants rows, so any writer that replaces a principal's
+grants must re-apply the role defaults or it silently strips the permissions
+the membership role implies.
+
+- setMemberPermissions and updateMemberAndPermissions now merge the role
+  defaults back in instead of trusting every caller to pass the full set.
+  Explicit grants still win on a key collision; agent principals are untouched
+  because they have no role defaults.
+- updateMember seeds the new role's defaults when membershipRole changes, so a
+  promotion actually confers the role. Joining as an owner already did this;
+  promotion did not.
+- Agent principals keep exact set semantics (setMemberPermissions with
+  ["tasks:assign"] still yields exactly that).
+
+Verification: 28/28 in access-service.test.ts and
+access-routes-permissions-upgrade.test.ts. With only the service changes
+reverted, the 7 new/updated assertions fail. tsc --noEmit clean for the
+server package.
+
+Co-Authored-By: Paperclip <noreply@paperclip.ing>
+---
+ .../access-routes-permissions-upgrade.test.ts | 102 ++++++++++++++-
+ server/src/__tests__/access-service.test.ts   | 122 ++++++++++++++++++
+ server/src/services/access.ts                 |  50 ++++++-
+ server/src/services/company-member-roles.ts   |  33 +++++
+ 4 files changed, 299 insertions(+), 8 deletions(-)
+
+diff --git a/server/src/__tests__/access-routes-permissions-upgrade.test.ts b/server/src/__tests__/access-routes-permissions-upgrade.test.ts
+index 799701e1..f9035889 100644
+--- a/server/src/__tests__/access-routes-permissions-upgrade.test.ts
++++ b/server/src/__tests__/access-routes-permissions-upgrade.test.ts
+@@ -19,6 +19,7 @@ import {
+   getEmbeddedPostgresTestSupport,
+   startEmbeddedPostgresTestDatabase,
+ } from "./helpers/embedded-postgres.js";
++import { grantsForHumanRole } from "../services/company-member-roles.js";
+ 
+ vi.hoisted(() => {
+   process.env.PAPERCLIP_HOME = "/tmp/paperclip-test-home";
+@@ -133,6 +134,98 @@ describeEmbeddedPostgres("access routes permissions upgrade compatibility", () =
+     expect(unchanged.membershipRole).toBe("owner");
+   }, 10_000);
+ 
++  it("keeps role-derived grants when the role-and-grants route replaces a member's grants", async () => {
++    const { company, owner } = await createCompanyWithOwner(db);
++    const operator = await db
++      .insert(companyMemberships)
++      .values({
++        companyId: company.id,
++        principalType: "user",
++        principalId: `operator-${randomUUID()}`,
++        status: "active",
++        membershipRole: "operator",
++      })
++      .returning()
++      .then((rows) => rows[0]!);
++    for (const grant of grantsForHumanRole("operator")) {
++      await db.insert(principalPermissionGrants).values({
++        companyId: company.id,
++        principalType: "user",
++        principalId: operator.principalId,
++        permissionKey: grant.permissionKey,
++        scope: grant.scope,
++        grantedByUserId: owner.principalId,
++      });
++    }
++
++    // An owner editing an operator's grants is the reachable case: the target rank
++    // is below the actor rank, so assertCanManageCompanyMember allows it.
++    const res = await request(await createApp(db, company.id, owner.principalId))
++      .patch(`/api/companies/${company.id}/members/${operator.id}/role-and-grants`)
++      .send({ status: "active", grants: [] });
++    expect(res.status, JSON.stringify(res.body)).toBe(200);
++    expect(res.body.membershipRole).toBe("operator");
++
++    const grants = await db
++      .select({ permissionKey: principalPermissionGrants.permissionKey })
++      .from(principalPermissionGrants)
++      .where(
++        and(
++          eq(principalPermissionGrants.companyId, company.id),
++          eq(principalPermissionGrants.principalId, operator.principalId),
++        ),
++      )
++      .then((rows) => rows.map((row) => row.permissionKey));
++    // The membership role still says operator, so its permissions must survive.
++    for (const roleGrant of grantsForHumanRole("operator")) {
++      expect(grants).toContain(roleGrant.permissionKey);
++    }
++  });
++
++  it("keeps role-derived grants when the permissions-only route replaces a member's grants", async () => {
++    const { company, owner } = await createCompanyWithOwner(db);
++    const admin = await db
++      .insert(companyMemberships)
++      .values({
++        companyId: company.id,
++        principalType: "user",
++        principalId: `admin-${randomUUID()}`,
++        status: "active",
++        membershipRole: "admin",
++      })
++      .returning()
++      .then((rows) => rows[0]!);
++    for (const grant of grantsForHumanRole("admin")) {
++      await db.insert(principalPermissionGrants).values({
++        companyId: company.id,
++        principalType: "user",
++        principalId: admin.principalId,
++        permissionKey: grant.permissionKey,
++        scope: grant.scope,
++        grantedByUserId: owner.principalId,
++      });
++    }
++
++    const res = await request(await createApp(db, company.id, owner.principalId))
++      .patch(`/api/companies/${company.id}/members/${admin.id}/permissions`)
++      .send({ grants: [] });
++    expect(res.status, JSON.stringify(res.body)).toBe(200);
++
++    const grants = await db
++      .select({ permissionKey: principalPermissionGrants.permissionKey })
++      .from(principalPermissionGrants)
++      .where(
++        and(
++          eq(principalPermissionGrants.companyId, company.id),
++          eq(principalPermissionGrants.principalId, admin.principalId),
++        ),
++      )
++      .then((rows) => rows.map((row) => row.permissionKey));
++    for (const roleGrant of grantsForHumanRole("admin")) {
++      expect(grants).toContain(roleGrant.permissionKey);
++    }
++  });
++
+   it("keeps custom grants when the role-only member route changes a member role", async () => {
+     const { company, owner } = await createCompanyWithOwner(db);
+     const member = await db
+@@ -173,12 +266,17 @@ describeEmbeddedPostgres("access routes permissions upgrade compatibility", () =
+           eq(principalPermissionGrants.principalId, member.principalId),
+         ),
+       );
+-    expect(grants).toHaveLength(1);
+-    expect(grants[0]).toMatchObject({
++    const customGrant = grants.find((grant) => grant.permissionKey === "tasks:assign_scope");
++    expect(customGrant).toMatchObject({
+       permissionKey: "tasks:assign_scope",
+       scope: customScope,
+       grantedByUserId: owner.principalId,
+     });
++    // The new role's defaults are materialized alongside the custom grant, so a
++    // role change is what confers the role's permissions.
++    for (const roleGrant of grantsForHumanRole("operator")) {
++      expect(grants.map((grant) => grant.permissionKey)).toContain(roleGrant.permissionKey);
++    }
+   });
+ 
+   it("sweeps personal connection access when the member route suspends a user", async () => {
+diff --git a/server/src/__tests__/access-service.test.ts b/server/src/__tests__/access-service.test.ts
+index 2d81dba8..df12ee90 100644
+--- a/server/src/__tests__/access-service.test.ts
++++ b/server/src/__tests__/access-service.test.ts
+@@ -56,6 +56,37 @@ async function createCompanyWithOwner(db: ReturnType<typeof createDb>) {
+   return { company, owner };
+ }
+ 
++async function createMember(
++  db: ReturnType<typeof createDb>,
++  companyId: string,
++  membershipRole: "owner" | "admin" | "operator" | "viewer",
++) {
++  return db
++    .insert(companyMemberships)
++    .values({
++      companyId,
++      principalType: "user",
++      principalId: `member-${randomUUID()}`,
++      status: "active",
++      membershipRole,
++    })
++    .returning()
++    .then((rows) => rows[0]!);
++}
++
++async function grantKeysFor(db: ReturnType<typeof createDb>, companyId: string, principalId: string) {
++  return db
++    .select({ permissionKey: principalPermissionGrants.permissionKey })
++    .from(principalPermissionGrants)
++    .where(
++      and(
++        eq(principalPermissionGrants.companyId, companyId),
++        eq(principalPermissionGrants.principalId, principalId),
++      ),
++    )
++    .then((rows) => rows.map((row) => row.permissionKey));
++}
++
+ describeEmbeddedPostgres("access service", () => {
+   let db!: ReturnType<typeof createDb>;
+   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+@@ -125,6 +156,97 @@ describeEmbeddedPostgres("access service", () => {
+     expect(unchanged.status).toBe("active");
+   });
+ 
++  it("keeps role-derived grants when a member permissions PATCH omits them", async () => {
++    const { company, owner } = await createCompanyWithOwner(db);
++    const access = accessService(db);
++    const member = await createMember(db, company.id, "owner");
++
++    await access.setMemberPermissions(company.id, member.id, [], owner.principalId);
++
++    const grants = await grantKeysFor(db, company.id, member.principalId);
++    expect(grants.sort()).toEqual(
++      grantsForHumanRole("owner").map((grant) => grant.permissionKey).sort(),
++    );
++    expect(grants).toContain("users:manage_permissions");
++  });
++
++  it("keeps role-derived grants and still adds explicit ones on a role-and-grants PATCH", async () => {
++    const { company, owner } = await createCompanyWithOwner(db);
++    const access = accessService(db);
++    const member = await createMember(db, company.id, "operator");
++
++    await access.updateMemberAndPermissions(
++      company.id,
++      member.id,
++      { grants: [{ permissionKey: "pipelines:write" }] },
++      owner.principalId,
++    );
++
++    const grants = await grantKeysFor(db, company.id, member.principalId);
++    for (const defaultGrant of grantsForHumanRole("operator")) {
++      expect(grants).toContain(defaultGrant.permissionKey);
++    }
++    expect(grants).toContain("pipelines:write");
++  });
++
++  it("applies the next role's defaults when a grants PATCH changes the role", async () => {
++    const { company, owner } = await createCompanyWithOwner(db);
++    const access = accessService(db);
++    const member = await createMember(db, company.id, "viewer");
++
++    await access.updateMemberAndPermissions(
++      company.id,
++      member.id,
++      { membershipRole: "owner", grants: [] },
++      owner.principalId,
++    );
++
++    const grants = await grantKeysFor(db, company.id, member.principalId);
++    expect(grants).toContain("users:manage_permissions");
++    for (const defaultGrant of grantsForHumanRole("owner")) {
++      expect(grants).toContain(defaultGrant.permissionKey);
++    }
++  });
++
++  it("confers the new role's permissions on promotion through updateMember", async () => {
++    const { company } = await createCompanyWithOwner(db);
++    const access = accessService(db);
++    const member = await createMember(db, company.id, "operator");
++
++    await access.updateMember(company.id, member.id, { membershipRole: "owner" });
++
++    const grants = await grantKeysFor(db, company.id, member.principalId);
++    expect(grants).toContain("users:manage_permissions");
++    for (const defaultGrant of grantsForHumanRole("owner")) {
++      expect(grants).toContain(defaultGrant.permissionKey);
++    }
++  });
++
++  it("does not rewrite agent principal grants, which have no role defaults", async () => {
++    const { company } = await createCompanyWithOwner(db);
++    const access = accessService(db);
++    const agent = await db
++      .insert(companyMemberships)
++      .values({
++        companyId: company.id,
++        principalType: "agent",
++        principalId: `agent-${randomUUID()}`,
++        status: "active",
++        membershipRole: "member",
++      })
++      .returning()
++      .then((rows) => rows[0]!);
++
++    await access.setMemberPermissions(
++      company.id,
++      agent.id,
++      [{ permissionKey: "tasks:assign" }],
++      null,
++    );
++
++    expect(await grantKeysFor(db, company.id, agent.principalId)).toEqual(["tasks:assign"]);
++  });
++
+   it("archives members, clears grants, and reassigns open issues without deleting history", async () => {
+     const { company, owner } = await createCompanyWithOwner(db);
+     const member = await db
+diff --git a/server/src/services/access.ts b/server/src/services/access.ts
+index 7cecb4cd..e737222d 100644
+--- a/server/src/services/access.ts
++++ b/server/src/services/access.ts
+@@ -18,7 +18,15 @@ import type { PermissionKey, PrincipalType } from "@paperclipai/shared";
+ import { conflict } from "../errors.js";
+ import { assertAssignableAgent } from "./agent-assignability.js";
+ import { authorizationService, type AuthorizationActor, type AuthorizationResource } from "./authorization.js";
+-import { ensureHumanRoleDefaultGrants } from "./principal-access-compatibility.js";
++import {
++  grantsForHumanRole,
++  mergeRoleDefaultGrants,
++  normalizeHumanRole,
++} from "./company-member-roles.js";
++import {
++  ensureHumanRoleDefaultGrants,
++  insertMissingPrincipalGrants,
++} from "./principal-access-compatibility.js";
+ 
+ type MembershipRow = typeof companyMemberships.$inferSelect;
+ type GrantInput = {
+@@ -451,6 +459,12 @@ export function accessService(db: Db) {
+     const member = await getMemberById(companyId, memberId);
+     if (!member) return null;
+ 
++    const effectiveGrants = mergeRoleDefaultGrants({
++      principalType: member.principalType,
++      membershipRole: member.membershipRole,
++      grants,
++    });
++
+     await db.transaction(async (tx) => {
+       await tx
+         .delete(principalPermissionGrants)
+@@ -461,9 +475,9 @@ export function accessService(db: Db) {
+             eq(principalPermissionGrants.principalId, member.principalId),
+           ),
+         );
+-      if (grants.length > 0) {
++      if (effectiveGrants.length > 0) {
+         await tx.insert(principalPermissionGrants).values(
+-          grants.map((grant) => ({
++          effectiveGrants.map((grant) => ({
+             companyId,
+             principalType: member.principalType,
+             principalId: member.principalId,
+@@ -560,9 +574,15 @@ export function accessService(db: Db) {
+             eq(principalPermissionGrants.principalId, existing.principalId),
+           ),
+         );
+-      if (data.grants.length > 0) {
++      const effectiveGrants = mergeRoleDefaultGrants({
++        principalType: existing.principalType,
++        membershipRole: nextMembershipRole,
++        grants: data.grants,
++      });
++
++      if (effectiveGrants.length > 0) {
+         await tx.insert(principalPermissionGrants).values(
+-          data.grants.map((grant) => ({
++          effectiveGrants.map((grant) => ({
+             companyId,
+             principalType: existing.principalType,
+             principalId: existing.principalId,
+@@ -1112,7 +1132,7 @@ export function accessService(db: Db) {
+         await sweepMemberConnectionAccess(tx, companyId, existing.principalId, now);
+       }
+ 
+-      return tx
++      const updated = await tx
+         .update(companyMemberships)
+         .set({
+           membershipRole: nextMembershipRole,
+@@ -1122,6 +1142,24 @@ export function accessService(db: Db) {
+         .where(eq(companyMemberships.id, existing.id))
+         .returning()
+         .then((rows) => rows[0] ?? existing);
++
++      // A role change must confer the new role's permissions. Grant rows are the only
++      // source of non-`tools:` permissions, so promoting a member without seeding the
++      // new role's defaults leaves them unable to exercise the role they were given.
++      if (
++        existing.principalType === "user"
++        && nextMembershipRole !== existing.membershipRole
++      ) {
++        await insertMissingPrincipalGrants(tx as unknown as Db, {
++          companyId,
++          principalType: "user",
++          principalId: existing.principalId,
++          grants: grantsForHumanRole(normalizeHumanRole(nextMembershipRole, "operator")),
++          grantedByUserId: null,
++        });
++      }
++
++      return updated;
+     });
+   }
+ 
+diff --git a/server/src/services/company-member-roles.ts b/server/src/services/company-member-roles.ts
+index d67ddbc9..028207c2 100644
+--- a/server/src/services/company-member-roles.ts
++++ b/server/src/services/company-member-roles.ts
+@@ -76,6 +76,39 @@ export function grantsForHumanRole(
+   }
+ }
+ 
++type RoleGrant = {
++  permissionKey: (typeof PERMISSION_KEYS)[number];
++  scope?: Record<string, unknown> | null;
++};
++
++/**
++ * Role-derived permissions are materialized as ordinary grant rows, so any writer
++ * that replaces a principal's grants must re-apply the role defaults or it will
++ * silently strip the permissions the membership role implies. Callers may only
++ * add to the role defaults, never remove them.
++ *
++ * Agent principals have no role defaults: their grants are set explicitly.
++ */
++export function mergeRoleDefaultGrants<T extends RoleGrant>(input: {
++  principalType: string;
++  membershipRole: string | null | undefined;
++  grants: T[];
++}): T[] {
++  if (input.principalType !== "user") return input.grants;
++
++  const defaults = grantsForHumanRole(normalizeHumanRole(input.membershipRole, "operator"));
++  if (defaults.length === 0) return input.grants;
++
++  const merged = [...input.grants];
++  const seen = new Set(input.grants.map((grant) => grant.permissionKey));
++  for (const roleGrant of defaults) {
++    if (seen.has(roleGrant.permissionKey)) continue;
++    seen.add(roleGrant.permissionKey);
++    merged.push({ permissionKey: roleGrant.permissionKey, scope: roleGrant.scope } as T);
++  }
++  return merged;
++}
++
+ export function resolveHumanInviteRole(
+   defaultsPayload: Record<string, unknown> | null | undefined
+ ): HumanCompanyMembershipRole {
+-- 
+2.47.3
+
+
+From cd10736bbfd9ad90802891e0facacec652027a43 Mon Sep 17 00:00:00 2001
+From: jjude80 <18168364+jjude80@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 00:13:13 +0000
+Subject: [PATCH 2/4] test(access): reproduce owner grants surviving demotion
+ to operator
+
+3330eb1 makes role-change handling seed the new role's defaults but it
+never prunes the old role's. Because role defaults are materialized as
+ordinary principal_permission_grants rows, a demoted member keeps them.
+
+Reproducer for the review finding on NEXA-207. Promote operator -> owner,
+then demote owner -> operator, and the member still holds the two
+owner-only permissions: users:manage_permissions and joins:approve.
+
+users:manage_permissions is the sharper one: a demoted operator can use it
+to re-grant themselves the permissions the demotion just removed.
+
+The 28 pre-existing assertions in access-service.test.ts and
+access-routes-permissions-upgrade.test.ts all still pass.
+
+Co-Authored-By: Paperclip <noreply@paperclip.ing>
+---
+ server/src/__tests__/access-service.test.ts | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/server/src/__tests__/access-service.test.ts b/server/src/__tests__/access-service.test.ts
+index df12ee90..6cef4e32 100644
+--- a/server/src/__tests__/access-service.test.ts
++++ b/server/src/__tests__/access-service.test.ts
+@@ -222,6 +222,23 @@ describeEmbeddedPostgres("access service", () => {
+     }
+   });
+ 
++  it("revokes the previous role's permissions on demotion through updateMember", async () => {
++    const { company } = await createCompanyWithOwner(db);
++    const access = accessService(db);
++    const member = await createMember(db, company.id, "operator");
++
++    await access.updateMember(company.id, member.id, { membershipRole: "owner" });
++    expect(await grantKeysFor(db, company.id, member.principalId)).toContain("users:manage_permissions");
++
++    await access.updateMember(company.id, member.id, { membershipRole: "operator" });
++
++    const grants = await grantKeysFor(db, company.id, member.principalId);
++    const operatorDefaults = new Set(grantsForHumanRole("operator").map((grant) => grant.permissionKey));
++    for (const permissionKey of grants) {
++      expect(operatorDefaults.has(permissionKey)).toBe(true);
++    }
++  });
++
+   it("does not rewrite agent principal grants, which have no role defaults", async () => {
+     const { company } = await createCompanyWithOwner(db);
+     const access = accessService(db);
+-- 
+2.47.3
+
+
+From 0687b5c878c1bfac8adbb0af5af1d3dbb55b275d Mon Sep 17 00:00:00 2001
+From: jjude80 <18168364+jjude80@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 00:19:36 +0000
+Subject: [PATCH 3/4] fix(access): revoke the previous role's grants on
+ demotion
+
+3330eb1 made a role change seed the new role's defaults but never withdrew
+the old role's. Because role defaults are materialized as ordinary
+principal_permission_grants rows, a demoted member kept them -- including
+users:manage_permissions and joins:approve, which operator does not imply.
+
+That is a self-escalation path, not just stale state: the demoted operator
+can call PATCH /members/:id/permissions and re-grant themselves exactly what
+the demotion removed.
+
+pruneSupersededRoleDefaultGrants withdraws only rows with a null
+granted_by_user_id. That column is the provenance signal available today: a
+grant a human made explicitly carries that human's id and must survive a
+demotion, while a role default has none. The prune and the seed run in the
+same transaction as the membership update, so a failure cannot leave the
+role changed and the grants behind.
+
+This is the asymmetry flagged in review on NEXA-203: updateMemberAndPermissions
+already pruned on a role change (delete-all, re-merged), while updateMember
+only added. Both now behave the same way on demotion.
+
+Also widens insertMissingPrincipalGrants and pruneSupersededRoleDefaultGrants
+to take Pick<Db, "insert" | "select" | "delete"> rather than Db. Neither opens
+a transaction, and a transaction handle satisfies the narrower type, which
+removes the `tx as unknown as Db` cast at both call sites instead of
+laundering a transaction through a full-client type.
+
+Verified: 30/30 in access-service + access-routes-permissions-upgrade, 94/94
+across authorization-service, hidden-floor, validators, invite-join-grants and
+invite-accept-existing-member, and tsc --noEmit clean. With only the two
+service files reverted to cd10736 and the tests kept, both new demotion
+assertions fail.
+
+Co-Authored-By: Paperclip <noreply@paperclip.ing>
+---
+ server/src/__tests__/access-service.test.ts   | 25 ++++++++
+ server/src/services/access.ts                 | 20 +++++--
+ .../principal-access-compatibility.ts         | 57 ++++++++++++++++++-
+ 3 files changed, 96 insertions(+), 6 deletions(-)
+
+diff --git a/server/src/__tests__/access-service.test.ts b/server/src/__tests__/access-service.test.ts
+index 6cef4e32..c222fd6a 100644
+--- a/server/src/__tests__/access-service.test.ts
++++ b/server/src/__tests__/access-service.test.ts
+@@ -239,6 +239,31 @@ describeEmbeddedPostgres("access service", () => {
+     }
+   });
+ 
++  it("keeps an explicitly granted permission when a demotion removes the role that implied it", async () => {
++    const { company } = await createCompanyWithOwner(db);
++    const access = accessService(db);
++    const member = await createMember(db, company.id, "operator");
++
++    // A human grants one of the owner-only permissions outside the role. It is not
++    // part of the operator defaults, so only this grant accounts for it.
++    await access.setPrincipalPermission(
++      company.id,
++      "user",
++      member.principalId,
++      "users:manage_permissions",
++      true,
++      `grantor-${randomUUID()}`,
++    );
++
++    await access.updateMember(company.id, member.id, { membershipRole: "owner" });
++    await access.updateMember(company.id, member.id, { membershipRole: "operator" });
++
++    const grants = await grantKeysFor(db, company.id, member.principalId);
++    expect(grants).toContain("users:manage_permissions");
++    // The other owner-only permission had no explicit grant, so the demotion takes it.
++    expect(grants).not.toContain("joins:approve");
++  });
++
+   it("does not rewrite agent principal grants, which have no role defaults", async () => {
+     const { company } = await createCompanyWithOwner(db);
+     const access = accessService(db);
+diff --git a/server/src/services/access.ts b/server/src/services/access.ts
+index e737222d..76f0de5b 100644
+--- a/server/src/services/access.ts
++++ b/server/src/services/access.ts
+@@ -26,6 +26,7 @@ import {
+ import {
+   ensureHumanRoleDefaultGrants,
+   insertMissingPrincipalGrants,
++  pruneSupersededRoleDefaultGrants,
+ } from "./principal-access-compatibility.js";
+ 
+ type MembershipRow = typeof companyMemberships.$inferSelect;
+@@ -1143,14 +1144,25 @@ export function accessService(db: Db) {
+         .returning()
+         .then((rows) => rows[0] ?? existing);
+ 
+-      // A role change must confer the new role's permissions. Grant rows are the only
+-      // source of non-`tools:` permissions, so promoting a member without seeding the
+-      // new role's defaults leaves them unable to exercise the role they were given.
++      // A role change must both confer the new role's permissions and take back the
++      // old role's. Grant rows are the only source of non-`tools:` permissions, so
++      // without the seed a promoted member cannot exercise the role they were given,
++      // and without the prune a demoted member keeps the owner-only permissions the
++      // demotion just took away -- `users:manage_permissions` among them, which is a
++      // self-escalation path: the demoted member can re-grant themselves what the
++      // demotion removed. The prune runs in this transaction so a failure cannot leave
++      // the membership updated and the grants behind.
+       if (
+         existing.principalType === "user"
+         && nextMembershipRole !== existing.membershipRole
+       ) {
+-        await insertMissingPrincipalGrants(tx as unknown as Db, {
++        await pruneSupersededRoleDefaultGrants(tx, {
++          companyId,
++          principalId: existing.principalId,
++          previousRole: existing.membershipRole,
++          nextRole: nextMembershipRole,
++        });
++        await insertMissingPrincipalGrants(tx, {
+           companyId,
+           principalType: "user",
+           principalId: existing.principalId,
+diff --git a/server/src/services/principal-access-compatibility.ts b/server/src/services/principal-access-compatibility.ts
+index cb1e86be..eb9526b7 100644
+--- a/server/src/services/principal-access-compatibility.ts
++++ b/server/src/services/principal-access-compatibility.ts
+@@ -1,4 +1,4 @@
+-import { and, eq, notInArray } from "drizzle-orm";
++import { and, eq, inArray, isNull, notInArray } from "drizzle-orm";
+ import type { Db } from "@paperclipai/db";
+ import { agents, companyMemberships, principalPermissionGrants } from "@paperclipai/db";
+ import type { PermissionKey, PrincipalType } from "@paperclipai/shared";
+@@ -14,8 +14,16 @@ export type PrincipalAccessCompatibilityBackfillStats = {
+   humanGrantsInserted: number;
+ };
+ 
++/**
++ * These helpers only read and write rows; they never open or commit a transaction of
++ * their own. Widening the parameter to just the statement builders lets a
++ * `db.transaction()` handle be passed without a cast, so a call site inside a
++ * transaction cannot silently be handed a non-transactional client.
++ */
++type GrantStore = Pick<Db, "insert" | "select" | "delete">;
++
+ export async function insertMissingPrincipalGrants(
+-  db: Db,
++  db: GrantStore,
+   input: {
+     companyId: string;
+     principalType: PrincipalType;
+@@ -73,6 +81,51 @@ export async function ensureHumanRoleDefaultGrants(
+   });
+ }
+ 
++/**
++ * Role-derived grants are materialized as ordinary grant rows, so a demotion has to
++ * withdraw the ones the previous role contributed. Only rows with no granting human
++ * are considered role-derived: a grant a human made explicitly carries that human's
++ * id and survives a demotion.
++ */
++export async function pruneSupersededRoleDefaultGrants(
++  db: GrantStore,
++  input: {
++    companyId: string;
++    principalId: string;
++    previousRole: string | null | undefined;
++    nextRole: string | null | undefined;
++  },
++): Promise<number> {
++  const previousKeys = new Set(
++    grantsForHumanRole(normalizeHumanRole(input.previousRole, "operator")).map(
++      (grant) => grant.permissionKey,
++    ),
++  );
++  if (previousKeys.size === 0) return 0;
++
++  const nextKeys = new Set(
++    grantsForHumanRole(normalizeHumanRole(input.nextRole, "operator")).map(
++      (grant) => grant.permissionKey,
++    ),
++  );
++  const revokedKeys = [...previousKeys].filter((key) => !nextKeys.has(key));
++  if (revokedKeys.length === 0) return 0;
++
++  return db
++    .delete(principalPermissionGrants)
++    .where(
++      and(
++        eq(principalPermissionGrants.companyId, input.companyId),
++        eq(principalPermissionGrants.principalType, "user"),
++        eq(principalPermissionGrants.principalId, input.principalId),
++        isNull(principalPermissionGrants.grantedByUserId),
++        inArray(principalPermissionGrants.permissionKey, revokedKeys),
++      ),
++    )
++    .returning({ id: principalPermissionGrants.id })
++    .then((rows) => rows.length);
++}
++
+ export async function backfillPrincipalAccessCompatibility(
+   db: Db,
+ ): Promise<PrincipalAccessCompatibilityBackfillStats> {
+-- 
+2.47.3
+
+
+From 96bf5080a97e910a976c1b8c1f0b686078eef774 Mon Sep 17 00:00:00 2001
+From: jjude80 <18168364+jjude80@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 21:42:45 -0400
+Subject: [PATCH 4/4] fix(issue): clarify agent restriction in
+ unblockDescriptor 403 error
+
+---
+ .../__tests__/issue-agent-mutation-ownership-routes.test.ts   | 4 ++--
+ server/src/routes/issues.ts                                   | 4 ++--
+ 2 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts b/server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts
+index 4452045d..ae5293a2 100644
+--- a/server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts
++++ b/server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts
+@@ -1723,7 +1723,7 @@ describe("agent issue mutation checkout ownership", () => {
+     });
+ 
+     expect(res.status, JSON.stringify(res.body)).toBe(403);
+-    expect(res.body.error).toBe("Agents may only name themselves as an unblock owner");
++    expect(res.body.error).toBe("Agents may only name themselves as an unblock owner; use a comment to hand off to another team member");
+     expect(mockIssueService.update).not.toHaveBeenCalled();
+   });
+ 
+@@ -1738,7 +1738,7 @@ describe("agent issue mutation checkout ownership", () => {
+     });
+ 
+     expect(res.status, JSON.stringify(res.body)).toBe(403);
+-    expect(res.body.error).toBe("Agents may only name themselves as an unblock owner");
++    expect(res.body.error).toBe("Agents may only name themselves as an unblock owner; use a comment to hand off to another team member");
+     expect(mockIssueService.update).not.toHaveBeenCalled();
+   });
+ 
+diff --git a/server/src/routes/issues.ts b/server/src/routes/issues.ts
+index bf3fcda0..babf606e 100644
+--- a/server/src/routes/issues.ts
++++ b/server/src/routes/issues.ts
+@@ -13783,7 +13783,7 @@ export function issueRoutes(
+           (owner === "board" || "userId" in owner)
+         ) {
+           throw forbidden(
+-            "Agents may only name themselves as an unblock owner",
++            "Agents may only name themselves as an unblock owner; use a comment to hand off to another team member",
+           );
+         }
+         if (owner !== "board" && "agentId" in owner) {
+@@ -13807,7 +13807,7 @@ export function issueRoutes(
+             req.actor.agentId !== owner.agentId
+           ) {
+             throw forbidden(
+-              "Agents may only name themselves as an unblock owner",
++              "Agents may only name themselves as an unblock owner; use a comment to hand off to another team member",
+             );
+           }
+         } else if (owner !== "board" && "userId" in owner) {
+-- 
+2.47.3
+
