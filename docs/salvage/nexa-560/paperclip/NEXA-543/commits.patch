@@ -1,0 +1,143 @@
+From 07aaad456074957230b50e3a2d9a2c51e186c940 Mon Sep 17 00:00:00 2001
+From: jjude80 <18168364+jjude80@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 17:55:06 -0400
+Subject: [PATCH] fix(adapter-utils): prepend launcher directory to child PATH
+
+The managed GitHub launcher profile exported PATH as a fixed value, so
+every non-interactive bash that sourced it lost any directory the caller
+had prepended. Build steps that provision a tool by prepending a shim
+directory then failed with 'command not found' for an installed tool.
+
+Keep the inherited PATH and only move the launcher directory to the
+front, deduplicated so nested shells do not grow PATH. Fall back to the
+launch PATH only when the shell has no PATH at all.
+
+Regression test runs a real child bash and asserts a caller-prepended
+directory survives and the launcher directory appears once.
+---
+ .../src/execution-target.test.ts              | 65 ++++++++++++++++++-
+ .../adapter-utils/src/execution-target.ts     | 24 ++++++-
+ 2 files changed, 87 insertions(+), 2 deletions(-)
+
+diff --git a/packages/adapter-utils/src/execution-target.test.ts b/packages/adapter-utils/src/execution-target.test.ts
+index be9dfde4..037ee229 100644
+--- a/packages/adapter-utils/src/execution-target.test.ts
++++ b/packages/adapter-utils/src/execution-target.test.ts
+@@ -1,5 +1,8 @@
+ import { randomUUID } from "node:crypto";
+-import { access, readFile } from "node:fs/promises";
++import { spawnSync } from "node:child_process";
++import { access, mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
++import os from "node:os";
++import path from "node:path";
+ import { afterEach, describe, expect, it, vi } from "vitest";
+ import * as ssh from "./ssh.js";
+ import * as serverUtils from "./server-utils.js";
+@@ -389,3 +392,63 @@ describe("GitHub launcher lifecycle", () => {
+     expect(runner.execute).toHaveBeenCalledTimes(1);
+   });
+ });
++
++describe("GitHub launcher PATH inheritance", () => {
++  it("keeps a directory the caller prepended to PATH in child shells", async () => {
++    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-launcher-path-"));
++    const runId = randomUUID();
++    try {
++      // A build step provisions a tool by prepending a shim directory and then
++      // starts a shell script. The staged BASH_ENV must keep that entry.
++      const shim = path.join(root, "pnpm-bin");
++      await mkdir(shim, { recursive: true });
++      const env = await prepareGitHubOperationLaunchers({
++        runId, target: null, cwd: root, env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
++      });
++      const callerPath = [shim, env.PATH].join(path.delimiter);
++      // stdin must not be a pipe: bash skips startup files for `bash -c` when
++      // stdin is a pipe on this host, which would hide the regression.
++      const readPath = 'printf %s "$PATH"';
++      const child = spawnSync("bash", ["-c", readPath], {
++        env: { ...process.env, ...env, PATH: callerPath },
++        stdio: ["ignore", "pipe", "pipe"], encoding: "utf8",
++      });
++      expect(child.status, child.stderr).toBe(0);
++      const entries = child.stdout.split(path.delimiter);
++      expect(entries[0]).toBe(shim);
++      expect(entries.filter((entry) => entry === env.PAPERCLIP_GITHUB_LAUNCHER_DIR)).toHaveLength(1);
++
++      const nested = spawnSync("bash", ["-c", `bash -c 'printf %s "$PATH"'`], {
++        env: { ...process.env, ...env, PATH: callerPath },
++        stdio: ["ignore", "pipe", "pipe"], encoding: "utf8",
++      });
++      expect(nested.status, nested.stderr).toBe(0);
++      const nestedEntries = nested.stdout.split(path.delimiter);
++      expect(nestedEntries[0]).toBe(shim);
++      expect(nestedEntries.filter((entry) => entry === env.PAPERCLIP_GITHUB_LAUNCHER_DIR)).toHaveLength(1);
++    } finally {
++      await cleanupGitHubOperationLaunchers({ runId, target: null });
++      await rm(root, { recursive: true, force: true });
++    }
++  });
++
++  it("falls back to the launch PATH when a shell has no PATH", async () => {
++    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-launcher-path-"));
++    const runId = randomUUID();
++    try {
++      const launchPath = `${root}${path.delimiter}/usr/bin${path.delimiter}/bin`;
++      const env = await prepareGitHubOperationLaunchers({ runId, target: null, cwd: root, env: { PATH: launchPath } });
++      const profile = await readFile(path.join(env.PAPERCLIP_GITHUB_LAUNCHER_DIR, ".bashrc"), "utf8");
++      // Invoke by absolute path: the child has no PATH to resolve a command name.
++      const child = spawnSync(process.env.BASH || "/bin/bash", ["--noprofile", "--norc", "-c", `${profile}\nprintf %s "$PATH"`], {
++        env: { HOME: root, PATH: "" },
++        stdio: ["ignore", "pipe", "pipe"], encoding: "utf8",
++      });
++      expect(child.status, child.stderr).toBe(0);
++      expect(child.stdout.split(path.delimiter)).toEqual([env.PAPERCLIP_GITHUB_LAUNCHER_DIR, root, "/usr/bin", "/bin"]);
++    } finally {
++      await cleanupGitHubOperationLaunchers({ runId, target: null });
++      await rm(root, { recursive: true, force: true });
++    }
++  });
++});
+diff --git a/packages/adapter-utils/src/execution-target.ts b/packages/adapter-utils/src/execution-target.ts
+index cd8f0057..21eb969f 100644
+--- a/packages/adapter-utils/src/execution-target.ts
++++ b/packages/adapter-utils/src/execution-target.ts
+@@ -1763,13 +1763,35 @@ export async function prepareGitHubOperationLaunchers(input: {
+   const managedPath = basePath ? `${directory}:${basePath}` : directory;
+   // Login shells may reorder PATH through /etc/profile or path_helper. Restore
+   // the managed launchers after startup without loading a host user's profile.
++  // Prepend the launcher directory to the inherited PATH instead of replacing
++  // it: build steps routinely provision a tool by prepending a shim directory
++  // before starting a child shell, and a replacement here silently drops it
++  // (the failure reads as "command not found" for a tool that is installed).
++  // The `case` guard keeps a shell nested under an already-restored PATH from
++  // duplicating the directory on every nesting level.
++  const launcherDirPattern = directory.replace(/[\\*?[\]]/g, "\\$&");
++  const fallbackPath = basePath || "/usr/bin:/bin";
++  const restoreLauncherPath = [
++    `_paperclip_launcher_dir=${shellQuote(directory)}`,
++    `case ":\${PATH-}:" in`,
++    `  *:${launcherDirPattern}:*) ;;`,
++    `  *) if [ -n "\${PATH-}" ]; then`,
++    `       PATH="\${_paperclip_launcher_dir}:\${PATH}"`,
++    `     else`,
++    `       PATH="\${_paperclip_launcher_dir}":${shellQuote(fallbackPath)}`,
++    `     fi`,
++    `     export PATH ;;`,
++    `esac`,
++    `unset _paperclip_launcher_dir`,
++    ``,
++  ].join("\n");
+   // Empty merge overrides clear host identity before launch, but Git treats
+   // them as an explicit empty author. Remove them once the shell has inherited
+   // its final environment; preserve nonempty per-operation identity values.
+   const clearEmptyGitIdentity = ["GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"]
+     .map((key) => `if [ -z "\${${key}-}" ]; then unset ${key}; fi\n`)
+     .join("");
+-  const profile = `export PATH=${shellQuote(managedPath)}\n${clearEmptyGitIdentity}`;
++  const profile = `${restoreLauncherPath}${clearEmptyGitIdentity}`;
+   const files: Record<string, string> = Object.fromEntries([
+     // Remote launchers live beneath the checkout. Pin their own package scope
+     // so an enclosing project's "type": "module" cannot reinterpret require().
+-- 
+2.47.3
+
