@@ -1,0 +1,2830 @@
+From 3330eb1a09e77daa896d4182a4a7ca8ae430d56a Mon Sep 17 00:00:00 2001
+From: jjude80 <18168364+jjude80@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 00:04:49 +0000
+Subject: [PATCH 1/9] fix(access): keep role-derived grants when a member's
+ grants are replaced
+
+Role-derived permissions are materialized as ordinary
+principal_permission_grants rows, so any writer that replaces a principal's
+grants must re-apply the role defaults or it silently strips the permissions
+the membership role implies.
+
+- setMemberPermissions and updateMemberAndPermissions now merge the role
+  defaults back in instead of trusting every caller to pass the full set.
+  Explicit grants still win on a key collision; agent principals are untouched
+  because they have no role defaults.
+- updateMember seeds the new role's defaults when membershipRole changes, so a
+  promotion actually confers the role. Joining as an owner already did this;
+  promotion did not.
+- Agent principals keep exact set semantics (setMemberPermissions with
+  ["tasks:assign"] still yields exactly that).
+
+Verification: 28/28 in access-service.test.ts and
+access-routes-permissions-upgrade.test.ts. With only the service changes
+reverted, the 7 new/updated assertions fail. tsc --noEmit clean for the
+server package.
+
+Co-Authored-By: Paperclip <noreply@paperclip.ing>
+---
+ .../access-routes-permissions-upgrade.test.ts | 102 ++++++++++++++-
+ server/src/__tests__/access-service.test.ts   | 122 ++++++++++++++++++
+ server/src/services/access.ts                 |  50 ++++++-
+ server/src/services/company-member-roles.ts   |  33 +++++
+ 4 files changed, 299 insertions(+), 8 deletions(-)
+
+diff --git a/server/src/__tests__/access-routes-permissions-upgrade.test.ts b/server/src/__tests__/access-routes-permissions-upgrade.test.ts
+index 799701e1..f9035889 100644
+--- a/server/src/__tests__/access-routes-permissions-upgrade.test.ts
++++ b/server/src/__tests__/access-routes-permissions-upgrade.test.ts
+@@ -19,6 +19,7 @@ import {
+   getEmbeddedPostgresTestSupport,
+   startEmbeddedPostgresTestDatabase,
+ } from "./helpers/embedded-postgres.js";
++import { grantsForHumanRole } from "../services/company-member-roles.js";
+ 
+ vi.hoisted(() => {
+   process.env.PAPERCLIP_HOME = "/tmp/paperclip-test-home";
+@@ -133,6 +134,98 @@ describeEmbeddedPostgres("access routes permissions upgrade compatibility", () =
+     expect(unchanged.membershipRole).toBe("owner");
+   }, 10_000);
+ 
++  it("keeps role-derived grants when the role-and-grants route replaces a member's grants", async () => {
++    const { company, owner } = await createCompanyWithOwner(db);
++    const operator = await db
++      .insert(companyMemberships)
++      .values({
++        companyId: company.id,
++        principalType: "user",
++        principalId: `operator-${randomUUID()}`,
++        status: "active",
++        membershipRole: "operator",
++      })
++      .returning()
++      .then((rows) => rows[0]!);
++    for (const grant of grantsForHumanRole("operator")) {
++      await db.insert(principalPermissionGrants).values({
++        companyId: company.id,
++        principalType: "user",
++        principalId: operator.principalId,
++        permissionKey: grant.permissionKey,
++        scope: grant.scope,
++        grantedByUserId: owner.principalId,
++      });
++    }
++
++    // An owner editing an operator's grants is the reachable case: the target rank
++    // is below the actor rank, so assertCanManageCompanyMember allows it.
++    const res = await request(await createApp(db, company.id, owner.principalId))
++      .patch(`/api/companies/${company.id}/members/${operator.id}/role-and-grants`)
++      .send({ status: "active", grants: [] });
++    expect(res.status, JSON.stringify(res.body)).toBe(200);
++    expect(res.body.membershipRole).toBe("operator");
++
++    const grants = await db
++      .select({ permissionKey: principalPermissionGrants.permissionKey })
++      .from(principalPermissionGrants)
++      .where(
++        and(
++          eq(principalPermissionGrants.companyId, company.id),
++          eq(principalPermissionGrants.principalId, operator.principalId),
++        ),
++      )
++      .then((rows) => rows.map((row) => row.permissionKey));
++    // The membership role still says operator, so its permissions must survive.
++    for (const roleGrant of grantsForHumanRole("operator")) {
++      expect(grants).toContain(roleGrant.permissionKey);
++    }
++  });
++
++  it("keeps role-derived grants when the permissions-only route replaces a member's grants", async () => {
++    const { company, owner } = await createCompanyWithOwner(db);
++    const admin = await db
++      .insert(companyMemberships)
++      .values({
++        companyId: company.id,
++        principalType: "user",
++        principalId: `admin-${randomUUID()}`,
++        status: "active",
++        membershipRole: "admin",
++      })
++      .returning()
++      .then((rows) => rows[0]!);
++    for (const grant of grantsForHumanRole("admin")) {
++      await db.insert(principalPermissionGrants).values({
++        companyId: company.id,
++        principalType: "user",
++        principalId: admin.principalId,
++        permissionKey: grant.permissionKey,
++        scope: grant.scope,
++        grantedByUserId: owner.principalId,
++      });
++    }
++
++    const res = await request(await createApp(db, company.id, owner.principalId))
++      .patch(`/api/companies/${company.id}/members/${admin.id}/permissions`)
++      .send({ grants: [] });
++    expect(res.status, JSON.stringify(res.body)).toBe(200);
++
++    const grants = await db
++      .select({ permissionKey: principalPermissionGrants.permissionKey })
++      .from(principalPermissionGrants)
++      .where(
++        and(
++          eq(principalPermissionGrants.companyId, company.id),
++          eq(principalPermissionGrants.principalId, admin.principalId),
++        ),
++      )
++      .then((rows) => rows.map((row) => row.permissionKey));
++    for (const roleGrant of grantsForHumanRole("admin")) {
++      expect(grants).toContain(roleGrant.permissionKey);
++    }
++  });
++
+   it("keeps custom grants when the role-only member route changes a member role", async () => {
+     const { company, owner } = await createCompanyWithOwner(db);
+     const member = await db
+@@ -173,12 +266,17 @@ describeEmbeddedPostgres("access routes permissions upgrade compatibility", () =
+           eq(principalPermissionGrants.principalId, member.principalId),
+         ),
+       );
+-    expect(grants).toHaveLength(1);
+-    expect(grants[0]).toMatchObject({
++    const customGrant = grants.find((grant) => grant.permissionKey === "tasks:assign_scope");
++    expect(customGrant).toMatchObject({
+       permissionKey: "tasks:assign_scope",
+       scope: customScope,
+       grantedByUserId: owner.principalId,
+     });
++    // The new role's defaults are materialized alongside the custom grant, so a
++    // role change is what confers the role's permissions.
++    for (const roleGrant of grantsForHumanRole("operator")) {
++      expect(grants.map((grant) => grant.permissionKey)).toContain(roleGrant.permissionKey);
++    }
+   });
+ 
+   it("sweeps personal connection access when the member route suspends a user", async () => {
+diff --git a/server/src/__tests__/access-service.test.ts b/server/src/__tests__/access-service.test.ts
+index 2d81dba8..df12ee90 100644
+--- a/server/src/__tests__/access-service.test.ts
++++ b/server/src/__tests__/access-service.test.ts
+@@ -56,6 +56,37 @@ async function createCompanyWithOwner(db: ReturnType<typeof createDb>) {
+   return { company, owner };
+ }
+ 
++async function createMember(
++  db: ReturnType<typeof createDb>,
++  companyId: string,
++  membershipRole: "owner" | "admin" | "operator" | "viewer",
++) {
++  return db
++    .insert(companyMemberships)
++    .values({
++      companyId,
++      principalType: "user",
++      principalId: `member-${randomUUID()}`,
++      status: "active",
++      membershipRole,
++    })
++    .returning()
++    .then((rows) => rows[0]!);
++}
++
++async function grantKeysFor(db: ReturnType<typeof createDb>, companyId: string, principalId: string) {
++  return db
++    .select({ permissionKey: principalPermissionGrants.permissionKey })
++    .from(principalPermissionGrants)
++    .where(
++      and(
++        eq(principalPermissionGrants.companyId, companyId),
++        eq(principalPermissionGrants.principalId, principalId),
++      ),
++    )
++    .then((rows) => rows.map((row) => row.permissionKey));
++}
++
+ describeEmbeddedPostgres("access service", () => {
+   let db!: ReturnType<typeof createDb>;
+   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+@@ -125,6 +156,97 @@ describeEmbeddedPostgres("access service", () => {
+     expect(unchanged.status).toBe("active");
+   });
+ 
++  it("keeps role-derived grants when a member permissions PATCH omits them", async () => {
++    const { company, owner } = await createCompanyWithOwner(db);
++    const access = accessService(db);
++    const member = await createMember(db, company.id, "owner");
++
++    await access.setMemberPermissions(company.id, member.id, [], owner.principalId);
++
++    const grants = await grantKeysFor(db, company.id, member.principalId);
++    expect(grants.sort()).toEqual(
++      grantsForHumanRole("owner").map((grant) => grant.permissionKey).sort(),
++    );
++    expect(grants).toContain("users:manage_permissions");
++  });
++
++  it("keeps role-derived grants and still adds explicit ones on a role-and-grants PATCH", async () => {
++    const { company, owner } = await createCompanyWithOwner(db);
++    const access = accessService(db);
++    const member = await createMember(db, company.id, "operator");
++
++    await access.updateMemberAndPermissions(
++      company.id,
++      member.id,
++      { grants: [{ permissionKey: "pipelines:write" }] },
++      owner.principalId,
++    );
++
++    const grants = await grantKeysFor(db, company.id, member.principalId);
++    for (const defaultGrant of grantsForHumanRole("operator")) {
++      expect(grants).toContain(defaultGrant.permissionKey);
++    }
++    expect(grants).toContain("pipelines:write");
++  });
++
++  it("applies the next role's defaults when a grants PATCH changes the role", async () => {
++    const { company, owner } = await createCompanyWithOwner(db);
++    const access = accessService(db);
++    const member = await createMember(db, company.id, "viewer");
++
++    await access.updateMemberAndPermissions(
++      company.id,
++      member.id,
++      { membershipRole: "owner", grants: [] },
++      owner.principalId,
++    );
++
++    const grants = await grantKeysFor(db, company.id, member.principalId);
++    expect(grants).toContain("users:manage_permissions");
++    for (const defaultGrant of grantsForHumanRole("owner")) {
++      expect(grants).toContain(defaultGrant.permissionKey);
++    }
++  });
++
++  it("confers the new role's permissions on promotion through updateMember", async () => {
++    const { company } = await createCompanyWithOwner(db);
++    const access = accessService(db);
++    const member = await createMember(db, company.id, "operator");
++
++    await access.updateMember(company.id, member.id, { membershipRole: "owner" });
++
++    const grants = await grantKeysFor(db, company.id, member.principalId);
++    expect(grants).toContain("users:manage_permissions");
++    for (const defaultGrant of grantsForHumanRole("owner")) {
++      expect(grants).toContain(defaultGrant.permissionKey);
++    }
++  });
++
++  it("does not rewrite agent principal grants, which have no role defaults", async () => {
++    const { company } = await createCompanyWithOwner(db);
++    const access = accessService(db);
++    const agent = await db
++      .insert(companyMemberships)
++      .values({
++        companyId: company.id,
++        principalType: "agent",
++        principalId: `agent-${randomUUID()}`,
++        status: "active",
++        membershipRole: "member",
++      })
++      .returning()
++      .then((rows) => rows[0]!);
++
++    await access.setMemberPermissions(
++      company.id,
++      agent.id,
++      [{ permissionKey: "tasks:assign" }],
++      null,
++    );
++
++    expect(await grantKeysFor(db, company.id, agent.principalId)).toEqual(["tasks:assign"]);
++  });
++
+   it("archives members, clears grants, and reassigns open issues without deleting history", async () => {
+     const { company, owner } = await createCompanyWithOwner(db);
+     const member = await db
+diff --git a/server/src/services/access.ts b/server/src/services/access.ts
+index 7cecb4cd..e737222d 100644
+--- a/server/src/services/access.ts
++++ b/server/src/services/access.ts
+@@ -18,7 +18,15 @@ import type { PermissionKey, PrincipalType } from "@paperclipai/shared";
+ import { conflict } from "../errors.js";
+ import { assertAssignableAgent } from "./agent-assignability.js";
+ import { authorizationService, type AuthorizationActor, type AuthorizationResource } from "./authorization.js";
+-import { ensureHumanRoleDefaultGrants } from "./principal-access-compatibility.js";
++import {
++  grantsForHumanRole,
++  mergeRoleDefaultGrants,
++  normalizeHumanRole,
++} from "./company-member-roles.js";
++import {
++  ensureHumanRoleDefaultGrants,
++  insertMissingPrincipalGrants,
++} from "./principal-access-compatibility.js";
+ 
+ type MembershipRow = typeof companyMemberships.$inferSelect;
+ type GrantInput = {
+@@ -451,6 +459,12 @@ export function accessService(db: Db) {
+     const member = await getMemberById(companyId, memberId);
+     if (!member) return null;
+ 
++    const effectiveGrants = mergeRoleDefaultGrants({
++      principalType: member.principalType,
++      membershipRole: member.membershipRole,
++      grants,
++    });
++
+     await db.transaction(async (tx) => {
+       await tx
+         .delete(principalPermissionGrants)
+@@ -461,9 +475,9 @@ export function accessService(db: Db) {
+             eq(principalPermissionGrants.principalId, member.principalId),
+           ),
+         );
+-      if (grants.length > 0) {
++      if (effectiveGrants.length > 0) {
+         await tx.insert(principalPermissionGrants).values(
+-          grants.map((grant) => ({
++          effectiveGrants.map((grant) => ({
+             companyId,
+             principalType: member.principalType,
+             principalId: member.principalId,
+@@ -560,9 +574,15 @@ export function accessService(db: Db) {
+             eq(principalPermissionGrants.principalId, existing.principalId),
+           ),
+         );
+-      if (data.grants.length > 0) {
++      const effectiveGrants = mergeRoleDefaultGrants({
++        principalType: existing.principalType,
++        membershipRole: nextMembershipRole,
++        grants: data.grants,
++      });
++
++      if (effectiveGrants.length > 0) {
+         await tx.insert(principalPermissionGrants).values(
+-          data.grants.map((grant) => ({
++          effectiveGrants.map((grant) => ({
+             companyId,
+             principalType: existing.principalType,
+             principalId: existing.principalId,
+@@ -1112,7 +1132,7 @@ export function accessService(db: Db) {
+         await sweepMemberConnectionAccess(tx, companyId, existing.principalId, now);
+       }
+ 
+-      return tx
++      const updated = await tx
+         .update(companyMemberships)
+         .set({
+           membershipRole: nextMembershipRole,
+@@ -1122,6 +1142,24 @@ export function accessService(db: Db) {
+         .where(eq(companyMemberships.id, existing.id))
+         .returning()
+         .then((rows) => rows[0] ?? existing);
++
++      // A role change must confer the new role's permissions. Grant rows are the only
++      // source of non-`tools:` permissions, so promoting a member without seeding the
++      // new role's defaults leaves them unable to exercise the role they were given.
++      if (
++        existing.principalType === "user"
++        && nextMembershipRole !== existing.membershipRole
++      ) {
++        await insertMissingPrincipalGrants(tx as unknown as Db, {
++          companyId,
++          principalType: "user",
++          principalId: existing.principalId,
++          grants: grantsForHumanRole(normalizeHumanRole(nextMembershipRole, "operator")),
++          grantedByUserId: null,
++        });
++      }
++
++      return updated;
+     });
+   }
+ 
+diff --git a/server/src/services/company-member-roles.ts b/server/src/services/company-member-roles.ts
+index d67ddbc9..028207c2 100644
+--- a/server/src/services/company-member-roles.ts
++++ b/server/src/services/company-member-roles.ts
+@@ -76,6 +76,39 @@ export function grantsForHumanRole(
+   }
+ }
+ 
++type RoleGrant = {
++  permissionKey: (typeof PERMISSION_KEYS)[number];
++  scope?: Record<string, unknown> | null;
++};
++
++/**
++ * Role-derived permissions are materialized as ordinary grant rows, so any writer
++ * that replaces a principal's grants must re-apply the role defaults or it will
++ * silently strip the permissions the membership role implies. Callers may only
++ * add to the role defaults, never remove them.
++ *
++ * Agent principals have no role defaults: their grants are set explicitly.
++ */
++export function mergeRoleDefaultGrants<T extends RoleGrant>(input: {
++  principalType: string;
++  membershipRole: string | null | undefined;
++  grants: T[];
++}): T[] {
++  if (input.principalType !== "user") return input.grants;
++
++  const defaults = grantsForHumanRole(normalizeHumanRole(input.membershipRole, "operator"));
++  if (defaults.length === 0) return input.grants;
++
++  const merged = [...input.grants];
++  const seen = new Set(input.grants.map((grant) => grant.permissionKey));
++  for (const roleGrant of defaults) {
++    if (seen.has(roleGrant.permissionKey)) continue;
++    seen.add(roleGrant.permissionKey);
++    merged.push({ permissionKey: roleGrant.permissionKey, scope: roleGrant.scope } as T);
++  }
++  return merged;
++}
++
+ export function resolveHumanInviteRole(
+   defaultsPayload: Record<string, unknown> | null | undefined
+ ): HumanCompanyMembershipRole {
+-- 
+2.47.3
+
+
+From cd10736bbfd9ad90802891e0facacec652027a43 Mon Sep 17 00:00:00 2001
+From: jjude80 <18168364+jjude80@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 00:13:13 +0000
+Subject: [PATCH 2/9] test(access): reproduce owner grants surviving demotion
+ to operator
+
+3330eb1 makes role-change handling seed the new role's defaults but it
+never prunes the old role's. Because role defaults are materialized as
+ordinary principal_permission_grants rows, a demoted member keeps them.
+
+Reproducer for the review finding on NEXA-207. Promote operator -> owner,
+then demote owner -> operator, and the member still holds the two
+owner-only permissions: users:manage_permissions and joins:approve.
+
+users:manage_permissions is the sharper one: a demoted operator can use it
+to re-grant themselves the permissions the demotion just removed.
+
+The 28 pre-existing assertions in access-service.test.ts and
+access-routes-permissions-upgrade.test.ts all still pass.
+
+Co-Authored-By: Paperclip <noreply@paperclip.ing>
+---
+ server/src/__tests__/access-service.test.ts | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/server/src/__tests__/access-service.test.ts b/server/src/__tests__/access-service.test.ts
+index df12ee90..6cef4e32 100644
+--- a/server/src/__tests__/access-service.test.ts
++++ b/server/src/__tests__/access-service.test.ts
+@@ -222,6 +222,23 @@ describeEmbeddedPostgres("access service", () => {
+     }
+   });
+ 
++  it("revokes the previous role's permissions on demotion through updateMember", async () => {
++    const { company } = await createCompanyWithOwner(db);
++    const access = accessService(db);
++    const member = await createMember(db, company.id, "operator");
++
++    await access.updateMember(company.id, member.id, { membershipRole: "owner" });
++    expect(await grantKeysFor(db, company.id, member.principalId)).toContain("users:manage_permissions");
++
++    await access.updateMember(company.id, member.id, { membershipRole: "operator" });
++
++    const grants = await grantKeysFor(db, company.id, member.principalId);
++    const operatorDefaults = new Set(grantsForHumanRole("operator").map((grant) => grant.permissionKey));
++    for (const permissionKey of grants) {
++      expect(operatorDefaults.has(permissionKey)).toBe(true);
++    }
++  });
++
+   it("does not rewrite agent principal grants, which have no role defaults", async () => {
+     const { company } = await createCompanyWithOwner(db);
+     const access = accessService(db);
+-- 
+2.47.3
+
+
+From 86ade43a750a0e402a3d1022ab1103a1a0f4fad0 Mon Sep 17 00:00:00 2001
+From: jjude80 <18168364+jjude80@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 00:18:50 +0000
+Subject: [PATCH 3/9] fix(access): revoke the previous role's default grants on
+ demotion
+
+updateMember seeded the new role's defaults on a role change but never
+withdrew the old role's, so a demoted human kept them. users:manage_permissions
+among them, which is a self-escalation path: the demoted member can re-grant
+themselves the permissions the demotion just removed.
+
+pruneSupersededRoleDefaultGrants deletes only rows with no granting human, so
+an explicitly granted permission a human gave outside the role survives the
+demotion. It runs inside the membership transaction. setMemberPermissions and
+updateMemberAndPermissions replace the whole set and are unaffected.
+
+Co-Authored-By: Paperclip <noreply@paperclip.ing>
+---
+ server/src/__tests__/access-service.test.ts | 25 +++++++++++++++++++++
+ 1 file changed, 25 insertions(+)
+
+diff --git a/server/src/__tests__/access-service.test.ts b/server/src/__tests__/access-service.test.ts
+index 6cef4e32..c222fd6a 100644
+--- a/server/src/__tests__/access-service.test.ts
++++ b/server/src/__tests__/access-service.test.ts
+@@ -239,6 +239,31 @@ describeEmbeddedPostgres("access service", () => {
+     }
+   });
+ 
++  it("keeps an explicitly granted permission when a demotion removes the role that implied it", async () => {
++    const { company } = await createCompanyWithOwner(db);
++    const access = accessService(db);
++    const member = await createMember(db, company.id, "operator");
++
++    // A human grants one of the owner-only permissions outside the role. It is not
++    // part of the operator defaults, so only this grant accounts for it.
++    await access.setPrincipalPermission(
++      company.id,
++      "user",
++      member.principalId,
++      "users:manage_permissions",
++      true,
++      `grantor-${randomUUID()}`,
++    );
++
++    await access.updateMember(company.id, member.id, { membershipRole: "owner" });
++    await access.updateMember(company.id, member.id, { membershipRole: "operator" });
++
++    const grants = await grantKeysFor(db, company.id, member.principalId);
++    expect(grants).toContain("users:manage_permissions");
++    // The other owner-only permission had no explicit grant, so the demotion takes it.
++    expect(grants).not.toContain("joins:approve");
++  });
++
+   it("does not rewrite agent principal grants, which have no role defaults", async () => {
+     const { company } = await createCompanyWithOwner(db);
+     const access = accessService(db);
+-- 
+2.47.3
+
+
+From f88d40c542e2ce2853674d08de554f1241ec3d47 Mon Sep 17 00:00:00 2001
+From: jjude80 <18168364+jjude80@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 00:27:03 +0000
+Subject: [PATCH 4/9] fix(access): revoke the previous role's grants on
+ demotion
+
+updateMember seeded the new role's defaults on a role change but never withdrew
+the old role's. Role defaults are materialized as ordinary grant rows, so a
+demoted member kept them -- users:manage_permissions among them, which is a
+self-escalation primitive: the demoted member can re-grant themselves exactly
+what the demotion removed.
+
+pruneSupersededRoleDefaultGrants deletes the previous role's defaults that the
+new role does not confer, only where granted_by_user_id IS NULL, and runs inside
+the membership transaction. A permission a human granted deliberately carries
+that human's id and survives the demotion.
+
+The NULL predicate is only sound if role defaults never record a granting human,
+and three paths did: board-claim, company-create and company-clone all stamped
+their owner's id onto owner defaults. Those rows then looked like explicit grants
+and a later demotion could not withdraw them, so the escalation path stayed open
+for exactly the highest-privilege principals -- reproduced before this change,
+which kept both joins:approve and users:manage_permissions. ensureHumanRoleDefaultGrants
+and ensureRoleDefaultGrants no longer accept a granting human, so role defaults
+are recorded as role defaults and the mistake is a compile error.
+
+Rows written before this change remain ambiguous: a row that is both a role
+default and explicitly held is undecidable from the table alone, because
+principal_permission_grants has no provenance column. Those rows keep their
+current behaviour and need an owner decision before a backfill.
+
+Verification (run here): 31/31 in access-service.test.ts and
+access-routes-permissions-upgrade.test.ts, 190/190 across board-claim,
+company-portability, portability-routes, cloud-floor, cross-company-authz,
+companies-service and cloud-tenant-provisioning, 159/159 across the wider
+access/membership surface. tsc --noEmit clean. With the service changes stashed,
+the three demotion tests fail and 23 pre-existing assertions still pass.
+
+Co-Authored-By: Paperclip <noreply@paperclip.ing>
+---
+ server/src/__tests__/access-service.test.ts   | 43 ++++++++++-
+ server/src/board-claim.ts                     |  1 -
+ server/src/middleware/auth.ts                 |  1 -
+ server/src/routes/companies.ts                |  1 -
+ server/src/services/access.ts                 | 21 +++--
+ server/src/services/company-portability.ts    |  1 -
+ .../principal-access-compatibility.ts         | 76 ++++++++++++++++++-
+ 7 files changed, 129 insertions(+), 15 deletions(-)
+
+diff --git a/server/src/__tests__/access-service.test.ts b/server/src/__tests__/access-service.test.ts
+index c222fd6a..c2df020f 100644
+--- a/server/src/__tests__/access-service.test.ts
++++ b/server/src/__tests__/access-service.test.ts
+@@ -26,7 +26,7 @@ import {
+ } from "./helpers/embedded-postgres.js";
+ import { accessService } from "../services/access.js";
+ import { grantsForHumanRole } from "../services/company-member-roles.js";
+-import { backfillPrincipalAccessCompatibility } from "../services/principal-access-compatibility.js";
++import { backfillPrincipalAccessCompatibility, ensureHumanRoleDefaultGrants } from "../services/principal-access-compatibility.js";
+ 
+ const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
+ const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+@@ -239,6 +239,47 @@ describeEmbeddedPostgres("access service", () => {
+     }
+   });
+ 
++  it("revokes owner defaults for a member who claimed or created the company", async () => {
++    // Board-claim, company-create and company-clone all seed an owner's role
++    // defaults directly. If those rows carry a granting human they look like
++    // explicit grants, and the demotion below cannot tell them apart -- leaving
++    // the escalation path open for exactly the highest-privilege principals.
++    const { company, owner } = await createCompanyWithOwner(db);
++    const access = accessService(db);
++
++    await ensureHumanRoleDefaultGrants(db, {
++      companyId: company.id,
++      principalId: owner.principalId,
++      membershipRole: "owner",
++    });
++
++    const seeded = await db
++      .select({
++        permissionKey: principalPermissionGrants.permissionKey,
++        grantedByUserId: principalPermissionGrants.grantedByUserId,
++      })
++      .from(principalPermissionGrants)
++      .where(
++        and(
++          eq(principalPermissionGrants.companyId, company.id),
++          eq(principalPermissionGrants.principalId, owner.principalId),
++        ),
++      );
++    expect(seeded.length).toBeGreaterThan(0);
++    for (const grant of seeded) {
++      expect(grant.grantedByUserId).toBeNull();
++    }
++
++    // A second owner, so the last-owner guard does not block the demotion.
++    await createMember(db, company.id, "owner");
++
++    await access.updateMember(company.id, owner.id, { membershipRole: "operator" });
++
++    const grants = await grantKeysFor(db, company.id, owner.principalId);
++    expect(grants).not.toContain("users:manage_permissions");
++    expect(grants).not.toContain("joins:approve");
++  });
++
+   it("keeps an explicitly granted permission when a demotion removes the role that implied it", async () => {
+     const { company } = await createCompanyWithOwner(db);
+     const access = accessService(db);
+diff --git a/server/src/board-claim.ts b/server/src/board-claim.ts
+index c4784406..9fefc61e 100644
+--- a/server/src/board-claim.ts
++++ b/server/src/board-claim.ts
+@@ -148,7 +148,6 @@ export async function claimBoardOwnership(
+       companyId,
+       principalId: opts.userId,
+       membershipRole: "owner",
+-      grantedByUserId: opts.userId,
+     });
+   }
+ 
+diff --git a/server/src/middleware/auth.ts b/server/src/middleware/auth.ts
+index 8bc814f4..6b344518 100644
+--- a/server/src/middleware/auth.ts
++++ b/server/src/middleware/auth.ts
+@@ -684,7 +684,6 @@ async function resolveCloudTenantActorOnce(
+     companyId,
+     principalId: userId,
+     membershipRole: effectiveMembership.membershipRole ?? membershipRole,
+-    grantedByUserId: null,
+   });
+   if (shouldSync) {
+     cloudTenantWriteDebounce.delete(userId);
+diff --git a/server/src/routes/companies.ts b/server/src/routes/companies.ts
+index 8de78282..6a2af6b9 100644
+--- a/server/src/routes/companies.ts
++++ b/server/src/routes/companies.ts
+@@ -1216,7 +1216,6 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
+       company.id,
+       ownerPrincipalId,
+       "owner",
+-      req.actor.userId ?? null,
+     );
+     await logActivity(db, {
+       companyId: company.id,
+diff --git a/server/src/services/access.ts b/server/src/services/access.ts
+index e737222d..79bd5c4f 100644
+--- a/server/src/services/access.ts
++++ b/server/src/services/access.ts
+@@ -26,6 +26,7 @@ import {
+ import {
+   ensureHumanRoleDefaultGrants,
+   insertMissingPrincipalGrants,
++  pruneSupersededRoleDefaultGrants,
+ } from "./principal-access-compatibility.js";
+ 
+ type MembershipRow = typeof companyMemberships.$inferSelect;
+@@ -969,23 +970,23 @@ export function accessService(db: Db) {
+         companyId: targetCompanyId,
+         principalId: membership.principalId,
+         membershipRole: membership.membershipRole,
+-        grantedByUserId: null,
+       });
+     }
+     return sourceMemberships;
+   }
+ 
++  // No granting human is accepted here on purpose -- see
++  // ensureHumanRoleDefaultGrants. Role defaults must stay distinguishable from
++  // explicit grants so a demotion can withdraw them.
+   async function ensureRoleDefaultGrants(
+     companyId: string,
+     principalId: string,
+     membershipRole: string | null | undefined,
+-    grantedByUserId: string | null,
+   ) {
+     return ensureHumanRoleDefaultGrants(db, {
+       companyId,
+       principalId,
+       membershipRole,
+-      grantedByUserId,
+     });
+   }
+ 
+@@ -1143,13 +1144,21 @@ export function accessService(db: Db) {
+         .returning()
+         .then((rows) => rows[0] ?? existing);
+ 
+-      // A role change must confer the new role's permissions. Grant rows are the only
+-      // source of non-`tools:` permissions, so promoting a member without seeding the
+-      // new role's defaults leaves them unable to exercise the role they were given.
++      // A role change has to move the member's permissions in both directions.
++      // Seeding the new role's defaults is the promotion half; without withdrawing
++      // the previous role's, a demoted member keeps them and can use the retained
++      // ones to re-grant themselves what the demotion just removed. Both run in the
++      // membership transaction so a failure leaves no partial role change.
+       if (
+         existing.principalType === "user"
+         && nextMembershipRole !== existing.membershipRole
+       ) {
++        await pruneSupersededRoleDefaultGrants(tx as unknown as Db, {
++          companyId,
++          principalId: existing.principalId,
++          previousMembershipRole: existing.membershipRole,
++          nextMembershipRole,
++        });
+         await insertMissingPrincipalGrants(tx as unknown as Db, {
+           companyId,
+           principalType: "user",
+diff --git a/server/src/services/company-portability.ts b/server/src/services/company-portability.ts
+index 701894a7..c3a8f107 100644
+--- a/server/src/services/company-portability.ts
++++ b/server/src/services/company-portability.ts
+@@ -5336,7 +5336,6 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
+           created.id,
+           ownerPrincipalId,
+           "owner",
+-          actorUserId ?? null,
+         );
+       }
+       targetCompany = created;
+diff --git a/server/src/services/principal-access-compatibility.ts b/server/src/services/principal-access-compatibility.ts
+index cb1e86be..3f722e45 100644
+--- a/server/src/services/principal-access-compatibility.ts
++++ b/server/src/services/principal-access-compatibility.ts
+@@ -1,4 +1,4 @@
+-import { and, eq, notInArray } from "drizzle-orm";
++import { and, eq, inArray, isNull, notInArray } from "drizzle-orm";
+ import type { Db } from "@paperclipai/db";
+ import { agents, companyMemberships, principalPermissionGrants } from "@paperclipai/db";
+ import type { PermissionKey, PrincipalType } from "@paperclipai/shared";
+@@ -54,13 +54,27 @@ export async function insertMissingPrincipalGrants(
+   return inserted.length;
+ }
+ 
++/**
++ * Seed the defaults a membership role implies.
++ *
++ * Role defaults are always recorded with no granting human. That is what makes
++ * `granted_by_user_id IS NULL` a usable provenance signal: it separates a row the
++ * role produced from a permission somebody granted on purpose, and
++ * `pruneSupersededRoleDefaultGrants` depends on the two being distinguishable.
++ *
++ * This parameter is deliberately absent rather than merely ignored. Accepting a
++ * granting human here is what let board-claim, company-create and company-clone
++ * owners seed owner defaults stamped with their own id, which made those rows
++ * indistinguishable from explicit grants and let a later demotion keep
++ * `users:manage_permissions`. Removing it makes that mistake a compile error
++ * instead of a silent escalation path.
++ */
+ export async function ensureHumanRoleDefaultGrants(
+   db: Db,
+   input: {
+     companyId: string;
+     principalId: string;
+     membershipRole: string | null | undefined;
+-    grantedByUserId: string | null;
+   },
+ ): Promise<number> {
+   const role = normalizeHumanRole(input.membershipRole, "operator");
+@@ -69,10 +83,65 @@ export async function ensureHumanRoleDefaultGrants(
+     principalType: "user",
+     principalId: input.principalId,
+     grants: grantsForHumanRole(role),
+-    grantedByUserId: input.grantedByUserId,
++    grantedByUserId: null,
+   });
+ }
+ 
++/**
++ * A role change must revoke what the previous role implied, not only confer what
++ * the new one does. Role defaults are materialized as ordinary grant rows, so
++ * seeding the new role without withdrawing the old one leaves the demoted member
++ * holding them -- `users:manage_permissions` among them, which is a
++ * self-escalation primitive: the demoted member can re-grant themselves exactly
++ * what the demotion removed.
++ *
++ * Only rows with no granting human are removed. Role defaults are seeded without
++ * one, so `granted_by_user_id IS NULL` is the provenance signal available in the
++ * current schema; a permission a human granted deliberately carries that human's
++ * id and survives the demotion.
++ *
++ * The residual: rows seeded as role defaults by a caller that recorded a granting
++ * human, and rows whose provenance predates that convention, are not recognized as
++ * role-derived and survive. Closing that needs a provenance column on the table.
++ */
++export async function pruneSupersededRoleDefaultGrants(
++  db: Db,
++  input: {
++    companyId: string;
++    principalId: string;
++    previousMembershipRole: string | null | undefined;
++    nextMembershipRole: string | null | undefined;
++  },
++): Promise<number> {
++  const nextKeys = new Set(
++    grantsForHumanRole(normalizeHumanRole(input.nextMembershipRole, "operator")).map(
++      (grant) => grant.permissionKey,
++    ),
++  );
++  const supersededKeys = grantsForHumanRole(
++    normalizeHumanRole(input.previousMembershipRole, "operator"),
++  )
++    .map((grant) => grant.permissionKey)
++    .filter((permissionKey) => !nextKeys.has(permissionKey));
++
++  if (supersededKeys.length === 0) return 0;
++
++  const removed = await db
++    .delete(principalPermissionGrants)
++    .where(
++      and(
++        eq(principalPermissionGrants.companyId, input.companyId),
++        eq(principalPermissionGrants.principalType, "user"),
++        eq(principalPermissionGrants.principalId, input.principalId),
++        isNull(principalPermissionGrants.grantedByUserId),
++        inArray(principalPermissionGrants.permissionKey, supersededKeys),
++      ),
++    )
++    .returning({ id: principalPermissionGrants.id });
++
++  return removed.length;
++}
++
+ export async function backfillPrincipalAccessCompatibility(
+   db: Db,
+ ): Promise<PrincipalAccessCompatibilityBackfillStats> {
+@@ -130,7 +199,6 @@ export async function backfillPrincipalAccessCompatibility(
+       companyId: membership.companyId,
+       principalId: membership.principalId,
+       membershipRole: membership.membershipRole,
+-      grantedByUserId: null,
+     });
+   }
+ 
+-- 
+2.47.3
+
+
+From 67772bd1d73d4897d262fad0c7513cb291147059 Mon Sep 17 00:00:00 2001
+From: jjude80 <18168364+jjude80@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 00:20:02 +0000
+Subject: [PATCH 5/9] fix(access): record grant provenance instead of inferring
+ it
+
+Grant provenance was inferred from `granted_by_user_id IS NULL`, which is
+wrong in both directions: board-claim, company-create and company-clone
+seeded role defaults stamped with the owner's own id, so those rows read
+as deliberate grants and a demotion kept `users:manage_permissions` for
+the principals most likely to hold it.
+
+Add `principal_permission_grants.granted_via_role`, written at insert time
+by every path that materializes a role default, and point the demotion
+prune at it.
+
+`mergeRoleDefaultGrants` now returns which keys it contributed, so a caller
+can tell a key it supplied from one the role added. A supplied key stays
+deliberate even when the role also implies it: marking it role-derived
+would let a demotion silently revoke a grant a person made on purpose.
+`setPrincipalPermission` clears the marker for the same reason.
+
+That resolves the case the schema could not previously decide -- a
+permission that is both a role default and explicitly held. The writer
+knows which list a key came from, so the two rows differ only in
+provenance and the demotion makes the right call on each.
+
+`insertMissingPrincipalGrants` takes `grantedViaRole` as a required field,
+so leaving provenance unset is a type error rather than a silent
+escalation path.
+
+Rows predating the column carry a null marker and are treated as
+deliberate, preserving them. The backfill policy for those is a decision,
+not a mechanical detail, so `countUndecidableRoleDefaultGrants` returns
+the affected rows instead of guessing at them.
+
+Migration 0315. Access service 29/29, permissions/portability/tool-access
+485/485, authorization 70/70; db, shared, server and ui typecheck clean.
+Reverting the prune predicate alone fails the new ambiguous-case test, and
+so does dropping the write-side marker -- both halves are load-bearing.
+
+Co-Authored-By: Paperclip <noreply@paperclip.ing>
+---
+ .../db/src/migrations/0315_kind_cargill.sql   |   1 +
+ ...{0310_snapshot.json => 0315_snapshot.json} | Bin 1498602 -> 1559512 bytes
+ packages/db/src/migrations/meta/_journal.json | Bin 47496 -> 47638 bytes
+ .../src/schema/principal_permission_grants.ts |  10 ++
+ packages/shared/src/types/access.ts           |   6 +
+ server/src/__tests__/access-service.test.ts   | 158 +++++++++++++++++-
+ server/src/services/access.ts                 |  37 +++-
+ server/src/services/company-member-roles.ts   |  39 ++++-
+ server/src/services/index.ts                  |   2 +
+ .../principal-access-compatibility.ts         | 131 ++++++++++++---
+ ui/src/api/access.ts                          |   7 +
+ 11 files changed, 354 insertions(+), 37 deletions(-)
+ create mode 100644 packages/db/src/migrations/0315_kind_cargill.sql
+ rename packages/db/src/migrations/meta/{0310_snapshot.json => 0315_snapshot.json} (96%)
+
+diff --git a/packages/db/src/migrations/0315_kind_cargill.sql b/packages/db/src/migrations/0315_kind_cargill.sql
+new file mode 100644
+index 00000000..6b4475e1
+--- /dev/null
++++ b/packages/db/src/migrations/0315_kind_cargill.sql
+@@ -0,0 +1 @@
++ALTER TABLE "principal_permission_grants" ADD COLUMN "granted_via_role" text;
+\ No newline at end of file
+diff --git a/packages/db/src/migrations/meta/0310_snapshot.json b/packages/db/src/migrations/meta/0315_snapshot.json
+similarity index 96%
+rename from packages/db/src/migrations/meta/0310_snapshot.json
+rename to packages/db/src/migrations/meta/0315_snapshot.json
+index 8adbf57d9bbfc7a0503c71a54b4a1c5435e6abb4..819cdb04bc7c4ffd18fa5487da35351b5496da8b 100644
+GIT binary patch
+delta 9660
+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
+DKGg6Y
+
+delta 813
+zcmXYuT}V@57{@usvvbaN+}X~So}w@tL1~^?JKJ=UvC4vq${@0ji`;f5tq(PqGpPJP
+zaG4T*gb!h<N#sDRLEzJe7fOLpl<VUnl0prOBxun^7ZvtSyZBxF|Ihz<-sgSacW`|E
+z@v-^~hU{!xNV64Y+X{Scdm!lWD{i0PtvFSerg-drkCLwi^2-D6e9fhn+wxNRs_I~5
+z*J6*$qdL`1fq<g9eFchB^OY+;HRx14K{Zg|acCarCeKn&Bv>5|RaT@9%3pG{kneOy
+zz5PC%tA7FuF)<9uLu}{Bp0pvV%lnmu+^tk5&KFYSXCYCdD*^L9YZX3wEfrJHA7dCi
+zc8|*W3*J2WFtkVH4rplRS3+{mdL8V)c|CeNjQeS9h|{CIuz5@NIxQ4F6AFjB+bBOw
+z=TW&pN-N-QUwST@AJJd*IR2DAPoZvtuArcO(l`iSOylwUMaynFmE|Cwpe4+DL4Ql{
+zZl={JGer~9keOmO)GV#oZe%OrYHbD|?LD9)u-JQmD_a9)D$|LH2)9-T=Fd!NSKKt*
+zm1Jh&`894CBw9Ell*}7sNS@&YsA}T$NW52>P&P(6pbj~GR2<+4JVB4*fT6Vj8frNn
+zKTH`kZgC{`eKM3Vi?fi-`g0L-&d~x6oDgC>)ZNHr@qLXjxfb`{6mksET4c$9ilY`8
+z`fm#|5;;WfI3n0!Y*;V?Hd6m9L{7*f6T(Io+AGslY<el|ycO+fOeYwzr%?>rAlYYW
+zgR0kN9p1hp4mu%gPGlkRP-5U?X_^evZ$uNUniF{>-Y*L5f5g;Niaea06$L09C0nF2
+zNF=u%FRwSP)`L0AWQ>+NOawEQI;0&%*#A`;ra<9zJoME_7G$fXOFW*wB0b#(Ue(wM
+z5EHZT$D|bJVeFK71C+H$EY?m*j~IwQFsV`NjD*%1OXMJ=zA3ukvJ#dNGH}6_`8Wx0
+ai)AxBkIBnn`k>6>v`6;m;?J}4+>w8H`ZSpU
+
+diff --git a/packages/db/src/migrations/meta/_journal.json b/packages/db/src/migrations/meta/_journal.json
+index 4319e115911962b5a3148ddf4925a2eba560b1bc..72325fa01cbc3983f5eda7d6ca43f6629be69139 100644
+GIT binary patch
+delta 74
+zcmeD9%rxx_(}t#<6EBD|8c%kt*V3^xG&L}>FfleZG}Pfz00X6x#B?Pq1tkMxL(}-|
+Z%)FHN<iw)%%$%Ib3k8+ffQn+dY5{_I78d{j
+
+delta 13
+VcmbRCg{k8+(}t#<lLdCM0RS+I23P<9
+
+diff --git a/packages/db/src/schema/principal_permission_grants.ts b/packages/db/src/schema/principal_permission_grants.ts
+index 279151f8..87b45a69 100644
+--- a/packages/db/src/schema/principal_permission_grants.ts
++++ b/packages/db/src/schema/principal_permission_grants.ts
+@@ -11,6 +11,16 @@ export const principalPermissionGrants = pgTable(
+     permissionKey: text("permission_key").notNull(),
+     scope: jsonb("scope").$type<Record<string, unknown> | null>(),
+     grantedByUserId: text("granted_by_user_id"),
++    // Provenance. Non-null means this row exists because a human membership role
++    // implied it; the value is that role. Null means either a human granted it
++    // deliberately or the row predates this column.
++    //
++    // This is recorded, never inferred. `granted_by_user_id` cannot carry the
++    // signal: three seeding paths (board-claim, company-create, company-clone)
++    // wrote role defaults stamped with the owner's own id, so a role default and
++    // an explicit grant were indistinguishable and a demotion could not tell
++    // which rows to withdraw. See pruneSupersededRoleDefaultGrants.
++    grantedViaRole: text("granted_via_role"),
+     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+   },
+diff --git a/packages/shared/src/types/access.ts b/packages/shared/src/types/access.ts
+index 015d5179..9a8844cb 100644
+--- a/packages/shared/src/types/access.ts
++++ b/packages/shared/src/types/access.ts
+@@ -31,6 +31,12 @@ export interface PrincipalPermissionGrant {
+   permissionKey: PermissionKey;
+   scope: Record<string, unknown> | null;
+   grantedByUserId: string | null;
++  /**
++   * The membership role that implied this grant, or null when it was granted
++   * deliberately. Null also covers rows written before the column existed, whose
++   * provenance the table cannot recover.
++   */
++  grantedViaRole: string | null;
+   createdAt: Date;
+   updatedAt: Date;
+ }
+diff --git a/server/src/__tests__/access-service.test.ts b/server/src/__tests__/access-service.test.ts
+index c2df020f..2d8111bc 100644
+--- a/server/src/__tests__/access-service.test.ts
++++ b/server/src/__tests__/access-service.test.ts
+@@ -26,7 +26,7 @@ import {
+ } from "./helpers/embedded-postgres.js";
+ import { accessService } from "../services/access.js";
+ import { grantsForHumanRole } from "../services/company-member-roles.js";
+-import { backfillPrincipalAccessCompatibility, ensureHumanRoleDefaultGrants } from "../services/principal-access-compatibility.js";
++import { backfillPrincipalAccessCompatibility, countUndecidableRoleDefaultGrants, ensureHumanRoleDefaultGrants } from "../services/principal-access-compatibility.js";
+ 
+ const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
+ const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+@@ -87,6 +87,22 @@ async function grantKeysFor(db: ReturnType<typeof createDb>, companyId: string,
+     .then((rows) => rows.map((row) => row.permissionKey));
+ }
+ 
++async function grantsFor(db: ReturnType<typeof createDb>, companyId: string, principalId: string) {
++  return db
++    .select({
++      permissionKey: principalPermissionGrants.permissionKey,
++      grantedByUserId: principalPermissionGrants.grantedByUserId,
++      grantedViaRole: principalPermissionGrants.grantedViaRole,
++    })
++    .from(principalPermissionGrants)
++    .where(
++      and(
++        eq(principalPermissionGrants.companyId, companyId),
++        eq(principalPermissionGrants.principalId, principalId),
++      ),
++    );
++}
++
+ describeEmbeddedPostgres("access service", () => {
+   let db!: ReturnType<typeof createDb>;
+   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+@@ -305,6 +321,143 @@ describeEmbeddedPostgres("access service", () => {
+     expect(grants).not.toContain("joins:approve");
+   });
+ 
++  it("records the role that produced a grant rather than inferring it from a null grantor", async () => {
++    const { company } = await createCompanyWithOwner(db);
++    const access = accessService(db);
++    const member = await createMember(db, company.id, "operator");
++
++    await access.updateMember(company.id, member.id, { membershipRole: "owner" });
++
++    const rows = await grantsFor(db, company.id, member.principalId);
++    expect(rows.length).toBeGreaterThan(0);
++    for (const row of rows) {
++      // Every owner default names the role that produced it. This is the fact the
++      // prune reads; the old `granted_by_user_id IS NULL` guess was wrong because
++      // board-claim, company-create and company-clone stamped role defaults with
++      // the owner's own id.
++      expect(row.grantedViaRole).toBe("owner");
++      expect(row.grantedByUserId).toBeNull();
++    }
++
++    await access.setPrincipalPermission(
++      company.id,
++      "user",
++      member.principalId,
++      "tools:admin",
++      true,
++      `grantor-${randomUUID()}`,
++    );
++
++    const explicit = await grantsFor(db, company.id, member.principalId);
++    expect(explicit.find((row) => row.permissionKey === "tools:admin")?.grantedViaRole).toBeNull();
++  });
++
++  it("keeps a grant a human made on purpose even when the same permission is a role default", async () => {
++    // This is the case the old schema could not decide. `users:manage_permissions`
++    // is an owner default, and an owner was also granted it by hand. One row, two
++    // valid readings, and `granted_by_user_id` identical either way.
++    //
++    // The marker resolves it because the writer knows which list a key came from:
++    // supplied by the caller means deliberate, contributed by the role means
++    // derived. The caller's list wins, so a demotion must not revoke it.
++    const { company, owner } = await createCompanyWithOwner(db);
++    const access = accessService(db);
++    const member = await createMember(db, company.id, "owner");
++
++    const grantor = `grantor-${randomUUID()}`;
++    await access.setMemberPermissions(
++      company.id,
++      member.id,
++      // Only this one key is hand-granted. `joins:approve` is left out on
++      // purpose so it arrives only through the owner role and is therefore
++      // role-derived -- the two rows differ solely in provenance.
++      [{ permissionKey: "users:manage_permissions" }],
++      grantor,
++    );
++
++    const beforeDemotion = await grantsFor(db, company.id, member.principalId);
++    // Named by the caller, so recorded as deliberate even though the owner role
++    // implies it too.
++    expect(beforeDemotion.find((r) => r.permissionKey === "users:manage_permissions")?.grantedViaRole)
++      .toBeNull();
++    // Never named by the caller, so recorded as role-derived.
++    const roleDerived = beforeDemotion.filter((row) => row.grantedViaRole === "owner");
++    expect(roleDerived.map((row) => row.permissionKey)).toContain("joins:approve");
++    expect(roleDerived.some((row) => row.permissionKey === "users:manage_permissions")).toBe(false);
++
++    // A second owner, so the last-owner guard does not block the demotion.
++    await createMember(db, company.id, "owner");
++    await access.updateMember(company.id, member.id, { membershipRole: "operator" });
++
++    const grants = await grantKeysFor(db, company.id, member.principalId);
++    // The hand-made grant survives the demotion that removed the role implying it.
++    expect(grants).toContain("users:manage_permissions");
++    // The purely role-derived one is withdrawn -- this is the escalation the
++    // demotion has to close.
++    expect(grants).not.toContain("joins:approve");
++    // Exactly the operator defaults plus that one deliberate grant. Nothing else
++    // leaked through, and nothing the operator role implies was lost.
++    expect(grants.sort()).toEqual(
++      [
++        ...grantsForHumanRole("operator").map((g) => g.permissionKey),
++        "users:manage_permissions",
++      ].sort(),
++    );
++    expect(owner.principalId).toBeTruthy();
++  });
++
++  it("lists the rows whose provenance cannot be recovered so the backfill policy can be chosen from data", async () => {
++    const { company } = await createCompanyWithOwner(db);
++    const access = accessService(db);
++    const member = await createMember(db, company.id, "operator");
++
++    await access.updateMember(company.id, member.id, { membershipRole: "owner" });
++    await access.updateMember(company.id, member.id, { membershipRole: "operator" });
++
++    // Every row now written carries provenance, so nothing is left ambiguous.
++    const report = await countUndecidableRoleDefaultGrants(db);
++    expect(report.rows.some((row) => row.principalId === member.principalId)).toBe(false);
++
++    // A row from before the column existed: no marker, and its key is a current
++    // role default, so both readings are valid and no query can separate them.
++    const staleKey = grantsForHumanRole("operator")[0]!.permissionKey;
++    const legacyPrincipalId = `legacy-${randomUUID()}`;
++    await db.insert(companyMemberships).values({
++      companyId: company.id,
++      principalType: "user",
++      principalId: legacyPrincipalId,
++      status: "active",
++      membershipRole: "operator",
++    });
++    await db.insert(principalPermissionGrants).values({
++      companyId: company.id,
++      principalType: "user",
++      principalId: legacyPrincipalId,
++      permissionKey: staleKey,
++      grantedByUserId: `grantor-${randomUUID()}`,
++      grantedViaRole: null,
++    });
++
++    const after = await countUndecidableRoleDefaultGrants(db);
++    const reported = after.rows.filter((row) => row.principalId === legacyPrincipalId);
++    expect(reported).toHaveLength(1);
++    expect(reported[0]!.permissionKey).toBe(staleKey);
++    expect(after.total).toBe(reported.length);
++
++    // A key that is not a role default was never seeded by anything, so it is
++    // not ambiguous and must not be reported.
++    await db.insert(principalPermissionGrants).values({
++      companyId: company.id,
++      principalType: "user",
++      principalId: legacyPrincipalId,
++      permissionKey: "users:manage_permissions",
++      grantedByUserId: `grantor-${randomUUID()}`,
++      grantedViaRole: null,
++    });
++    const final = await countUndecidableRoleDefaultGrants(db);
++    expect(final.rows.filter((row) => row.principalId === legacyPrincipalId)).toHaveLength(1);
++  });
++
+   it("does not rewrite agent principal grants, which have no role defaults", async () => {
+     const { company } = await createCompanyWithOwner(db);
+     const access = accessService(db);
+@@ -327,8 +480,7 @@ describeEmbeddedPostgres("access service", () => {
+       null,
+     );
+ 
+-    expect(await grantKeysFor(db, company.id, agent.principalId)).toEqual(["tasks:assign"]);
+-  });
++    expect(await grantKeysFor(db, company.id, agent.principalId)).toEqual(["tasks:assign"]);  });
+ 
+   it("archives members, clears grants, and reassigns open issues without deleting history", async () => {
+     const { company, owner } = await createCompanyWithOwner(db);
+diff --git a/server/src/services/access.ts b/server/src/services/access.ts
+index 79bd5c4f..e73debc2 100644
+--- a/server/src/services/access.ts
++++ b/server/src/services/access.ts
+@@ -460,7 +460,7 @@ export function accessService(db: Db) {
+     const member = await getMemberById(companyId, memberId);
+     if (!member) return null;
+ 
+-    const effectiveGrants = mergeRoleDefaultGrants({
++    const effective = mergeRoleDefaultGrants({
+       principalType: member.principalType,
+       membershipRole: member.membershipRole,
+       grants,
+@@ -476,15 +476,21 @@ export function accessService(db: Db) {
+             eq(principalPermissionGrants.principalId, member.principalId),
+           ),
+         );
+-      if (effectiveGrants.length > 0) {
++      if (effective.grants.length > 0) {
+         await tx.insert(principalPermissionGrants).values(
+-          effectiveGrants.map((grant) => ({
++          effective.grants.map((grant) => ({
+             companyId,
+             principalType: member.principalType,
+             principalId: member.principalId,
+             permissionKey: grant.permissionKey,
+             scope: grant.scope ?? null,
+             grantedByUserId,
++            // Only the keys the caller did not supply came from the role. A key
++            // the caller listed is a deliberate grant even when the role also
++            // implies it, and must survive a later demotion.
++            grantedViaRole: effective.roleDefaultKeys.has(grant.permissionKey)
++              ? normalizeHumanRole(member.membershipRole, "operator")
++              : null,
+             createdAt: new Date(),
+             updatedAt: new Date(),
+           })),
+@@ -575,21 +581,28 @@ export function accessService(db: Db) {
+             eq(principalPermissionGrants.principalId, existing.principalId),
+           ),
+         );
+-      const effectiveGrants = mergeRoleDefaultGrants({
++      const effective = mergeRoleDefaultGrants({
+         principalType: existing.principalType,
+         membershipRole: nextMembershipRole,
+         grants: data.grants,
+       });
+ 
+-      if (effectiveGrants.length > 0) {
++      if (effective.grants.length > 0) {
+         await tx.insert(principalPermissionGrants).values(
+-          effectiveGrants.map((grant) => ({
++          effective.grants.map((grant) => ({
+             companyId,
+             principalType: existing.principalType,
+             principalId: existing.principalId,
+             permissionKey: grant.permissionKey,
+             scope: grant.scope ?? null,
+             grantedByUserId,
++            // This path replaces every grant row, so it is the one place where
++            // provenance has to be re-derived rather than preserved. Keys the
++            // caller supplied are deliberate; keys the role contributed are
++            // marked with the role so a later demotion can withdraw them.
++            grantedViaRole: effective.roleDefaultKeys.has(grant.permissionKey)
++              ? normalizeHumanRole(nextMembershipRole, "operator")
++              : null,
+             createdAt: now,
+             updatedAt: now,
+           })),
+@@ -949,6 +962,10 @@ export function accessService(db: Db) {
+           permissionKey: grant.permissionKey,
+           scope: grant.scope ?? null,
+           grantedByUserId,
++          // Every key here was supplied by the caller. A plugin or an agent
++          // setting a grant is naming it deliberately; nothing about this list is
++          // implied by a role, so nothing is role-derived.
++          grantedViaRole: null,
+           createdAt: new Date(),
+           updatedAt: new Date(),
+         })),
+@@ -1052,6 +1069,11 @@ export function accessService(db: Db) {
+         .set({
+           scope,
+           grantedByUserId,
++          // Naming a permission here is a deliberate act, so the row stops being
++          // role-derived even if the role also implies it. Leaving a role marker
++          // on a row somebody just granted by hand would let the next demotion
++          // revoke a grant they made on purpose.
++          grantedViaRole: null,
+           updatedAt: new Date(),
+         })
+         .where(eq(principalPermissionGrants.id, existing.id));
+@@ -1065,6 +1087,8 @@ export function accessService(db: Db) {
+       permissionKey,
+       scope,
+       grantedByUserId,
++      // Explicitly enabled, so deliberately granted rather than role-implied.
++      grantedViaRole: null,
+       createdAt: new Date(),
+       updatedAt: new Date(),
+     });
+@@ -1165,6 +1189,7 @@ export function accessService(db: Db) {
+           principalId: existing.principalId,
+           grants: grantsForHumanRole(normalizeHumanRole(nextMembershipRole, "operator")),
+           grantedByUserId: null,
++          grantedViaRole: normalizeHumanRole(nextMembershipRole, "operator"),
+         });
+       }
+ 
+diff --git a/server/src/services/company-member-roles.ts b/server/src/services/company-member-roles.ts
+index 028207c2..511d4c2d 100644
+--- a/server/src/services/company-member-roles.ts
++++ b/server/src/services/company-member-roles.ts
+@@ -81,6 +81,21 @@ type RoleGrant = {
+   scope?: Record<string, unknown> | null;
+ };
+ 
++export type RoleDefaultMerge<T extends RoleGrant> = {
++  /** Every grant to persist, role defaults included. */
++  grants: T[];
++  /**
++   * Permission keys this function appended because the role implies them, as
++   * opposed to keys the caller supplied.
++   *
++   * The caller needs the distinction to record provenance. A permission the
++   * caller supplied was granted deliberately and must survive a later demotion;
++   * one appended here exists only because of the role and must be withdrawn when
++   * the role no longer implies it.
++   */
++  roleDefaultKeys: Set<string>;
++};
++
+ /**
+  * Role-derived permissions are materialized as ordinary grant rows, so any writer
+  * that replaces a principal's grants must re-apply the role defaults or it will
+@@ -88,25 +103,37 @@ type RoleGrant = {
+  * add to the role defaults, never remove them.
+  *
+  * Agent principals have no role defaults: their grants are set explicitly.
++ *
++ * A key present in both `grants` and the role defaults counts as supplied, not
++ * role-default. The caller's list is the statement of what somebody meant to
++ * hold, so it wins: marking that row role-derived would let a demotion silently
++ * revoke a grant a person made on purpose.
+  */
+ export function mergeRoleDefaultGrants<T extends RoleGrant>(input: {
+   principalType: string;
+   membershipRole: string | null | undefined;
+   grants: T[];
+-}): T[] {
+-  if (input.principalType !== "user") return input.grants;
++}): RoleDefaultMerge<T> {
++  const supplied = [...input.grants];
++  if (input.principalType !== "user") {
++    return { grants: supplied, roleDefaultKeys: new Set() };
++  }
+ 
+   const defaults = grantsForHumanRole(normalizeHumanRole(input.membershipRole, "operator"));
+-  if (defaults.length === 0) return input.grants;
++  if (defaults.length === 0) {
++    return { grants: supplied, roleDefaultKeys: new Set() };
++  }
+ 
+-  const merged = [...input.grants];
+-  const seen = new Set(input.grants.map((grant) => grant.permissionKey));
++  const merged = [...supplied];
++  const roleDefaultKeys = new Set<string>();
++  const seen = new Set(supplied.map((grant) => grant.permissionKey));
+   for (const roleGrant of defaults) {
+     if (seen.has(roleGrant.permissionKey)) continue;
+     seen.add(roleGrant.permissionKey);
++    roleDefaultKeys.add(roleGrant.permissionKey);
+     merged.push({ permissionKey: roleGrant.permissionKey, scope: roleGrant.scope } as T);
+   }
+-  return merged;
++  return { grants: merged, roleDefaultKeys };
+ }
+ 
+ export function resolveHumanInviteRole(
+diff --git a/server/src/services/index.ts b/server/src/services/index.ts
+index a007837a..4e4eb87d 100644
+--- a/server/src/services/index.ts
++++ b/server/src/services/index.ts
+@@ -122,9 +122,11 @@ export { inboxDismissalService } from "./inbox-dismissals.js";
+ export { accessService } from "./access.js";
+ export {
+   backfillPrincipalAccessCompatibility,
++  countUndecidableRoleDefaultGrants,
+   ensureHumanRoleDefaultGrants,
+   insertMissingPrincipalGrants,
+   type PrincipalAccessCompatibilityBackfillStats,
++  type UndecidableRoleDefaultGrant,
+ } from "./principal-access-compatibility.js";
+ export { authorizationService } from "./authorization.js";
+ export { inboxAgentPolicyService } from "./inbox-agent-policy.js";
+diff --git a/server/src/services/principal-access-compatibility.ts b/server/src/services/principal-access-compatibility.ts
+index 3f722e45..097e1027 100644
+--- a/server/src/services/principal-access-compatibility.ts
++++ b/server/src/services/principal-access-compatibility.ts
+@@ -4,6 +4,13 @@ import { agents, companyMemberships, principalPermissionGrants } from "@papercli
+ import type { PermissionKey, PrincipalType } from "@paperclipai/shared";
+ import { grantsForHumanRole, normalizeHumanRole } from "./company-member-roles.js";
+ 
++/**
++ * Roles enumerated for provenance analysis. A null membership role normalizes to
++ * "operator" elsewhere; enumerating it explicitly keeps the backfill report from
++ * depending on that fallback.
++ */
++const HUMAN_MEMBERSHIP_ROLES_FOR_PROVENANCE = ["owner", "admin", "operator", "viewer"] as const;
++
+ type GrantInput = {
+   permissionKey: PermissionKey;
+   scope?: Record<string, unknown> | null;
+@@ -22,6 +29,12 @@ export async function insertMissingPrincipalGrants(
+     principalId: string;
+     grants: GrantInput[];
+     grantedByUserId: string | null;
++    /**
++     * The membership role that implied these grants, or null when they were
++     * granted deliberately. Required rather than optional so no caller can leave
++     * provenance unset by omission.
++     */
++    grantedViaRole: string | null;
+   },
+ ): Promise<number> {
+   if (input.grants.length === 0) return 0;
+@@ -37,6 +50,7 @@ export async function insertMissingPrincipalGrants(
+         permissionKey: grant.permissionKey,
+         scope: grant.scope ?? null,
+         grantedByUserId: input.grantedByUserId,
++        grantedViaRole: input.grantedViaRole,
+         createdAt: now,
+         updatedAt: now,
+       })),
+@@ -55,19 +69,17 @@ export async function insertMissingPrincipalGrants(
+ }
+ 
+ /**
+- * Seed the defaults a membership role implies.
++ * Seed the defaults a membership role implies, tagged with that role.
+  *
+- * Role defaults are always recorded with no granting human. That is what makes
+- * `granted_by_user_id IS NULL` a usable provenance signal: it separates a row the
+- * role produced from a permission somebody granted on purpose, and
+- * `pruneSupersededRoleDefaultGrants` depends on the two being distinguishable.
++ * `grantedViaRole` is what makes a role default distinguishable from a
++ * deliberate grant. `grantedByUserId` cannot: three paths seeded owner defaults
++ * while stamping the owner's own id (board-claim, company-create,
++ * company-clone), so those rows were indistinguishable from explicit grants and
++ * a demotion kept `users:manage_permissions` for exactly the principals most
++ * likely to hold it.
+  *
+- * This parameter is deliberately absent rather than merely ignored. Accepting a
+- * granting human here is what let board-claim, company-create and company-clone
+- * owners seed owner defaults stamped with their own id, which made those rows
+- * indistinguishable from explicit grants and let a later demotion keep
+- * `users:manage_permissions`. Removing it makes that mistake a compile error
+- * instead of a silent escalation path.
++ * No granting human is accepted here, and the role is passed separately rather
++ * than inferred. Reintroducing either mistake is now a type error.
+  */
+ export async function ensureHumanRoleDefaultGrants(
+   db: Db,
+@@ -84,6 +96,7 @@ export async function ensureHumanRoleDefaultGrants(
+     principalId: input.principalId,
+     grants: grantsForHumanRole(role),
+     grantedByUserId: null,
++    grantedViaRole: role,
+   });
+ }
+ 
+@@ -95,14 +108,22 @@ export async function ensureHumanRoleDefaultGrants(
+  * self-escalation primitive: the demoted member can re-grant themselves exactly
+  * what the demotion removed.
+  *
+- * Only rows with no granting human are removed. Role defaults are seeded without
+- * one, so `granted_by_user_id IS NULL` is the provenance signal available in the
+- * current schema; a permission a human granted deliberately carries that human's
+- * id and survives the demotion.
++ * Only rows whose `grantedViaRole` names the previous role are removed. That
++ * marker is written at insert time by every path that materializes a role
++ * default, so the predicate is a fact rather than an inference:
++ *
++ * - a deliberate grant carries a null marker and survives the demotion;
++ * - a row seeded by the previous role names that role and is withdrawn.
+  *
+- * The residual: rows seeded as role defaults by a caller that recorded a granting
+- * human, and rows whose provenance predates that convention, are not recognized as
+- * role-derived and survive. Closing that needs a provenance column on the table.
++ * The earlier `granted_by_user_id IS NULL` predicate was an inference and was
++ * wrong in both directions. It missed role defaults seeded with a grantor, and
++ * it would have withdrawn deliberate grants recorded with a null grantor.
++ *
++ * Rows written before the column existed carry a null marker and are therefore
++ * treated as deliberate, which preserves them. That is the same posture the old
++ * code took for the common case, and it is why the backfill policy for those
++ * rows is a decision rather than a mechanical detail -- see
++ * `countUndecidableRoleDefaultGrants`.
+  */
+ export async function pruneSupersededRoleDefaultGrants(
+   db: Db,
+@@ -113,14 +134,13 @@ export async function pruneSupersededRoleDefaultGrants(
+     nextMembershipRole: string | null | undefined;
+   },
+ ): Promise<number> {
++  const previousRole = normalizeHumanRole(input.previousMembershipRole, "operator");
+   const nextKeys = new Set(
+     grantsForHumanRole(normalizeHumanRole(input.nextMembershipRole, "operator")).map(
+       (grant) => grant.permissionKey,
+     ),
+   );
+-  const supersededKeys = grantsForHumanRole(
+-    normalizeHumanRole(input.previousMembershipRole, "operator"),
+-  )
++  const supersededKeys = grantsForHumanRole(previousRole)
+     .map((grant) => grant.permissionKey)
+     .filter((permissionKey) => !nextKeys.has(permissionKey));
+ 
+@@ -133,7 +153,7 @@ export async function pruneSupersededRoleDefaultGrants(
+         eq(principalPermissionGrants.companyId, input.companyId),
+         eq(principalPermissionGrants.principalType, "user"),
+         eq(principalPermissionGrants.principalId, input.principalId),
+-        isNull(principalPermissionGrants.grantedByUserId),
++        eq(principalPermissionGrants.grantedViaRole, previousRole),
+         inArray(principalPermissionGrants.permissionKey, supersededKeys),
+       ),
+     )
+@@ -142,6 +162,73 @@ export async function pruneSupersededRoleDefaultGrants(
+   return removed.length;
+ }
+ 
++export type UndecidableRoleDefaultGrant = {
++  companyId: string;
++  principalId: string;
++  membershipRole: string | null;
++  permissionKey: string;
++  grantedByUserId: string | null;
++};
++
++/**
++ * Rows whose provenance the schema cannot recover.
++ *
++ * A row written before `granted_via_role` existed, whose `permission_key` is a
++ * default of the principal's current role, satisfies both readings at once: the
++ * role may have seeded it, or somebody may have granted it deliberately. No
++ * query resolves it, so the only honest options are to pick a policy for the
++ * whole class or to leave the rows alone and preserve them.
++ *
++ * This returns the class so the policy can be chosen against a real count and a
++ * real list rather than an assumption about how many rows are affected.
++ *
++ * Rows whose permission key is *not* a role default are not ambiguous: nothing
++ * seeded them, so they are deliberate and are excluded.
++ */
++export async function countUndecidableRoleDefaultGrants(
++  db: Db,
++): Promise<{ total: number; rows: UndecidableRoleDefaultGrant[] }> {
++  const rows = await db
++    .select({
++      companyId: principalPermissionGrants.companyId,
++      principalId: principalPermissionGrants.principalId,
++      permissionKey: principalPermissionGrants.permissionKey,
++      grantedByUserId: principalPermissionGrants.grantedByUserId,
++      membershipRole: companyMemberships.membershipRole,
++    })
++    .from(principalPermissionGrants)
++    .innerJoin(
++      companyMemberships,
++      and(
++        eq(companyMemberships.companyId, principalPermissionGrants.companyId),
++        eq(companyMemberships.principalType, principalPermissionGrants.principalType),
++        eq(companyMemberships.principalId, principalPermissionGrants.principalId),
++      ),
++    )
++    .where(
++      and(
++        eq(principalPermissionGrants.principalType, "user"),
++        isNull(principalPermissionGrants.grantedViaRole),
++      ),
++    );
++
++  const roleDefaultKeysByRole = new Map<string, Set<string>>(
++    HUMAN_MEMBERSHIP_ROLES_FOR_PROVENANCE.map((role) => [
++      role,
++      new Set(grantsForHumanRole(role).map((grant) => grant.permissionKey)),
++    ]),
++  );
++
++  const undecidable = rows.filter((row) => {
++    const keys = roleDefaultKeysByRole.get(
++      normalizeHumanRole(row.membershipRole, "operator"),
++    );
++    return keys?.has(row.permissionKey) ?? false;
++  });
++
++  return { total: undecidable.length, rows: undecidable };
++}
++
+ export async function backfillPrincipalAccessCompatibility(
+   db: Db,
+ ): Promise<PrincipalAccessCompatibilityBackfillStats> {
+diff --git a/ui/src/api/access.ts b/ui/src/api/access.ts
+index 35c76898..1507cc0e 100644
+--- a/ui/src/api/access.ts
++++ b/ui/src/api/access.ts
+@@ -110,6 +110,13 @@ export type CompanyMemberGrant = {
+   permissionKey: PermissionKey;
+   scope: Record<string, unknown> | null;
+   grantedByUserId: string | null;
++  /**
++   * The membership role that implied this grant, or null when it was granted
++   * deliberately. The permissions UI must not present a role-derived grant as
++   * removable: revoking it by hand does not survive the next role change, and
++   * the member silently regains it.
++   */
++  grantedViaRole: string | null;
+   createdAt: string;
+   updatedAt: string;
+ };
+-- 
+2.47.3
+
+
+From 8bd7335d4a29e13a7fc6696215c267bb49eac849 Mon Sep 17 00:00:00 2001
+From: jjude80 <18168364+jjude80@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 01:29:22 +0000
+Subject: [PATCH 6/9] NEXA-194: Add idempotency key and actor auth source to
+ /heartbeat/invoke endpoint
+
+- Accept and honor idempotencyKey on POST /agents/:id/heartbeat/invoke for coalescing parity with /wakeup
+- Record actorAuthSource and peerAddress on wakeup requests for attribution
+- Add actor_auth_source and peer_address columns to agent_wakeup_requests table
+- Add tests verifying idempotency coalescing and auth source recording
+---
+ .../db/src/schema/agent_wakeup_requests.ts    |   2 +
+ ...eat-invoke-idempotency-auth-source.test.ts | 208 ++++++++++++++++++
+ server/src/routes/agents.ts                   |  16 ++
+ .../chat-inbound-wakeup-publications.test.ts  |   2 +
+ server/src/services/heartbeat.ts              |  58 +++++
+ 5 files changed, 286 insertions(+)
+ create mode 100644 server/src/__tests__/heartbeat-invoke-idempotency-auth-source.test.ts
+
+diff --git a/packages/db/src/schema/agent_wakeup_requests.ts b/packages/db/src/schema/agent_wakeup_requests.ts
+index 0537bf6e..f228edc9 100644
+--- a/packages/db/src/schema/agent_wakeup_requests.ts
++++ b/packages/db/src/schema/agent_wakeup_requests.ts
+@@ -30,6 +30,8 @@ export const agentWakeupRequests = pgTable(
+     coalescedCount: integer("coalesced_count").notNull().default(0),
+     requestedByActorType: text("requested_by_actor_type"),
+     requestedByActorId: text("requested_by_actor_id"),
++    actorAuthSource: text("actor_auth_source"),
++    peerAddress: text("peer_address"),
+     idempotencyKey: text("idempotency_key"),
+     runId: uuid("run_id"),
+     requestedAt: timestamp("requested_at", { withTimezone: true })
+diff --git a/server/src/__tests__/heartbeat-invoke-idempotency-auth-source.test.ts b/server/src/__tests__/heartbeat-invoke-idempotency-auth-source.test.ts
+new file mode 100644
+index 00000000..2f012650
+--- /dev/null
++++ b/server/src/__tests__/heartbeat-invoke-idempotency-auth-source.test.ts
+@@ -0,0 +1,208 @@
++import { randomUUID } from "node:crypto";
++import { and, eq } from "drizzle-orm";
++import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
++import request from "supertest";
++import {
++  agentWakeupRequests,
++  companies,
++  companyMemberships,
++  createDb,
++  agents,
++  heartbeatRuns,
++  heartbeatRunEvents,
++  costEvents,
++  agentRuntimeState,
++  activityLog,
++} from "@paperclipai/db";
++import {
++  getEmbeddedPostgresTestSupport,
++  startEmbeddedPostgresTestDatabase,
++} from "./helpers/embedded-postgres.js";
++import { heartbeatService } from "../services/heartbeat.js";
++import { runningProcesses } from "../adapters/index.js";
++import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
++import { routeApp, seedCompanyWithBoardAccess, resetCompanyIssueFixtures } from "./helpers/route-test-harness.js";
++
++const mockAdapterExecute = vi.hoisted(() =>
++  vi.fn(async () => ({
++    exitCode: 0,
++    signal: null,
++    timedOut: false,
++    errorMessage: null,
++    summary: "Test run.",
++    provider: "test",
++    model: "test-model",
++  })),
++);
++
++vi.mock("../adapters/index.ts", async () => {
++  const actual = await vi.importActual<typeof import("../adapters/index.ts")>("../adapters/index.ts");
++  return {
++    ...actual,
++    getServerAdapter: vi.fn(() => ({
++      supportsLocalAgentJwt: false,
++      execute: mockAdapterExecute,
++    })),
++  };
++});
++
++const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
++const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
++
++async function waitForRun(db: ReturnType<typeof createDb>, runId: string) {
++  for (let attempt = 0; attempt < 80; attempt += 1) {
++    const run = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then((rows) => rows[0] ?? null);
++    if (run && run.status !== "queued" && run.status !== "running") return run;
++    await new Promise((resolve) => setTimeout(resolve, 50));
++  }
++  return db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then((rows) => rows[0] ?? null);
++}
++
++async function deleteHeartbeatRunsAfterEvents(db: ReturnType<typeof createDb>) {
++  for (let attempt = 0; attempt < 5; attempt += 1) {
++    await db.delete(heartbeatRunEvents);
++    try {
++      await db.delete(costEvents);
++      await db.delete(heartbeatRuns);
++      return;
++    } catch (error) {
++      const message = error instanceof Error ? error.message : String(error);
++      if (
++        attempt < 4 &&
++        message.includes("heartbeat_run_events_run_id_heartbeat_runs_id_fk")
++      ) {
++        await new Promise((resolve) => setTimeout(resolve, 50));
++        continue;
++      }
++      throw error;
++    }
++  }
++}
++
++describeEmbeddedPostgres("POST /agents/:id/heartbeat/invoke idempotency and auth source", () => {
++  let db!: ReturnType<typeof createDb>;
++  let heartbeat!: ReturnType<typeof heartbeatService>;
++  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
++  let seeded: Awaited<ReturnType<typeof seedCompanyWithBoardAccess>>;
++  let agentId: string;
++
++  beforeAll(async () => {
++    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-invoke-test-");
++    db = createDb(tempDb.connectionString);
++    heartbeat = heartbeatService(db);
++    seeded = await seedCompanyWithBoardAccess(db, "Test Company");
++    agentId = randomUUID();
++    await db.insert(agents).values({
++      id: agentId,
++      companyId: seeded.companyId,
++      name: "TestAgent",
++      role: "engineer",
++      status: "active",
++      adapterType: "codex_local",
++      adapterConfig: {},
++      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
++      permissions: {},
++    });
++  }, 20_000);
++
++  afterEach(async () => {
++    mockAdapterExecute.mockClear();
++    runningProcesses.clear();
++    await drainHeartbeatRunsToQuiescence(db, heartbeat);
++    await db.delete(activityLog);
++    await deleteHeartbeatRunsAfterEvents(db);
++    await db.delete(agentWakeupRequests);
++    await db.delete(agentRuntimeState).where(eq(agentRuntimeState.agentId, agentId));
++  });
++
++  afterAll(async () => {
++    await db.delete(agentRuntimeState).where(eq(agentRuntimeState.agentId, agentId));
++    await db.delete(agents).where(eq(agents.id, agentId));
++    await resetCompanyIssueFixtures(db);
++    await tempDb?.cleanup();
++  }, 60_000);
++
++  let agentRoutes: ReturnType<typeof import("../routes/agents.js").agentRoutes>;
++
++  beforeAll(async () => {
++    const mod = await import("../routes/agents.js");
++    agentRoutes = mod.agentRoutes(db);
++  });
++
++  function makeApp(actorSource: "session" | "board_key" = "session") {
++    const actor = { ...seeded.actor, source: actorSource };
++    return routeApp(db, actor, () => agentRoutes);
++  }
++
++  it("accepts idempotencyKey and coalesces concurrent requests into one run", async () => {
++    const app = makeApp("session");
++    const idempotencyKey = `test-idempotency-${randomUUID()}`;
++    const N = 5;
++
++    const promises = Array.from({ length: N }, () =>
++      request(app)
++        .post(`/api/agents/${agentId}/heartbeat/invoke`)
++        .send({ idempotencyKey })
++    );
++
++    const responses = await Promise.all(promises);
++    const runIds = responses.map((r) => r.body.id).filter(Boolean);
++    const uniqueRunIds = new Set(runIds);
++
++    expect(uniqueRunIds.size).toBe(1);
++    expect(runIds.length).toBe(N);
++
++    const [wakeup] = await db
++      .select()
++      .from(agentWakeupRequests)
++      .where(eq(agentWakeupRequests.idempotencyKey, idempotencyKey));
++    expect(wakeup).toBeDefined();
++    expect(wakeup.idempotencyKey).toBe(idempotencyKey);
++  });
++
++  it("records actor auth source as 'session' for session-authenticated requests", async () => {
++    const app = makeApp("session");
++    const idempotencyKey = `test-auth-source-session-${randomUUID()}`;
++
++    const response = await request(app)
++      .post(`/api/agents/${agentId}/heartbeat/invoke`)
++      .send({ idempotencyKey });
++
++    expect(response.status).toBe(202);
++    const run = response.body;
++    expect(run.id).toBeDefined();
++
++    const [wakeup] = await db
++      .select()
++      .from(agentWakeupRequests)
++      .where(eq(agentWakeupRequests.idempotencyKey, idempotencyKey));
++    expect(wakeup).toBeDefined();
++    expect(wakeup.requestedByActorType).toBe("user");
++    expect(wakeup.requestedByActorId).toBe(seeded.actor.userId);
++    expect(wakeup.actorAuthSource).toBe("session");
++    expect(wakeup.peerAddress).toBeDefined();
++  });
++
++  it("records actor auth source as 'board_key' for board-key-authenticated requests", async () => {
++    const app = makeApp("board_key");
++    const idempotencyKey = `test-auth-source-boardkey-${randomUUID()}`;
++
++    const response = await request(app)
++      .post(`/api/agents/${agentId}/heartbeat/invoke`)
++      .send({ idempotencyKey });
++
++    expect(response.status).toBe(202);
++    const run = response.body;
++    expect(run.id).toBeDefined();
++
++    const [wakeup] = await db
++      .select()
++      .from(agentWakeupRequests)
++      .where(eq(agentWakeupRequests.idempotencyKey, idempotencyKey));
++    expect(wakeup).toBeDefined();
++    expect(wakeup.requestedByActorType).toBe("user");
++    expect(wakeup.requestedByActorId).toBe(seeded.actor.userId);
++    expect(wakeup.actorAuthSource).toBe("board_key");
++    expect(wakeup.peerAddress).toBeDefined();
++  });
++});
+\ No newline at end of file
+diff --git a/server/src/routes/agents.ts b/server/src/routes/agents.ts
+index 96bba275..96e35c4c 100644
+--- a/server/src/routes/agents.ts
++++ b/server/src/routes/agents.ts
+@@ -6334,6 +6334,12 @@ export function agentRoutes(
+         ),
+       );
+     }
++    const peerAddress = ((): string | null => {
++      const forwarded = req.headers["x-forwarded-for"];
++      if (typeof forwarded === "string") return forwarded.split(",")[0].trim();
++      if (Array.isArray(forwarded) && forwarded.length > 0) return forwarded[0].trim();
++      return req.ip ?? null;
++    })();
+     const run = await heartbeat.wakeup(id, {
+       failedRunId: req.body.failedRunId ?? null,
+       ...(req.actor.type === "board" && !req.body.failedRunId ? { manualUserWake: true } : {}),
+@@ -6346,6 +6352,8 @@ export function agentRoutes(
+       idempotencyKey: req.body.idempotencyKey ?? null,
+       requestedByActorType: req.actor.type === "agent" ? "agent" : "user",
+       requestedByActorId: req.actor.type === "agent" ? req.actor.agentId ?? null : req.actor.userId ?? null,
++      actorAuthSource: req.actor.source,
++      peerAddress,
+       contextSnapshot: {
+         ...retryConversationContext,
+         // Only the selected server-owned run can carry review authority into
+@@ -6473,12 +6481,20 @@ export function agentRoutes(
+         contextSnapshot.resumeIntent = true;
+       }
+     }
++    const peerAddress = ((): string | null => {
++      const forwarded = req.headers["x-forwarded-for"];
++      if (typeof forwarded === "string") return forwarded.split(",")[0].trim();
++      if (Array.isArray(forwarded) && forwarded.length > 0) return forwarded[0].trim();
++      return req.ip ?? null;
++    })();
+     const wakeOpts: Parameters<typeof heartbeat.wakeup>[1] = {
+       ...(req.actor.type === "board" ? { manualUserWake: true } : {}),
+       source: "on_demand",
+       triggerDetail: typeof body.triggerDetail === "string" ? body.triggerDetail as "manual" | "system" | "ping" | "callback" : "manual",
+       requestedByActorType: req.actor.type === "agent" ? "agent" : "user",
+       requestedByActorId: req.actor.type === "agent" ? req.actor.agentId ?? null : req.actor.userId ?? null,
++      actorAuthSource: req.actor.source,
++      peerAddress,
+       contextSnapshot,
+     };
+     if (typeof body.reason === "string" && body.reason.length > 0) {
+diff --git a/server/src/services/chat-inbound-wakeup-publications.test.ts b/server/src/services/chat-inbound-wakeup-publications.test.ts
+index d163eeef..4fbf01a0 100644
+--- a/server/src/services/chat-inbound-wakeup-publications.test.ts
++++ b/server/src/services/chat-inbound-wakeup-publications.test.ts
+@@ -59,6 +59,8 @@ function fixture() {
+     runId: null,
+     requestedByActorType: "user",
+     requestedByActorId: "owner",
++    actorAuthSource: "session",
++    peerAddress: "127.0.0.1",
+     idempotencyKey: trusted.idempotencyKey,
+     coalescedCount: 0,
+     requestedAt: new Date(),
+diff --git a/server/src/services/heartbeat.ts b/server/src/services/heartbeat.ts
+index f406b9de..53cc36c1 100644
+--- a/server/src/services/heartbeat.ts
++++ b/server/src/services/heartbeat.ts
+@@ -3781,6 +3781,8 @@ interface WakeupOptions {
+   idempotencyKey?: string | null;
+   requestedByActorType?: "user" | "agent" | "system";
+   requestedByActorId?: string | null;
++  actorAuthSource?: string;
++  peerAddress?: string | null;
+   contextSnapshot?: Record<string, unknown>;
+   issueStateGuard?: {
+     statuses: string[];
+@@ -27300,6 +27302,8 @@ export function heartbeatService(
+         status: "skipped",
+         requestedByActorType: opts.requestedByActorType ?? null,
+         requestedByActorId: opts.requestedByActorId ?? null,
++        actorAuthSource: opts.actorAuthSource ?? null,
++        peerAddress: opts.peerAddress ?? null,
+         idempotencyKey: opts.idempotencyKey ?? null,
+         finishedAt: new Date(),
+         ...patch,
+@@ -27781,6 +27785,8 @@ export function heartbeatService(
+                   status: "skipped",
+                   requestedByActorType: "system",
+                   requestedByActorId: opts.requestedByActorId ?? null,
++                  actorAuthSource: opts.actorAuthSource ?? null,
++                  peerAddress: opts.peerAddress ?? null,
+                   idempotencyKey: opts.idempotencyKey ?? null,
+                   finishedAt: new Date(),
+                 });
+@@ -27908,6 +27914,8 @@ export function heartbeatService(
+               status: "skipped",
+               requestedByActorType: opts.requestedByActorType ?? null,
+               requestedByActorId: opts.requestedByActorId ?? null,
++              actorAuthSource: opts.actorAuthSource ?? null,
++              peerAddress: opts.peerAddress ?? null,
+               idempotencyKey: opts.idempotencyKey ?? null,
+               finishedAt: new Date(),
+             });
+@@ -27956,6 +27964,8 @@ export function heartbeatService(
+               status: "skipped",
+               requestedByActorType: opts.requestedByActorType ?? null,
+               requestedByActorId: opts.requestedByActorId ?? null,
++              actorAuthSource: opts.actorAuthSource ?? null,
++              peerAddress: opts.peerAddress ?? null,
+               idempotencyKey: opts.idempotencyKey ?? null,
+               finishedAt: new Date(),
+             });
+@@ -28120,6 +28130,8 @@ export function heartbeatService(
+                 status: "deferred_issue_execution",
+                 requestedByActorType: opts.requestedByActorType ?? null,
+                 requestedByActorId: opts.requestedByActorId ?? null,
++                actorAuthSource: opts.actorAuthSource ?? null,
++                peerAddress: opts.peerAddress ?? null,
+                 idempotencyKey: opts.idempotencyKey ?? null,
+               });
+             } else {
+@@ -28133,6 +28145,8 @@ export function heartbeatService(
+                   payload,
+                   requestedByActorType: opts.requestedByActorType ?? null,
+                   requestedByActorId: opts.requestedByActorId ?? null,
++                  actorAuthSource: opts.actorAuthSource ?? null,
++                  peerAddress: opts.peerAddress ?? null,
+                   idempotencyKey: opts.idempotencyKey ?? null,
+                 },
+               });
+@@ -28183,6 +28197,8 @@ export function heartbeatService(
+               status: "skipped",
+               requestedByActorType: opts.requestedByActorType ?? null,
+               requestedByActorId: opts.requestedByActorId ?? null,
++              actorAuthSource: opts.actorAuthSource ?? null,
++              peerAddress: opts.peerAddress ?? null,
+               idempotencyKey: opts.idempotencyKey ?? null,
+               finishedAt: new Date(),
+             });
+@@ -28494,6 +28510,8 @@ export function heartbeatService(
+                 status: "skipped",
+                 requestedByActorType: opts.requestedByActorType ?? null,
+                 requestedByActorId: opts.requestedByActorId ?? null,
++                actorAuthSource: opts.actorAuthSource ?? null,
++                peerAddress: opts.peerAddress ?? null,
+                 idempotencyKey: opts.idempotencyKey ?? null,
+                 finishedAt: new Date(),
+               },
+@@ -28615,6 +28633,8 @@ export function heartbeatService(
+                 status: "skipped",
+                 requestedByActorType: opts.requestedByActorType ?? null,
+                 requestedByActorId: opts.requestedByActorId ?? null,
++                actorAuthSource: opts.actorAuthSource ?? null,
++                peerAddress: opts.peerAddress ?? null,
+                 idempotencyKey: opts.idempotencyKey ?? null,
+                 finishedAt: now,
+               });
+@@ -28826,6 +28846,8 @@ export function heartbeatService(
+                   status: "skipped",
+                   requestedByActorType: opts.requestedByActorType ?? null,
+                   requestedByActorId: opts.requestedByActorId ?? null,
++                  actorAuthSource: opts.actorAuthSource ?? null,
++                  peerAddress: opts.peerAddress ?? null,
+                   idempotencyKey: opts.idempotencyKey ?? null,
+                   finishedAt: throttleNow,
+                 });
+@@ -28866,6 +28888,8 @@ export function heartbeatService(
+               status: "skipped",
+               requestedByActorType: opts.requestedByActorType ?? null,
+               requestedByActorId: opts.requestedByActorId ?? null,
++              actorAuthSource: opts.actorAuthSource ?? null,
++              peerAddress: opts.peerAddress ?? null,
+               idempotencyKey: opts.idempotencyKey ?? null,
+               finishedAt: now,
+             });
+@@ -28909,6 +28933,8 @@ export function heartbeatService(
+               status: "queued",
+               requestedByActorType: opts.requestedByActorType ?? null,
+               requestedByActorId: opts.requestedByActorId ?? null,
++              actorAuthSource: opts.actorAuthSource ?? null,
++              peerAddress: opts.peerAddress ?? null,
+               idempotencyKey: opts.idempotencyKey ?? null,
+             })
+             .returning()
+@@ -29183,6 +29209,8 @@ export function heartbeatService(
+         coalescedCount: 1,
+         requestedByActorType: opts.requestedByActorType ?? null,
+         requestedByActorId: opts.requestedByActorId ?? null,
++        actorAuthSource: opts.actorAuthSource ?? null,
++        peerAddress: opts.peerAddress ?? null,
+         idempotencyKey: opts.idempotencyKey ?? null,
+         runId: mergedRun.id,
+         finishedAt: new Date(),
+@@ -29195,6 +29223,34 @@ export function heartbeatService(
+         sql`select id from agents where id = ${agentId} and company_id = ${agent.companyId} for update`,
+       );
+ 
++      // If an idempotencyKey is provided for a non-issue-scoped wake, check for
++      // an existing non-skipped wakeup request with the same key and coalesce to it.
++      // This must be inside the transaction to avoid races between concurrent callers.
++      if (opts.idempotencyKey && !issueId) {
++        const [existingWake] = await tx
++          .select({ runId: agentWakeupRequests.runId })
++          .from(agentWakeupRequests)
++          .where(
++            and(
++              eq(agentWakeupRequests.companyId, agent.companyId),
++              eq(agentWakeupRequests.agentId, agentId),
++              eq(agentWakeupRequests.idempotencyKey, opts.idempotencyKey),
++              ne(agentWakeupRequests.status, "skipped"),
++              isNotNull(agentWakeupRequests.runId),
++            ),
++          )
++          .orderBy(asc(agentWakeupRequests.requestedAt))
++          .limit(1);
++        if (existingWake?.runId) {
++          const [run] = await tx
++            .select()
++            .from(heartbeatRuns)
++            .where(eq(heartbeatRuns.id, existingWake.runId))
++            .limit(1);
++          if (run) return { kind: "coalesced" as const, run };
++        }
++      }
++
+       const dailyCapBlock = await getHeartbeatDailyCapBlock(
+         agent,
+         policy,
+@@ -29250,6 +29306,8 @@ export function heartbeatService(
+           status: "queued",
+           requestedByActorType: opts.requestedByActorType ?? null,
+           requestedByActorId: opts.requestedByActorId ?? null,
++          actorAuthSource: opts.actorAuthSource ?? null,
++          peerAddress: opts.peerAddress ?? null,
+           idempotencyKey: opts.idempotencyKey ?? null,
+         })
+         .returning()
+-- 
+2.47.3
+
+
+From 4de723a014140e4752b3a3cf22e10630ee35b2dc Mon Sep 17 00:00:00 2001
+From: jjude80 <18168364+jjude80@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 01:34:10 +0000
+Subject: [PATCH 7/9] NEXA-194: Add migration for actor_auth_source and
+ peer_address columns
+
+---
+ .../migrations/0316_new_infant_terrible.sql   |   2 ++
+ ...{0311_snapshot.json => 0316_snapshot.json} | Bin 1506963 -> 1559832 bytes
+ packages/db/src/migrations/meta/_journal.json | Bin 47638 -> 47787 bytes
+ 3 files changed, 2 insertions(+)
+ create mode 100644 packages/db/src/migrations/0316_new_infant_terrible.sql
+ rename packages/db/src/migrations/meta/{0311_snapshot.json => 0316_snapshot.json} (96%)
+
+diff --git a/packages/db/src/migrations/0316_new_infant_terrible.sql b/packages/db/src/migrations/0316_new_infant_terrible.sql
+new file mode 100644
+index 00000000..7b94c2ed
+--- /dev/null
++++ b/packages/db/src/migrations/0316_new_infant_terrible.sql
+@@ -0,0 +1,2 @@
++ALTER TABLE "agent_wakeup_requests" ADD COLUMN "actor_auth_source" text;--> statement-breakpoint
++ALTER TABLE "agent_wakeup_requests" ADD COLUMN "peer_address" text;
+\ No newline at end of file
+diff --git a/packages/db/src/migrations/meta/0311_snapshot.json b/packages/db/src/migrations/meta/0316_snapshot.json
+similarity index 96%
+rename from packages/db/src/migrations/meta/0311_snapshot.json
+rename to packages/db/src/migrations/meta/0316_snapshot.json
+index e10ef09bc9b51c0f48a22f01a96e7af621414bdf..2cbc809de389f6620da068f9ed562fcc1b8f3c4c 100644
+GIT binary patch
+delta 8798
+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
+ArT_o{
+
+delta 811
+zcmXAmZAepL6vw&OyWP88ceguVMn$zo5L!2{yVI$ZuCkyA9Trp+mD`;#NF7e6S*b{H
+zAq&cprx%J<gqfL(pwl}>Q9@9YiU>`IiIPS5%`XZ)(+|H7=YRg^|D5M}u3S47T|C@=
+z%4oMcf~up$?kG@-U9!{Zl$`mhTXOmReyPakbV+KF>QiL7#ue}@j!h|ls38#9y);u)
+zT`2nlPM=g*?JJaAN`WdB%f4dCt@_<H{zA7}pwukSL;?-rV0~TcAosGO2CGk8YL_2F
+zWBXeuyDx-6KB(_T&)&3tD(d;Ihum#cHqMq%)@@MQ$li`7PF{pqE5%`?jcUpROO?(G
+z-pY&+8o!F=6eRl?2Cv7doJHu6YzHCHY`X+Q8n+7MnT)FtTHp-W(QT@vap)2KlH<3O
+z+Bc}daBVOg2G0e`2gyxTE|A^|_!mphMehrG#(>m&x`o1>!*m@5iG-;aI-aI+nAc|A
+zL#Mnf%#F|@9{oiBO$U!gD_Z#&O-RG?F=k`a@{$QbUk{&JvN&zLN=MM+colnm9mHHr
+zH(FZQ^*Zp*FbAS>^FVZtnFPLv%>+vqYl4e^j5d(#SsvnNSpyPnBpYIHC?~vr${Mta
+zJ1l`C7_j1wv8xD%T38NO|1_%XQY21H8NJL>7Lu%m(-3T;d7KRL_c(ZcBU_IvoB7Y{
+z@xo0$#|R%wty%E!u+;|1ySxoa*-tKsyrXB3H^F=-wcL0z$bYb*XPDotheRk{!MC6J
+zUAMH+&UAtaM>~ap1LRxQ^AP`H(cx6D(CdPu(}Er>FGL2`97?l+{hMHhBhvzhM4P7|
+zv?!#WQsChJFM)^FS7eEl2T959z~LP8S_633noSxgW`YGl5qECI<g7SAK`p1_U?L(~
+zaaUM8!{LK2@!fXlaGAQ{d!Mid^GC!u*HdfR2(fdb9&t>3&cNI=v!d;r6mj3AHL@R4
+VpQM$!GYFZ4EJ8Mxxotl#{|8KyFi`*i
+
+diff --git a/packages/db/src/migrations/meta/_journal.json b/packages/db/src/migrations/meta/_journal.json
+index 72325fa01cbc3983f5eda7d6ca43f6629be69139..9cb3a4f7647c709aa670bc4f4a54d1b50541a931 100644
+GIT binary patch
+delta 47
+zcmV+~0MP%I^a88(0<aLek<b+aGcl8Jv?~ZTIWssnGBYxh!L<_xF*aXrWp|T`jWUxE
+Fx(2-75r+T(
+
+delta 16
+XcmZ4em1)`+rVRqS*tirFV!3JoJjn&!
+
+-- 
+2.47.3
+
+
+From dfc4d802077b55dddf86eb7d075a37f866cbc578 Mon Sep 17 00:00:00 2001
+From: jjude80 <18168364+jjude80@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 00:02:50 +0000
+Subject: [PATCH 8/9] NEXA-224: send a client idempotency key with board invoke
+ wakes
+
+The board invoke path fired POST /agents/:id/heartbeat/invoke with an empty
+body, so nothing reached the idempotencyKey dedupe the route has honoured
+since NEXA-194. Board manual wakes already bypass same-scope run coalescing,
+which made this the one control path where two presses produced two runs.
+
+Mint one key per in-flight invoke action, per control: presses that land
+while an invoke is unresolved reuse the key and coalesce server-side, a
+failed request keeps its key so a retry coalesces, and only a settled
+success retires it so the next deliberate press starts a new run. The
+provider-trace control gets the same treatment.
+
+Tests: two presses of one control now send one key; a later press mints a
+fresh key; a failed press reuses its key on retry.
+---
+ ui/src/components/AgentActionButtons.test.tsx | 104 ++++++++++++++++++
+ ui/src/components/AgentActionButtons.tsx      |  32 +++++-
+ 2 files changed, 132 insertions(+), 4 deletions(-)
+
+diff --git a/ui/src/components/AgentActionButtons.test.tsx b/ui/src/components/AgentActionButtons.test.tsx
+index b90994ac..175de14d 100644
+--- a/ui/src/components/AgentActionButtons.test.tsx
++++ b/ui/src/components/AgentActionButtons.test.tsx
+@@ -44,6 +44,8 @@ vi.mock("../api/agents", () => ({
+   agentsApi: mockAgentsApi,
+ }));
+ 
++const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
++
+ // eslint-disable-next-line @typescript-eslint/no-explicit-any
+ (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
+ 
+@@ -192,11 +194,113 @@ describe("AgentActionButtons", () => {
+     await flushReact();
+ 
+     expect(mockAgentsApi.invoke).toHaveBeenCalledWith("agent-1", "company-1", {
++      idempotencyKey: expect.stringMatching(UUID_PATTERN),
+       debug: { providerTrace: "raw" },
+     });
+     expect(mockNavigate).toHaveBeenCalledWith("/agents/alpha/runs/run-1");
+   });
+ 
++  it("sends one idempotency key for two presses of Run now so they produce one run", async () => {
++    render(makeAgent());
++    await flushReact();
++
++    const runButton = Array.from(container.querySelectorAll("button")).find(
++      (button) => button.textContent?.includes("Run Heartbeat"),
++    );
++    expect(runButton).toBeTruthy();
++
++    // Two presses inside one act both reach the mutation before the pending
++    // state can disable the control - the duplicate-wakeup race from NEXA-180.
++    await act(async () => {
++      runButton?.click();
++      runButton?.click();
++    });
++    await flushReact();
++
++    expect(mockAgentsApi.invoke).toHaveBeenCalledTimes(2);
++    const [firstCall, secondCall] = mockAgentsApi.invoke.mock.calls;
++    expect(firstCall?.[2]?.idempotencyKey).toMatch(UUID_PATTERN);
++    // The same key coalesces both requests into one run server-side.
++    expect(secondCall?.[2]?.idempotencyKey).toBe(firstCall?.[2]?.idempotencyKey);
++  });
++
++  it("mints a fresh idempotency key for a later deliberate Run now press", async () => {
++    render(makeAgent());
++    await flushReact();
++
++    const runButton = Array.from(container.querySelectorAll("button")).find(
++      (button) => button.textContent?.includes("Run Heartbeat"),
++    );
++    expect(runButton).toBeTruthy();
++
++    await act(async () => {
++      runButton?.click();
++    });
++    await flushReact();
++
++    await act(async () => {
++      runButton?.click();
++    });
++    await flushReact();
++
++    expect(mockAgentsApi.invoke).toHaveBeenCalledTimes(2);
++    const [firstCall, secondCall] = mockAgentsApi.invoke.mock.calls;
++    expect(firstCall?.[2]?.idempotencyKey).toMatch(UUID_PATTERN);
++    expect(secondCall?.[2]?.idempotencyKey).toMatch(UUID_PATTERN);
++    expect(secondCall?.[2]?.idempotencyKey).not.toBe(firstCall?.[2]?.idempotencyKey);
++  });
++
++  it("reuses the idempotency key when a failed Run now press is retried", async () => {
++    mockAgentsApi.invoke.mockRejectedValueOnce(new Error("Network unavailable"));
++    render(makeAgent());
++    await flushReact();
++
++    const runButton = Array.from(container.querySelectorAll("button")).find(
++      (button) => button.textContent?.includes("Run Heartbeat"),
++    );
++    expect(runButton).toBeTruthy();
++
++    await act(async () => {
++      runButton?.click();
++    });
++    await flushReact();
++    expect(mockPushToast).toHaveBeenCalledWith(
++      expect.objectContaining({ title: "Action failed" }),
++    );
++
++    await act(async () => {
++      runButton?.click();
++    });
++    await flushReact();
++
++    expect(mockAgentsApi.invoke).toHaveBeenCalledTimes(2);
++    const [firstCall, secondCall] = mockAgentsApi.invoke.mock.calls;
++    expect(firstCall?.[2]?.idempotencyKey).toMatch(UUID_PATTERN);
++    expect(secondCall?.[2]?.idempotencyKey).toBe(firstCall?.[2]?.idempotencyKey);
++  });
++
++  it("sends one idempotency key for two presses of the provider trace control", async () => {
++    render(makeAgent(), { canRunWithProviderTrace: true });
++    await flushReact();
++
++    const traceButton = Array.from(container.querySelectorAll("button")).find(
++      (button) => button.textContent?.includes("Run with provider trace"),
++    );
++    expect(traceButton).toBeTruthy();
++
++    await act(async () => {
++      traceButton?.click();
++      traceButton?.click();
++    });
++    await flushReact();
++
++    expect(mockAgentsApi.invoke).toHaveBeenCalledTimes(2);
++    const [firstCall, secondCall] = mockAgentsApi.invoke.mock.calls;
++    expect(firstCall?.[2]?.debug).toEqual({ providerTrace: "raw" });
++    expect(firstCall?.[2]?.idempotencyKey).toMatch(UUID_PATTERN);
++    expect(secondCall?.[2]?.idempotencyKey).toBe(firstCall?.[2]?.idempotencyKey);
++  });
++
+   it("calls the terminate success handler after terminating an agent", async () => {
+     const onTerminateSuccess = vi.fn();
+     render(makeAgent(), { onTerminateSuccess });
+diff --git a/ui/src/components/AgentActionButtons.tsx b/ui/src/components/AgentActionButtons.tsx
+index 6ed44aae..b61f940e 100644
+--- a/ui/src/components/AgentActionButtons.tsx
++++ b/ui/src/components/AgentActionButtons.tsx
+@@ -35,6 +35,7 @@ import { ApiError } from "../api/client";
+ import { queryKeys } from "../lib/queryKeys";
+ import { agentRouteRef } from "../lib/utils";
+ import { copyTextToClipboard } from "../lib/clipboard";
++import { createUuid } from "../lib/uuid";
+ import { useDialogActions } from "../context/DialogContext";
+ import { useToastActions } from "../context/ToastContext";
+ import {
+@@ -223,6 +224,13 @@ export function AgentActionButtons({
+   const beforeNavigateRef = useRef(onBeforeNavigate);
+   const agentActionStartedDirtyRef = useRef(false);
+   const duplicateStartedDirtyRef = useRef(false);
++  // One idempotency key per in-flight invoke action, per control. Presses that
++  // land while an invoke is still unresolved reuse the key so the server
++  // coalesces them into a single run. A failed request keeps its key so an
++  // immediate retry coalesces instead of duplicating the wake; only a settled
++  // success retires the key, so the next deliberate press starts a new run.
++  const invokeIdempotencyKeyRef = useRef<string | null>(null);
++  const providerTraceIdempotencyKeyRef = useRef<string | null>(null);
+   pendingNavigationChangesRef.current = hasPendingNavigationChanges;
+   beforeNavigateRef.current = onBeforeNavigate;
+ 
+@@ -270,7 +278,12 @@ export function AgentActionButtons({
+   const agentAction = useMutation({
+     mutationFn: async (action: "invoke" | "pause" | "resume" | "clear_error" | "approve" | "terminate") => {
+       switch (action) {
+-        case "invoke": return agentsApi.invoke(agent.id, resolvedCompanyId ?? undefined);
++        case "invoke": {
++          invokeIdempotencyKeyRef.current ??= createUuid();
++          return agentsApi.invoke(agent.id, resolvedCompanyId ?? undefined, {
++            idempotencyKey: invokeIdempotencyKeyRef.current,
++          });
++        }
+         case "pause": return agentsApi.pause(agent.id, resolvedCompanyId ?? undefined);
+         case "resume": return agentsApi.resume(agent.id, resolvedCompanyId ?? undefined);
+         case "clear_error": return agentsApi.clearError(agent.id, resolvedCompanyId ?? undefined);
+@@ -278,6 +291,11 @@ export function AgentActionButtons({
+         case "terminate": return agentsApi.terminate(agent.id, resolvedCompanyId ?? undefined);
+       }
+     },
++    onSettled: (data, error, action) => {
++      // Retire the key only on a settled success. A failure keeps it so the
++      // next press is a retry of the same action and coalesces server-side.
++      if (action === "invoke" && !error) invokeIdempotencyKeyRef.current = null;
++    },
+     onSuccess: (data, action) => {
+       onActionError?.(null);
+       invalidateAgent();
+@@ -296,10 +314,16 @@ export function AgentActionButtons({
+   });
+ 
+   const providerTraceAction = useMutation({
+-    mutationFn: () =>
+-      agentsApi.invoke(agent.id, resolvedCompanyId ?? undefined, {
++    mutationFn: () => {
++      providerTraceIdempotencyKeyRef.current ??= createUuid();
++      return agentsApi.invoke(agent.id, resolvedCompanyId ?? undefined, {
++        idempotencyKey: providerTraceIdempotencyKeyRef.current,
+         debug: { providerTrace: "raw" },
+-      }),
++      });
++    },
++    onSettled: (_data, error) => {
++      if (!error) providerTraceIdempotencyKeyRef.current = null;
++    },
+     onSuccess: (run) => {
+       onActionError?.(null);
+       invalidateAgent();
+-- 
+2.47.3
+
+
+From b53ab3682ff844917261d995f65d15ed2fbab418 Mon Sep 17 00:00:00 2001
+From: jjude80 <18168364+jjude80@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 04:47:03 -0400
+Subject: [PATCH 9/9] NEXA-432: skip the managed credential broker for
+ local-only Git commands
+
+Every `git` invocation on an agent's PATH went through the managed GitHub
+launcher, which asked the control plane for managed credentials before each
+call, including calls that never touch the network. The round trip cost about
+1.8s per command, so a local-only script (the 127-case worktree suite, the
+pre-commit hook calling `git rev-parse`) took over ten minutes instead of
+forty seconds, and timed out the gates that depend on it. A timeout is
+reported as a failing test, so a green suite turned red for a reason that had
+nothing to do with the change under test.
+
+The launcher now recognises the Git commands that cannot reach a remote and
+cannot create a commit object, and skips the broker round trip for them.
+Commands that contact a remote keep it, and so do commands that create
+commits: the broker is what supplies the managed identity that commits are
+attributed to, and the credential helper that authenticates a push.
+
+Measured in this repository, five `git rev-parse HEAD` calls: 10.6s before,
+1.4s after. A local command also no longer reports a broker diagnostic it
+cannot have; the diagnostic still appears on the commands that need a
+credential.
+
+Co-Authored-By: Paperclip <noreply@paperclip.ing>
+---
+ .../adapter-utils/src/github-launcher.test.ts | 60 +++++++++++++++++-
+ packages/adapter-utils/src/github-launcher.ts | 62 +++++++++++++++++++
+ 2 files changed, 120 insertions(+), 2 deletions(-)
+
+diff --git a/packages/adapter-utils/src/github-launcher.test.ts b/packages/adapter-utils/src/github-launcher.test.ts
+index 5cb0a5d6..dbe652de 100644
+--- a/packages/adapter-utils/src/github-launcher.test.ts
++++ b/packages/adapter-utils/src/github-launcher.test.ts
+@@ -55,12 +55,23 @@ describe("managed GitHub launchers", () => {
+       ...process.env, ...githubBrokerEnvironment({ GH_TOKEN: "host-must-not-leak" }, { url: `http://127.0.0.1:${port}`, token: "private-capability" }),
+       GH_CONFIG_DIR: configRoot, PATH: `${bin}:${process.env.PATH}`,
+     } });
+-    expect(result.stderr).toContain(failure === "broker-offline" ? "broker_transport_unavailable" : failure === "config-unwritable" ? "configuration_directory_unavailable" : "capability_rejected");
+     expect(result.stderr).not.toMatch(/host-must-not-leak|private-capability/);
+-    await exec(path.join(bin, "git"), ["commit", "--allow-empty", "-m", "Offline work"], { cwd: root, env: {
++    if (failure === "config-unwritable") {
++      // The configuration directory is prepared for every command.
++      expect(result.stderr).toContain("configuration_directory_unavailable");
++    } else {
++      // A local-only command never contacts the broker, so it has no broker
++      // diagnostic to report.
++      expect(result.stderr).not.toContain("broker_transport_unavailable");
++      expect(result.stderr).not.toContain("capability_rejected");
++    }
++    // A command that needs a managed credential still reports the failure.
++    const remote = await exec(path.join(bin, "git"), ["commit", "--allow-empty", "-m", "Offline work"], { cwd: root, env: {
+       ...process.env, ...githubBrokerEnvironment({}, { url: `http://127.0.0.1:${port}`, token: "private-capability" }),
+       GH_CONFIG_DIR: configRoot, PATH: `${bin}:${process.env.PATH}`,
+     } });
++    expect(remote.stderr).toContain(failure === "broker-offline" ? "broker_transport_unavailable" : failure === "config-unwritable" ? "configuration_directory_unavailable" : "capability_rejected");
++    expect(remote.stderr).not.toMatch(/host-must-not-leak|private-capability/);
+   }, 15_000); // broker-offline retries the transport twice per command before it falls back
+ 
+   it("explains unavailable access while allowing local work without credentials", async () => {
+@@ -182,4 +193,49 @@ process.stdout.write(JSON.stringify({identity, token:process.env.GH_TOKEN ?? nul
+     expect(env.GH_TOKEN).toBe("");
+     expect(env.GIT_AUTHOR_NAME).toBe("");
+   });
++
++  it("skips the managed credential broker for local-only Git commands", async () => {
++    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-local-only-"));
++    cleanups.push(() => rm(root, { recursive: true, force: true }));
++    const bin = path.join(root, "managed"), realBin = path.join(root, "real");
++    await mkdir(bin); await mkdir(realBin);
++    await writeFile(path.join(bin, "git"), githubLauncherSource(), { mode: 0o700 });
++    // A stand-in for the real Git binary: it reports the arguments it received
++    // and whether it was handed a managed credential.
++    await writeFile(path.join(realBin, "git"), `#!/usr/bin/env node
++process.stdout.write(JSON.stringify({ argv: process.argv.slice(2), token: process.env.GH_TOKEN ?? null }));
++`, { mode: 0o700 });
++    let requests = 0;
++    const server = createServer((_req, res) => {
++      requests += 1;
++      res.setHeader("content-type", "application/json");
++      res.end(JSON.stringify({ status: "available", env: { GH_TOKEN: "managed-token" } }));
++    });
++    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
++    cleanups.push(() => new Promise<void>(resolve => server.close(() => resolve())));
++    const { port } = server.address() as { port: number };
++    const env = { ...process.env, ...githubBrokerEnvironment({}, { url: `http://127.0.0.1:${port}`, token: "run-capability" }), PATH: `${bin}:${realBin}:${process.env.PATH}` };
++    const git = async (...args: string[]) => JSON.parse((await exec(path.join(bin, "git"), args, { env })).stdout);
++    for (const args of [
++      ["rev-parse", "--git-dir"], ["status", "--porcelain"], ["ls-files"],
++      ["config", "--local", "--list"], ["diff", "--stat"], ["worktree", "list"],
++      ["-C", root, "rev-parse", "--git-dir"],
++    ]) {
++      requests = 0;
++      const result = await git(...args);
++      expect(result.token, `git ${args.join(" ")} must not receive a managed credential`).toBeNull();
++      expect(requests, `git ${args.join(" ")} must not call the broker`).toBe(0);
++    }
++    // Commands that can reach the remote still ask the broker for a credential.
++    for (const args of [["fetch"], ["push"], ["clone", "https://example.test/repo.git"], ["ls-remote"]]) {
++      requests = 0;
++      const result = await git(...args);
++      expect(result.token, `git ${args.join(" ")} must receive a managed credential`).toBe("managed-token");
++      expect(requests).toBe(1);
++    }
++    // A command that creates a commit keeps the managed identity, so it still asks.
++    requests = 0;
++    expect((await git("commit", "--allow-empty", "-m", "Managed identity")).token).toBe("managed-token");
++    expect(requests).toBe(1);
++  }, 20_000);
+ });
+diff --git a/packages/adapter-utils/src/github-launcher.ts b/packages/adapter-utils/src/github-launcher.ts
+index b44bc89c..465d46a8 100644
+--- a/packages/adapter-utils/src/github-launcher.ts
++++ b/packages/adapter-utils/src/github-launcher.ts
+@@ -17,6 +17,60 @@ if (!['git', 'gh'].includes(program) || !executable) {
+   process.stderr.write('Paperclip: requested GitHub command is not installed.\n');
+   process.exit(127);
+ }
++// Git commands that never contact a remote and never create a commit object.
++// A managed credential is not needed for these, and asking the broker for one
++// on every call made local-only work (status checks, hooks, test suites) cost
++// a round trip per command. That was slow enough to time out the gates that
++// depend on it, which turned a green suite red for a reason unrelated to the
++// change under test.
++const LOCAL_ONLY_GIT_COMMANDS = new Set([
++  'add', 'annotate', 'apply', 'blame', 'branch', 'cat-file', 'check-attr', 'check-ignore',
++  'check-mailmap', 'check-ref-format', 'cherry', 'clean', 'column', 'checkout', 'config',
++  'describe', 'diff', 'diff-files', 'diff-index', 'diff-tree', 'fast-export', 'for-each-ref',
++  'fsck', 'gc',
++  'grep', 'hash-object', 'init', 'interpret-trailers', 'log', 'ls-files', 'ls-tree', 'merge-base',
++  'merge-file', 'merge-tree', 'mktree', 'mktag', 'name-rev', 'pack-objects', 'prune',
++  'prune-packed', 'range-diff', 'read-tree', 'reflog', 'replace', 'rerere', 'reset', 'restore',
++  'rev-list', 'rev-parse', 'rm', 'shortlog', 'show', 'show-branch', 'show-ref',
++  'sparse-checkout', 'stage', 'status', 'switch', 'symbolic-ref', 'unpack-file',
++  'unpack-objects', 'update-index', 'update-ref', 'update-server-info', 'var', 'verify-commit',
++  'verify-pack', 'verify-tag', 'whatchanged', 'worktree', 'write-tree',
++]);
++// Global options that consume the next argument, so the subcommand is not the
++// first bare word on the command line.
++const GIT_GLOBAL_OPTIONS_WITH_VALUE = new Set([
++  '-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--super-prefix',
++  '--config-env',
++]);
++function gitSubcommandIndex(argv) {
++  for (let index = 0; index < argv.length; index += 1) {
++    const argument = argv[index];
++    if (argument === '--') return -1;
++    if (argument.startsWith('-')) {
++      const name = argument.includes('=') ? argument.slice(0, argument.indexOf('=')) : argument;
++      if (!argument.includes('=') && GIT_GLOBAL_OPTIONS_WITH_VALUE.has(name)) index += 1;
++      continue;
++    }
++    return index;
++  }
++  return -1;
++}
++function isLocalOnlyGitInvocation(argv) {
++  const index = gitSubcommandIndex(argv);
++  if (index < 0) return false;
++  const command = argv[index];
++  if (command === 'remote') {
++    // 'git remote' only reads configuration, but 'remote update' and
++    // 'remote prune' contact the remote.
++    const subcommand = argv.slice(index + 1).find((value) => !value.startsWith('-'));
++    return subcommand === undefined || subcommand === 'show' || subcommand === 'get-url';
++  }
++  if (command === 'archive') {
++    // 'git archive --remote' reads a remote repository.
++    return !argv.some((value) => value === '--remote' || value.startsWith('--remote='));
++  }
++  return LOCAL_ONLY_GIT_COMMANDS.has(command);
++}
+ async function main() {
+   let env = { ...process.env };
+   const diagnostic = (code) => process.stderr.write('Paperclip: GitHub ' + code + '; continuing without managed credentials.\n');
+@@ -49,6 +103,13 @@ async function main() {
+       GIT_CONFIG_KEY_3: 'core.askPass', GIT_CONFIG_VALUE_3: '',
+       GIT_CONFIG_KEY_4: 'user.useConfigOnly', GIT_CONFIG_VALUE_4: 'true',
+     });
++    // A local-only Git command never reaches the remote, so it skips the
++    // managed credential round trip instead of paying for it on every call.
++    // Commands that create commits keep it: the broker is what supplies the
++    // managed identity that commits are attributed to.
++    const needsManagedCredentials =
++      program !== 'git' || !isLocalOnlyGitInvocation(process.argv.slice(2));
++    if (needsManagedCredentials) {
+     const base = env.PAPERCLIP_GITHUB_BROKER_URL || env.PAPERCLIP_API_URL;
+     try {
+     let response;
+@@ -98,6 +159,7 @@ async function main() {
+       }
+     } else { diagnostic('capability_missing'); }
+     } catch { diagnostic('broker_transport_unavailable'); }
++    }
+   }
+   // Only this invocation and its children inherit the captured credential.
+   // Its Git children use the real binary, so steering cannot split a gh operation.
+-- 
+2.47.3
+
