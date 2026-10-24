@@ -1,0 +1,265 @@
+diff --git a/cli/src/__tests__/install-command.test.ts b/cli/src/__tests__/install-command.test.ts
+index 5204c735..48561d63 100644
+--- a/cli/src/__tests__/install-command.test.ts
++++ b/cli/src/__tests__/install-command.test.ts
+@@ -115,7 +115,7 @@ describe("managed install commands", () => {
+     expect(runCommand.mock.calls[0]?.[0]).toBe(process.execPath);
+   });
+ 
+-  const createGitCheckoutRunCommand = (sha: string, options?: { uiDistScript?: boolean }) =>
++  const createGitCheckoutRunCommand = (sha: string, options?: { uiDistScript?: boolean; onPrepareBundledPackage?: (packageDir: string) => void; onInstall?: (umask: number) => void }) =>
+     vi.fn(async (file: string, args: string[], _options?: Parameters<CommandRunner>[2]) => {
+       if (file === "curl" && !args.includes("--output")) return { stdout: JSON.stringify({ sha }), stderr: "" };
+       if (file === "curl") { fs.writeFileSync(args[args.indexOf("--output") + 1], "archive"); return { stdout: "", stderr: "" }; }
+@@ -128,6 +128,8 @@ describe("managed install commands", () => {
+         ];
+         fs.mkdirSync(path.join(checkout, "cli"), { recursive: true });
+         fs.writeFileSync(path.join(checkout, "cli", "package.json"), JSON.stringify({ version: "0.3.1" }));
++        fs.mkdirSync(path.join(checkout, "skills", "paperclip"), { recursive: true });
++        fs.writeFileSync(path.join(checkout, "skills", "paperclip", "SKILL.md"), "# paperclip\n");
+         fs.mkdirSync(path.join(checkout, "scripts"), { recursive: true });
+         if (options?.uiDistScript) {
+           fs.writeFileSync(path.join(checkout, "scripts", "prepare-server-ui-dist.sh"), "#!/usr/bin/env bash\n");
+@@ -154,8 +156,9 @@ describe("managed install commands", () => {
+         fs.writeFileSync(path.join(args[args.indexOf("--pack-destination") + 1], `${packageName}-0.3.1.tgz`), "package");
+         return { stdout: "", stderr: "" };
+       }
+-      if (file === "npm" && args[0] === "install") { const prefix = args[args.indexOf("--prefix") + 1]; const packageRoot = path.join(prefix, "node_modules", "paperclipai"); fs.mkdirSync(path.join(packageRoot, "dist"), { recursive: true }); fs.writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({ version: "0.3.1" })); fs.writeFileSync(path.join(packageRoot, "dist", "index.js"), "#!/usr/bin/env node\n"); return { stdout: "", stderr: "" }; }
++      if (file === "npm" && args[0] === "install") { options?.onInstall?.(process.umask()); const prefix = args[args.indexOf("--prefix") + 1]; const packageRoot = path.join(prefix, "node_modules", "paperclipai"); fs.mkdirSync(path.join(packageRoot, "dist"), { recursive: true }); fs.writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({ version: "0.3.1" })); fs.writeFileSync(path.join(packageRoot, "dist", "index.js"), "#!/usr/bin/env node\n"); return { stdout: "", stderr: "" }; }
+       if (file === process.execPath && args[0]?.endsWith("prepare-bundled-package.mjs")) {
++        options?.onPrepareBundledPackage?.(args[1]);
+         fs.mkdirSync(args[2], { recursive: true });
+         fs.writeFileSync(path.join(args[2], "package.json"), JSON.stringify({ name: "@paperclipai/db", version: "0.3.1" }));
+         return { stdout: "", stderr: "" };
+@@ -197,6 +200,47 @@ describe("managed install commands", () => {
+     )).toBeLessThan(stagedCall);
+   });
+ 
++  it("packs the staged bundled workspace package with lifecycle scripts disabled", async () => {
++    const sha = "f".repeat(40);
++    const runCommand = createGitCheckoutRunCommand(sha, { uiDistScript: true });
++    await expect(installGitPayload("paperclipai/paperclip", sha, runCommand, resolveInstallStorePaths())).resolves.toMatchObject({ version: "0.3.1", reused: false });
++    const stagedPack = runCommand.mock.calls.find(([file, args]) =>
++      file === "npm" && args[0] === "pack" && args.some((arg) => arg.includes("workspace-package-")),
++    );
++    expect(stagedPack).toBeTruthy();
++    expect(stagedPack?.[1]).toContain("--ignore-scripts");
++    const cliPack = runCommand.mock.calls.find(([file, args]) =>
++      file === "npm" && args[0] === "pack" && !args.some((arg) => arg.includes("workspace-package-")),
++    );
++    expect(cliPack?.[1]).not.toContain("--ignore-scripts");
++  });
++
++  it("stages the repository skills before packing workspace packages", async () => {
++    const sha = "1".repeat(40);
++    const seen: Array<{ packageDir: string; hasSkills: boolean }> = [];
++    const runCommand = createGitCheckoutRunCommand(sha, {
++      uiDistScript: true,
++      onPrepareBundledPackage: (packageDir) => seen.push({
++        packageDir,
++        hasSkills: fs.existsSync(path.join(path.dirname(packageDir), "skills", "paperclip", "SKILL.md")),
++      }),
++    });
++    await expect(installGitPayload("paperclipai/paperclip", sha, runCommand, resolveInstallStorePaths())).resolves.toMatchObject({ version: "0.3.1", reused: false });
++    expect(seen).toHaveLength(1);
++    expect(seen[0]?.packageDir).toMatch(/[\\/]server$/);
++    expect(seen[0]?.hasSkills).toBe(true);
++  });
++
++  it("installs the payload under the npm-standard umask and restores it", async () => {
++    const sha = "2".repeat(40);
++    const masks: number[] = [];
++    const previous = process.umask();
++    const runCommand = createGitCheckoutRunCommand(sha, { uiDistScript: true, onInstall: (umask) => masks.push(umask) });
++    await expect(installGitPayload("paperclipai/paperclip", sha, runCommand, resolveInstallStorePaths())).resolves.toMatchObject({ version: "0.3.1", reused: false });
++    expect(masks).toEqual([0o022]);
++    expect(process.umask()).toBe(previous);
++  });
++
+   it("builds git checkouts with NODE_ENV cleared so ambient production mode keeps devDependencies", async () => {
+     process.env.NODE_ENV = "production";
+     const sha = "d".repeat(40);
+diff --git a/cli/src/commands/install.ts b/cli/src/commands/install.ts
+index c81d6a66..cf54fc73 100644
+--- a/cli/src/commands/install.ts
++++ b/cli/src/commands/install.ts
+@@ -29,6 +29,20 @@ const EXACT_VERSION_PATTERN = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
+ 
+ export type InstallOptions = { canary?: boolean; version?: string; ref?: string; repo?: string; yes?: boolean };
+ 
++// npm extracts tarball modes through the process umask, so a group-writable
++// umask (0002 is common) produces group-writable files. The server postinstall
++// refuses group/world-writable pinned binaries, which made a legitimate payload
++// uninstallable on those hosts. Install with the npm-standard umask instead of
++// weakening that check. Child processes inherit it.
++async function withInstallUmask<T>(run: () => Promise<T>): Promise<T> {
++  const previous = process.umask(0o022);
++  try {
++    return await run();
++  } finally {
++    process.umask(previous);
++  }
++}
++
+ export type CommandRunner = (
+   file: string,
+   args: string[],
+@@ -209,7 +223,7 @@ export async function installNpmPayload(
+       `registry=${PUBLIC_NPM_REGISTRY}\n@paperclipai:registry=${PUBLIC_NPM_REGISTRY}\n`,
+       { mode: 0o600 },
+     );
+-    await runCommand(
++    await withInstallUmask(() => runCommand(
+       "npm",
+       [
+         "install",
+@@ -226,7 +240,7 @@ export async function installNpmPayload(
+         env: { ...process.env, npm_config_userconfig: npmUserConfigPath },
+         maxBuffer: 16 * 1024 * 1024,
+       },
+-    );
++    ));
+     await smokePayload(stagingPath, version, runCommand);
+     fs.renameSync(stagingPath, payloadPath);
+     return { payloadPath, reused: false };
+@@ -285,6 +299,18 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
+       await runCommand("bash", [serverUiDistScript], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
+     }
+     const metadata = JSON.parse(fs.readFileSync(path.join(checkoutPath, "cli", "package.json"), "utf8")) as { version: string };
++    // scripts/release.sh stages the repository skills into the packages that list
++    // them in `files` before packing. A git checkout has no staged copies, and
++    // prepare-bundled-package.mjs copies every `files` entry, so without this the
++    // server package dies on a missing server/skills before npm pack is reached.
++    const repositorySkills = path.join(checkoutPath, "skills");
++    if (fs.existsSync(repositorySkills)) {
++      for (const packageDir of ["server", "packages/adapters/claude-local", "packages/adapters/codex-local"]) {
++        const stagedSkills = path.join(checkoutPath, packageDir, "skills");
++        fs.rmSync(stagedSkills, { recursive: true, force: true });
++        fs.cpSync(repositorySkills, stagedSkills, { recursive: true });
++      }
++    }
+     const workspacePackages = resolveGitInstallWorkspacePackages(checkoutPath);
+     for (const [index, workspacePackage] of workspacePackages.entries()) {
+       const packageDir = path.join(checkoutPath, workspacePackage.dir);
+@@ -293,7 +319,10 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
+       if (bundledDependencies.length > 0) {
+         const stagedPackage = path.join(stagingRoot, `workspace-package-${index}`);
+         await runCommand(process.execPath, [path.join(checkoutPath, "scripts", "prepare-bundled-package.mjs"), packageDir, stagedPackage], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
+-        await runCommand("npm", ["pack", stagedPackage, "--pack-destination", stagingRoot], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 16 * 1024 * 1024 });
++        // The staged manifest is the source package's manifest, so it still carries hooks such as
++        // `prepack` that resolve paths relative to the checkout. The UI dist and bundled graph are
++        // already prepared above, so packaging must not re-run them from the staging directory.
++        await runCommand("npm", ["pack", stagedPackage, "--pack-destination", stagingRoot, "--ignore-scripts"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 16 * 1024 * 1024 });
+       } else {
+         await runCommand("corepack", ["pnpm", "--dir", workspacePackage.dir, "pack", "--pack-destination", stagingRoot], { cwd: checkoutPath, env: buildEnv({ PAPERCLIP_RELEASE_REUSE_UI_DIST: "1" }), maxBuffer: 32 * 1024 * 1024 });
+       }
+@@ -305,7 +334,7 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
+     if (!cliTarball || workspaceTarballs.length !== workspacePackages.length) {
+       throw new Error(`Git install packaging produced ${workspaceTarballs.length} workspace tarballs; expected ${workspacePackages.length}.`);
+     }
+-    await runCommand("npm", ["install", "--prefix", stagedPayload, path.join(stagingRoot, cliTarball), ...workspaceTarballs.map((entry) => path.join(stagingRoot, entry)), "--no-audit", "--no-fund"], { cwd: stagingRoot, maxBuffer: 32 * 1024 * 1024 });
++    await withInstallUmask(() => runCommand("npm", ["install", "--prefix", stagedPayload, path.join(stagingRoot, cliTarball), ...workspaceTarballs.map((entry) => path.join(stagingRoot, entry)), "--no-audit", "--no-fund"], { cwd: stagingRoot, maxBuffer: 32 * 1024 * 1024 }));
+     await smokePayload(stagedPayload, metadata.version, runCommand);
+     fs.renameSync(stagedPayload, payloadPath);
+     return { payloadPath, reused: false, version: metadata.version };
+diff --git a/scripts/acpx-patch-packaging.test.mjs b/scripts/acpx-patch-packaging.test.mjs
+index d502eaeb..dc2588fe 100644
+--- a/scripts/acpx-patch-packaging.test.mjs
++++ b/scripts/acpx-patch-packaging.test.mjs
+@@ -25,6 +25,7 @@ import {
+   createBundledInstallManifest,
+   configureBundledProviderOverrides,
+   materializePublishManifest,
++  readWorkspacePackageVersions,
+   selectBundledDependencyPatches,
+   stageBundledEsbuildOptionalDependencies,
+   stageBundledProviderOptionalDependencies,
+@@ -463,6 +464,37 @@ test("bundled package staging materializes workspace dependency versions", () =>
+   });
+ });
+ 
++test("bundled package staging resolves workspace dependencies to their own version", () => {
++  const staged = materializePublishManifest(
++    {
++      name: "@paperclipai/server",
++      version: "0.3.1",
++      dependencies: {
++        "@paperclipai/plugin-sdk": "workspace:*",
++        "@paperclipai/shared": "workspace:^",
++        "@paperclipai/unlisted": "workspace:*",
++      },
++    },
++    new Map([
++      ["@paperclipai/plugin-sdk", "1.0.0"],
++      ["@paperclipai/shared", "0.3.1"],
++    ]),
++  );
++
++  assert.deepEqual(staged.dependencies, {
++    "@paperclipai/plugin-sdk": "1.0.0",
++    "@paperclipai/shared": "^0.3.1",
++    "@paperclipai/unlisted": "0.3.1",
++  });
++});
++
++test("workspace versions are read from the release package manifest", () => {
++  const versions = readWorkspacePackageVersions();
++
++  assert.equal(versions.get("@paperclipai/server"), "0.3.1");
++  assert.equal(versions.get("@paperclipai/plugin-sdk"), "1.0.0");
++});
++
+ test("bundled package staging installs only dependencies included in the tarball", () => {
+   const publishManifest = {
+     name: "@paperclipai/db",
+diff --git a/scripts/prepare-bundled-package.mjs b/scripts/prepare-bundled-package.mjs
+index 528ece8b..c4055732 100644
+--- a/scripts/prepare-bundled-package.mjs
++++ b/scripts/prepare-bundled-package.mjs
+@@ -9,7 +9,27 @@ import { fileURLToPath } from "node:url";
+ const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
+ const nativeTargets = ["linux-x64", "darwin-arm64", "darwin-x64"];
+ 
+-export function materializePublishManifest(pkg) {
++// Resolve `workspace:` dependency ranges the way pnpm does: to the version the
++// dependency itself declares. Falling back to the depending package's version
++// only works for a release, where set_public_package_version() rewrites every
++// package to one calver first. A git install packs the checkout as-is, and a
++// workspace is not required to be version-locked (@paperclipai/plugin-sdk is
++// 1.0.0 while the rest of the tree is 0.3.1), so the dependency manifest is the
++// only source that can satisfy npm's resolution.
++export function readWorkspacePackageVersions(sourceRoot = repoRoot) {
++  const manifestPath = resolve(sourceRoot, "scripts", "release-package-manifest.json");
++  const versions = new Map();
++  if (!existsSync(manifestPath)) return versions;
++  for (const entry of JSON.parse(readFileSync(manifestPath, "utf8"))) {
++    const packagePath = resolve(sourceRoot, entry.dir, "package.json");
++    if (!existsSync(packagePath)) continue;
++    const manifest = JSON.parse(readFileSync(packagePath, "utf8"));
++    if (typeof manifest.version === "string") versions.set(entry.name, manifest.version);
++  }
++  return versions;
++}
++
++export function materializePublishManifest(pkg, workspaceVersions = new Map()) {
+   const publishConfig = pkg.publishConfig ?? {};
+   const publishManifest = { ...pkg };
+ 
+@@ -24,7 +44,7 @@ export function materializePublishManifest(pkg) {
+         if (typeof specifier !== "string" || !specifier.startsWith("workspace:")) return [name, specifier];
+         const range = specifier.slice("workspace:".length);
+         const prefix = range === "^" || range === "~" ? range : "";
+-        return [name, `${prefix}${pkg.version}`];
++        return [name, `${prefix}${workspaceVersions.get(name) ?? pkg.version}`];
+       }),
+     );
+   }
+@@ -394,7 +414,7 @@ export function prepareBundledPackage(sourceDir, destinationDir, { sourceRoot =
+   }
+ 
+   const deployedPackagePath = resolve(destinationDir, "package.json");
+-  const publishManifest = materializePublishManifest(sourcePackage);
++  const publishManifest = materializePublishManifest(sourcePackage, readWorkspacePackageVersions(sourceRoot));
+   const rootPackage = JSON.parse(readFileSync(resolve(sourceRoot, "package.json"), "utf8"));
+   const profileData = bundledDependencies.includes("@agentclientprotocol/codex-acp")
+     ? JSON.parse(readFileSync(resolve(sourceRoot, "packages/paperclip-runner/acpx-profiles.json"), "utf8")) : undefined;
