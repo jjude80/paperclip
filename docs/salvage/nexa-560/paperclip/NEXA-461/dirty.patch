@@ -1,0 +1,348 @@
+diff --git a/cli/src/__tests__/install-command.test.ts b/cli/src/__tests__/install-command.test.ts
+index 9c8c06c1..3427ee41 100644
+--- a/cli/src/__tests__/install-command.test.ts
++++ b/cli/src/__tests__/install-command.test.ts
+@@ -115,6 +115,34 @@ describe("managed install commands", () => {
+     expect(runCommand.mock.calls[0]?.[0]).toBe(process.execPath);
+   });
+ 
++  it("keeps a payload staged ahead of a deploy instead of pruning it", async () => {
++    const paths = resolveInstallStorePaths();
++    const staged = payloadPathFor(paths, "git", "0123456789ab");
++    fs.mkdirSync(path.join(staged, "node_modules", "paperclipai", "dist"), { recursive: true });
++    fs.writeFileSync(path.join(staged, "node_modules", "paperclipai", "package.json"), JSON.stringify({ version: "0.3.1" }));
++    fs.writeFileSync(path.join(staged, "node_modules", "paperclipai", "dist", "index.js"), "#!/usr/bin/env node\n");
++
++    const version = "2026.720.0";
++    const runCommand = vi.fn(async (file: string, args: string[]) => {
++      if (file === "npm" && args[0] === "view") return { stdout: JSON.stringify(version), stderr: "" };
++      if (file === "npm" && args[0] === "install") {
++        const prefix = args[args.indexOf("--prefix") + 1];
++        const entrypoint = path.join(prefix, "node_modules", "paperclipai", "dist", "index.js");
++        fs.mkdirSync(path.dirname(entrypoint), { recursive: true });
++        fs.writeFileSync(entrypoint, "#!/usr/bin/env node\n");
++        return { stdout: "", stderr: "" };
++      }
++      if (file === process.execPath && args.at(-1) === "--version") return { stdout: `${version}\n`, stderr: "" };
++      throw new Error(`Unexpected command: ${file} ${args.join(" ")}`);
++    });
++
++    await installCommand({}, { runCommand, now: () => new Date("2026-07-22T18:00:00.000Z") });
++
++    expect(fs.existsSync(staged)).toBe(true);
++    expect(console.log).toHaveBeenCalledWith(expect.stringContaining("this store did not install"));
++    expect(fs.existsSync(path.join(readInstallManifest(paths)!.payloadPath, ".paperclip-managed-payload.json"))).toBe(true);
++  });
++
+   const createGitCheckoutRunCommand = (sha: string) =>
+     vi.fn(async (file: string, args: string[], _options?: Parameters<CommandRunner>[2]) => {
+       if (file === "curl" && !args.includes("--output")) return { stdout: JSON.stringify({ sha }), stderr: "" };
+diff --git a/cli/src/__tests__/install-store.test.ts b/cli/src/__tests__/install-store.test.ts
+index 1efc9e89..e7d88298 100644
+--- a/cli/src/__tests__/install-store.test.ts
++++ b/cli/src/__tests__/install-store.test.ts
+@@ -10,6 +10,7 @@ import {
+   buildNextManifest,
+   flipCurrentAtomic,
+   isManagedExecutable,
++  markInstallPayloads,
+   payloadPathFor,
+   pruneInstallPayloads,
+   readInstallManifest,
+@@ -19,6 +20,7 @@ import {
+   withInstallStoreLock,
+   writeInstallManifestAtomic,
+   writeManagedShim,
++  writePayloadMarker,
+   type InstallManifest,
+   type InstallRecord,
+ } from "../install-store.js";
+@@ -100,11 +102,54 @@ describe("managed install store", () => {
+     const next = buildNextManifest(record(payloads[3], "4"), previousManifest);
+ 
+     expect(next.previous.map((entry) => entry.version)).toEqual(["3", "2"]);
+-    expect(pruneInstallPayloads(next, paths)).toEqual([payloads[0]]);
++    // Payload 1 fell out of the manifest, so it carries the marker from when it
++    // was still tracked; only then may the store delete it.
++    markInstallPayloads(previousManifest, paths);
++    markInstallPayloads(next, paths);
++    expect(pruneInstallPayloads(next, paths)).toEqual({ removed: [payloads[0]], retainedUnmanaged: [] });
+     expect(fs.existsSync(payloads[0])).toBe(false);
+     expect(payloads.slice(1).every((payload) => fs.existsSync(payload))).toBe(true);
+   });
+ 
++  it("keeps a payload staged outside the manifest instead of pruning it", () => {
++    const active = payloadPathFor(paths, "npm", "2026.1.0");
++    const staged = payloadPathFor(paths, "git", "0123456789ab");
++    fs.mkdirSync(active, { recursive: true });
++    fs.mkdirSync(staged, { recursive: true });
++    const manifest: InstallManifest = { schemaVersion: INSTALL_MANIFEST_VERSION, ...record(active, "2026.1.0"), previous: [] };
++    markInstallPayloads(manifest, paths);
++
++    const result = pruneInstallPayloads(manifest, paths);
++
++    expect(result.removed).toEqual([]);
++    expect(result.retainedUnmanaged).toEqual([staged]);
++    expect(fs.existsSync(staged)).toBe(true);
++    expect(fs.existsSync(active)).toBe(true);
++  });
++
++  it("keeps a payload whose marker belongs to another install store", () => {
++    const staged = payloadPathFor(paths, "git", "abcdefabcdef");
++    fs.mkdirSync(staged, { recursive: true });
++    const otherStore = resolveInstallStorePaths({
++      homeDir: path.join(root, "other-home"),
++      paperclipHome: path.join(root, "other-home", ".paperclip"),
++    });
++    writePayloadMarker(staged, record(staged, "2026.1.0"), otherStore);
++    const manifest: InstallManifest = {
++      schemaVersion: INSTALL_MANIFEST_VERSION,
++      ...record(payloadPathFor(paths, "npm", "2026.1.0"), "2026.1.0"),
++      previous: [],
++    };
++    fs.mkdirSync(manifest.payloadPath, { recursive: true });
++    markInstallPayloads(manifest, paths);
++
++    const result = pruneInstallPayloads(manifest, paths);
++
++    expect(result.removed).toEqual([]);
++    expect(result.retainedUnmanaged).toEqual([staged]);
++    expect(fs.existsSync(staged)).toBe(true);
++  });
++
+   it("writes a stable shim with the validated runtime and custom store path", () => {
+     writeManagedShim(paths);
+     const shim = fs.readFileSync(paths.shimPath, "utf8");
+diff --git a/cli/src/commands/install.ts b/cli/src/commands/install.ts
+index b8083a14..f92247f6 100644
+--- a/cli/src/commands/install.ts
++++ b/cli/src/commands/install.ts
+@@ -11,6 +11,7 @@ import {
+   assertManagedShimWritable,
+   buildNextManifest,
+   flipCurrentAtomic,
++  markInstallPayloads,
+   payloadPathFor,
+   pruneInstallPayloads,
+   readInstallManifest,
+@@ -24,6 +25,18 @@ import {
+ 
+ const execFileAsync = promisify(execFile);
+ export const PUBLIC_NPM_REGISTRY = "https://registry.npmjs.org";
++
++export function reportPruneResult(
++  result: ReturnType<typeof pruneInstallPayloads>,
++  write: (message: string) => void = console.log,
++): void {
++  if (result.removed.length > 0) {
++    write(pc.dim(`Pruned ${result.removed.length} old payload${result.removed.length === 1 ? "" : "s"}: ${result.removed.join(", ")}`));
++  }
++  if (result.retainedUnmanaged.length > 0) {
++    write(pc.yellow(`Kept ${result.retainedUnmanaged.length} payload${result.retainedUnmanaged.length === 1 ? "" : "s"} this store did not install (staged ahead of a deploy?): ${result.retainedUnmanaged.join(", ")}`));
++  }
++}
+ const DEFAULT_GITHUB_REPO = "paperclipai/paperclip";
+ const EXACT_VERSION_PATTERN = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
+ 
+@@ -377,7 +390,10 @@ export async function installCommand(
+       const oldTarget = fs.existsSync(paths.currentPath) ? fs.readlinkSync(paths.currentPath) : null;
+       flipCurrentAtomic(payload.payloadPath, paths);
+       try { writeInstallManifestAtomic(nextManifest, paths); } catch (error) { if (oldTarget) flipCurrentAtomic(path.resolve(paths.cliRoot, oldTarget), paths); else fs.rmSync(paths.currentPath, { force: true }); throw error; }
+-      writeManagedShim(paths); pruneInstallPayloads(nextManifest, paths); return payload;
++      writeManagedShim(paths);
++      markInstallPayloads(nextManifest, paths);
++      reportPruneResult(pruneInstallPayloads(nextManifest, paths));
++      return payload;
+     }, paths);
+     await ensureShimOnPath(options);
+     console.log(pc.green(`${installed.reused ? "Activated cached" : "Installed"} paperclipai git payload ${sha.slice(0, 12)}.`));
+@@ -411,7 +427,8 @@ export async function installCommand(
+       throw error;
+     }
+     writeManagedShim(paths);
+-    pruneInstallPayloads(nextManifest, paths);
++    markInstallPayloads(nextManifest, paths);
++    reportPruneResult(pruneInstallPayloads(nextManifest, paths));
+     return payload;
+   }, paths);
+   await ensureShimOnPath(options);
+diff --git a/cli/src/commands/update.ts b/cli/src/commands/update.ts
+index 5ac0be9f..6eb9f02f 100644
+--- a/cli/src/commands/update.ts
++++ b/cli/src/commands/update.ts
+@@ -5,9 +5,9 @@ import { execFile } from "node:child_process";
+ import { promisify } from "node:util";
+ import * as p from "@clack/prompts";
+ import pc from "picocolors";
+-import { assertManagedShimWritable, writeManagedShim, buildNextManifest, flipCurrentAtomic, isManagedExecutable, pruneInstallPayloads, readInstallManifest, resolveInstallStorePaths, withInstallStoreLock, writeInstallManifestAtomic, type InstallChannel, type InstallManifest, type InstallRecord, type InstallStorePaths } from "../install-store.js";
++import { assertManagedShimWritable, writeManagedShim, buildNextManifest, flipCurrentAtomic, isManagedExecutable, markInstallPayloads, pruneInstallPayloads, readInstallManifest, resolveInstallStorePaths, withInstallStoreLock, writeInstallManifestAtomic, type InstallChannel, type InstallManifest, type InstallRecord, type InstallStorePaths } from "../install-store.js";
+ import { dbBackupCommand } from "./db-backup.js";
+-import { assertSupportedNodeVersion, installGitPayload, installNpmPayload, PUBLIC_NPM_REGISTRY, resolveGitHubRef, resolvePublishedVersion, type CommandRunner } from "./install.js";
++import { assertSupportedNodeVersion, installGitPayload, installNpmPayload, PUBLIC_NPM_REGISTRY, reportPruneResult, resolveGitHubRef, resolvePublishedVersion, type CommandRunner } from "./install.js";
+ import { resolvePaperclipInstanceId, resolvePaperclipInstanceRoot } from "../config/home.js";
+ import { resolveConfigPath } from "../config/store.js";
+ import { detectServiceManager } from "../services/service-manager.js";
+@@ -200,7 +200,9 @@ export async function updateCommand(options: UpdateOptions, overrides: Partial<D
+       const record: InstallRecord = { source: "git", version: payload.version, channel: "pinned", repo: manifest.repo, ref: manifest.ref, sha: targetSha, payloadPath: payload.payloadPath, installedAt: (overrides.now?.() ?? new Date()).toISOString() };
+       const next = buildNextManifest(record, manifest); const oldTarget = fs.readlinkSync(paths.currentPath); flipCurrentAtomic(payload.payloadPath, paths);
+       try { writeInstallManifestAtomic(next, paths); } catch (error) { flipCurrentAtomic(path.resolve(paths.cliRoot, oldTarget), paths); throw error; }
+-      pruneInstallPayloads(next, paths); return payload;
++      markInstallPayloads(next, paths);
++      reportPruneResult(pruneInstallPayloads(next, paths), (message) => { if (!options.json) console.log(message); });
++      return payload;
+     }, paths);
+     let restarted: boolean;
+     try {
+@@ -256,7 +258,9 @@ export async function updateCommand(options: UpdateOptions, overrides: Partial<D
+     const record: InstallRecord = { source: "npm", version: targetVersion, channel: request.channel, payloadPath: payload.payloadPath, installedAt: (overrides.now?.() ?? new Date()).toISOString() };
+     const next = buildNextManifest(record, manifest); const oldTarget = fs.readlinkSync(paths.currentPath); flipCurrentAtomic(payload.payloadPath, paths);
+     try { writeInstallManifestAtomic(next, paths); } catch (error) { flipCurrentAtomic(path.resolve(paths.cliRoot, oldTarget), paths); throw error; }
+-    pruneInstallPayloads(next, paths); return payload;
++    markInstallPayloads(next, paths);
++    reportPruneResult(pruneInstallPayloads(next, paths), (message) => { if (!options.json) console.log(message); });
++    return payload;
+   }, paths);
+   let restarted: boolean;
+   try {
+diff --git a/cli/src/install-store.ts b/cli/src/install-store.ts
+index 984d955b..358282fd 100644
+--- a/cli/src/install-store.ts
++++ b/cli/src/install-store.ts
+@@ -212,6 +212,91 @@ export function payloadPathFor(
+   return path.join(paths.installsRoot, source, identifier);
+ }
+ 
++export const PAYLOAD_MARKER_VERSION = 1;
++export const PAYLOAD_MARKER_FILENAME = ".paperclip-managed-payload.json";
++
++/**
++ * Written into every payload the store activates. Pruning trusts this marker and
++ * nothing else: a payload staged by hand (or built against a scratch store and
++ * moved in) carries no matching marker, so the next install leaves it alone
++ * instead of deleting a build that was staged ahead of a restart window.
++ */
++export type PayloadMarker = {
++  schemaVersion: typeof PAYLOAD_MARKER_VERSION;
++  managedBy: "paperclipai";
++  installsRoot: string;
++  payloadPath: string;
++  source: InstallSource;
++  version: string;
++  installedAt: string;
++};
++
++function payloadMarkerPath(payloadPath: string): string {
++  return path.join(payloadPath, PAYLOAD_MARKER_FILENAME);
++}
++
++export function writePayloadMarker(
++  payloadPath: string,
++  record: Pick<InstallRecord, "source" | "version" | "installedAt">,
++  paths = resolveInstallStorePaths(),
++): void {
++  const marker: PayloadMarker = {
++    schemaVersion: PAYLOAD_MARKER_VERSION,
++    managedBy: "paperclipai",
++    installsRoot: path.resolve(paths.installsRoot),
++    payloadPath: path.resolve(payloadPath),
++    source: record.source,
++    version: record.version,
++    installedAt: record.installedAt,
++  };
++  writeFileAtomic(payloadMarkerPath(payloadPath), `${JSON.stringify(marker, null, 2)}\n`, 0o600);
++}
++
++export function readPayloadMarker(payloadPath: string): PayloadMarker | null {
++  try {
++    const value = JSON.parse(fs.readFileSync(payloadMarkerPath(payloadPath), "utf8")) as PayloadMarker;
++    if (
++      value?.schemaVersion !== PAYLOAD_MARKER_VERSION ||
++      value.managedBy !== "paperclipai" ||
++      typeof value.installsRoot !== "string" ||
++      typeof value.payloadPath !== "string"
++    ) {
++      return null;
++    }
++    return value;
++  } catch {
++    return null;
++  }
++}
++
++/**
++ * A payload belongs to this store only when its marker names both this store and
++ * this directory. A payload copied from another install store (the documented
++ * way to avoid a rebuild in the window) therefore stays foreign until the store
++ * activates it and rewrites the marker for its own path.
++ */
++export function isManagedPayload(
++  payloadPath: string,
++  paths = resolveInstallStorePaths(),
++): boolean {
++  const marker = readPayloadMarker(payloadPath);
++  return (
++    marker !== null &&
++    path.resolve(marker.installsRoot) === path.resolve(paths.installsRoot) &&
++    path.resolve(marker.payloadPath) === path.resolve(payloadPath)
++  );
++}
++
++export function markInstallPayloads(
++  manifest: InstallManifest,
++  paths = resolveInstallStorePaths(),
++): void {
++  for (const record of [manifest, ...manifest.previous]) {
++    if (!fs.existsSync(record.payloadPath)) continue;
++    writePayloadMarker(record.payloadPath, record, paths);
++  }
++}
++
+ export function readInstallManifest(paths = resolveInstallStorePaths()): InstallManifest | null {
+   try {
+     const value = JSON.parse(fs.readFileSync(paths.manifestPath, "utf8")) as InstallManifest;
+@@ -321,14 +406,20 @@ export function buildNextManifest(
+   return { schemaVersion: INSTALL_MANIFEST_VERSION, ...record, previous };
+ }
+ 
++export type PruneInstallPayloadsResult = {
++  removed: string[];
++  retainedUnmanaged: string[];
++};
++
+ export function pruneInstallPayloads(
+   manifest: InstallManifest,
+   paths = resolveInstallStorePaths(),
+-): string[] {
++): PruneInstallPayloadsResult {
+   const retained = new Set(
+     [manifest, ...manifest.previous].map((record) => path.resolve(record.payloadPath)),
+   );
+   const removed: string[] = [];
++  const retainedUnmanaged: string[] = [];
+   for (const source of ["npm", "git"] as const) {
+     const sourceRoot = path.join(paths.installsRoot, source);
+     if (!fs.existsSync(sourceRoot)) continue;
+@@ -339,13 +430,19 @@ export function pruneInstallPayloads(
+     for (const entry of fs.readdirSync(sourceRoot)) {
+       if (entry.startsWith(".")) continue;
+       const candidate = path.join(sourceRoot, entry);
+-      if (!retained.has(path.resolve(candidate))) {
+-        fs.rmSync(candidate, { recursive: true, force: true });
+-        removed.push(candidate);
++      if (retained.has(path.resolve(candidate))) continue;
++      const candidateStat = fs.lstatSync(candidate);
++      if (!candidateStat.isDirectory() || candidateStat.isSymbolicLink() || !isManagedPayload(candidate, paths)) {
++        // Not ours to delete: the caller staged it, or it came from another
++        // store. Removing it would silently destroy a build made for a window.
++        retainedUnmanaged.push(candidate);
++        continue;
+       }
++      fs.rmSync(candidate, { recursive: true, force: true });
++      removed.push(candidate);
+     }
+   }
+-  return removed;
++  return { removed, retainedUnmanaged };
+ }
+ 
+ export function assertManagedShimWritable(paths = resolveInstallStorePaths()): void {
