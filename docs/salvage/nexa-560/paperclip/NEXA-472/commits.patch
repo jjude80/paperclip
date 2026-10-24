@@ -1,0 +1,635 @@
+From 8f42413d70f09ce6c114443bc00a479e2ad54f52 Mon Sep 17 00:00:00 2001
+From: jjude80 <18168364+jjude80@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 22:22:12 -0400
+Subject: [PATCH] fix(opencode): recover agents from transient provider
+ failures
+
+The OpenCode adapter returned no machine-readable error class, so the
+server's existing bounded-transient-retry path could never see an
+opencode failure. A provider blip therefore left the agent row in error
+with no next run and the card parked.
+
+Classify failed attempts as provider_quota or transient_upstream, retry
+transient transport blips in-run with bounded backoff, and keep the
+agent idle only when a durable retry was actually queued. Non-transient
+failures still end in error, and retry exhaustion stays visible.
+---
+ .../opencode-local/src/server/execute.test.ts |  93 ++++++++++++
+ .../opencode-local/src/server/execute.ts      |  58 +++++++-
+ .../opencode-local/src/server/parse.test.ts   |  40 +++++-
+ .../opencode-local/src/server/parse.ts        |  47 +++++++
+ .../heartbeat-retry-scheduling.test.ts        | 133 ++++++++++++++++++
+ server/src/services/heartbeat/retries.ts      |   1 +
+ .../services/heartbeat/run-completion.test.ts |  59 ++++++++
+ .../src/services/heartbeat/run-completion.ts  |  14 +-
+ 8 files changed, 433 insertions(+), 12 deletions(-)
+
+diff --git a/packages/adapters/opencode-local/src/server/execute.test.ts b/packages/adapters/opencode-local/src/server/execute.test.ts
+index 8307883e..ffaef9dd 100644
+--- a/packages/adapters/opencode-local/src/server/execute.test.ts
++++ b/packages/adapters/opencode-local/src/server/execute.test.ts
+@@ -356,3 +356,96 @@ describe("ensureRemoteOpenCodeModelConfiguredAndAvailable — probe is non-fatal
+     ).rejects.toThrow("Configured OpenCode model is unavailable on the remote execution target");
+   });
+ });
++
++describe("OpenCode API error retry and classification", () => {
++  let configHome: string;
++
++  beforeEach(async () => {
++    configHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-test-api-retry-"));
++    vi.stubEnv("XDG_CONFIG_HOME", configHome);
++  });
++
++  afterEach(async () => {
++    vi.unstubAllEnvs();
++    await fs.rm(configHome, { recursive: true, force: true });
++  });
++
++  async function runWithResults(name: string, results: Array<Record<string, unknown>>) {
++    const commandPath = path.join(configHome, `fake-opencode-${name}`);
++    await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
++    const logs: string[] = [];
++    runProcessMock.mockReset();
++    for (const result of results) runProcessMock.mockResolvedValueOnce(probeResult(result));
++    const response = await execute({
++      runId: `run-${name}`,
++      agent: { id: "agent-1", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
++      runtime: { sessionId: "s1", sessionParams: null, sessionDisplayId: null, taskKey: null },
++      config: { command: commandPath, cwd: configHome, model: "openai/gpt-5", env: { OPENCODE_ALLOW_ALL_MODELS: "1" } },
++      context: {},
++      onLog: async (_stream, chunk) => { logs.push(chunk); },
++    });
++    return { response, logs };
++  }
++
++  it("retries a transient API error with the same session", async () => {
++    vi.spyOn(global, "setTimeout").mockImplementation((fn: () => void) => { fn(); return 0 as never; });
++    try {
++      const { response, logs } = await runWithResults("retry", [
++        { exitCode: 1, stdout: JSON.stringify({ type: "error", error: "429 Too Many Requests" }) },
++        { exitCode: 0, stdout: JSON.stringify({ type: "text", sessionID: "s1", part: { text: "done" } }) },
++      ]);
++      expect(response.exitCode).toBe(0);
++      expect(logs.some(line => line.includes("API error"))).toBe(true);
++      expect(runProcessMock).toHaveBeenCalledTimes(2);
++    } finally {
++      vi.restoreAllMocks();
++    }
++  });
++
++  it("does not retry a provider quota wall in-run and classifies it for durable recovery", async () => {
++    const { response, logs } = await runWithResults("quota", [
++      { exitCode: 1, stdout: JSON.stringify({ type: "error", error: "Free usage limit reached. Connect a provider or subscribe to OpenCode Go to keep going, or switch models." }) },
++    ]);
++    expect(response.exitCode).toBe(1);
++    expect(response.errorCode).toBe("provider_quota");
++    expect(response.errorFamily).toBe("provider_quota");
++    expect(response.resultJson).toMatchObject({ errorFamily: "provider_quota" });
++    expect(logs.some(line => line.includes("API error"))).toBe(false);
++    expect(runProcessMock).toHaveBeenCalledTimes(1);
++  });
++
++  it("classifies an exhausted transient upstream failure after bounded retries", async () => {
++    vi.spyOn(global, "setTimeout").mockImplementation((fn: () => void) => { fn(); return 0 as never; });
++    try {
++      const { response } = await runWithResults("exhaust", Array.from({ length: 6 }, () => ({
++        exitCode: 1,
++        stdout: JSON.stringify({ type: "error", error: "Upstream request failed: Endpoint is unavailable." }),
++      })));
++      expect(response.exitCode).toBe(1);
++      expect(response.errorCode).toBe("opencode_transient_upstream");
++      expect(response.errorFamily).toBe("transient_upstream");
++      expect(response.errorMessage).toContain("Endpoint is unavailable");
++      expect(runProcessMock).toHaveBeenCalledTimes(6);
++    } finally {
++      vi.restoreAllMocks();
++    }
++  });
++
++  it("does not retry or classify a non-transient failure", async () => {
++    const { response } = await runWithResults("no-retry", [
++      { exitCode: 1, stdout: JSON.stringify({ type: "error", error: "Some random error" }) },
++    ]);
++    expect(response.exitCode).toBe(1);
++    expect(response.errorCode).toBeNull();
++    expect(response.errorFamily).toBeNull();
++    expect(runProcessMock).toHaveBeenCalledTimes(1);
++  });
++
++  it("does not retry when the attempt timed out", async () => {
++    const { response } = await runWithResults("timeout", [
++      { exitCode: null, timedOut: true, stdout: "", stderr: "" },
++    ]);
++    expect(response.timedOut).toBe(true);
++    expect(runProcessMock).toHaveBeenCalledTimes(1);
++  });
++});
+diff --git a/packages/adapters/opencode-local/src/server/execute.ts b/packages/adapters/opencode-local/src/server/execute.ts
+index e9cbac64..4f20d73d 100644
+--- a/packages/adapters/opencode-local/src/server/execute.ts
++++ b/packages/adapters/opencode-local/src/server/execute.ts
+@@ -53,7 +53,13 @@ import {
+   readPaperclipIssueWorkModeFromContext,
+   resolveLegacyPaperclipDesiredSkillNames,
+ } from "@paperclipai/adapter-utils/server-utils";
+-import { isOpenCodeUnknownSessionError, parseOpenCodeJsonl, createOpenCodeJsonlParser } from "./parse.js";
++import {
++  classifyOpenCodeFailure,
++  isOpenCodeApiError,
++  isOpenCodeUnknownSessionError,
++  parseOpenCodeJsonl,
++  createOpenCodeJsonlParser,
++} from "./parse.js";
+ import {
+   ensureOpenCodeModelConfiguredAndAvailable,
+   isTruthyEnvFlag,
+@@ -91,6 +97,15 @@ function resolveOpenCodeBiller(env: Record<string, string>, provider: string | n
+ const REMOTE_OPENCODE_MODELS_PROBE_DEFAULT_TIMEOUT_SEC = 20;
+ const REMOTE_OPENCODE_MODELS_PROBE_SANDBOX_TIMEOUT_SEC = 120;
+ 
++// In-run retries only cover transient transport/provider blips. Quota walls
++// are classified separately and go straight to the durable recovery path.
++const API_RETRY_DELAYS_MS = [5_000, 15_000, 30_000, 60_000, 120_000];
++const MAX_API_RETRIES = API_RETRY_DELAYS_MS.length;
++
++function sleep(ms: number): Promise<void> {
++  return new Promise((resolve) => setTimeout(resolve, ms));
++}
++
+ export async function ensureRemoteOpenCodeModelConfiguredAndAvailable(input: {
+   runId: string;
+   executionTarget: NonNullable<AdapterExecutionContext["executionTarget"]>;
+@@ -761,6 +776,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
+         stderrLine ||
+         `OpenCode exited with code ${synthesizedExitCode ?? -1}`;
+       const modelId = model || null;
++      const failureClassification =
++        (synthesizedExitCode ?? 0) !== 0 || parsedError
++          ? classifyOpenCodeFailure(parsedError || attempt.proc.stdout, attempt.rawStderr)
++          : null;
+ 
+       return {
+         exitCode: synthesizedExitCode,
+@@ -772,8 +791,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
+         errorMessage: (synthesizedExitCode ?? 0) === 0 ? null : fallbackErrorMessage,
+         // Forward the transport-level error code from the run-disposition seam.
+         // A lost duplex control channel surfaces the typed `duplex_channel_lost`
+-        // code; every other result carries no code here.
+-        errorCode: attempt.proc.errorCode ?? null,
++        // code; every other result carries the classification of its provider
++        // failure (or no code when the failure is not retryable).
++        errorCode: attempt.proc.errorCode ?? failureClassification?.errorCode ?? null,
++        errorFamily: failureClassification?.errorFamily ?? null,
+         usage: attempt.parsed.usageReported ? attempt.parsed.usage : undefined,
+         sessionId: resolvedSessionId,
+         sessionParams: resolvedSessionParams,
+@@ -788,6 +809,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
+           adapterExecutionTimeout,
+           stdout: attempt.proc.stdout,
+           stderr: attempt.proc.stderr,
++          ...(failureClassification
++            ? { errorFamily: failureClassification.errorFamily }
++            : {}),
+         },
+         summary: attempt.parsed.summary,
+         clearSession: Boolean(clearSessionOnMissingSession && !attempt.parsed.sessionId),
+@@ -795,13 +819,33 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
+     };
+ 
+     try {
+-      const initial = await runAttempt(sessionId);
++      let attempt = await runAttempt(sessionId);
++      let retries = 0;
++
++      while (
++        retries < MAX_API_RETRIES &&
++        !attempt.proc.timedOut &&
++        !attempt.proc.signal &&
++        ((attempt.proc.exitCode ?? 0) !== 0 || Boolean(attempt.parsed.errorMessage)) &&
++        isOpenCodeApiError(attempt.parsed.errorMessage || attempt.proc.stdout, attempt.rawStderr)
++      ) {
++        const delayMs = API_RETRY_DELAYS_MS[retries]!;
++        await onLog(
++          "stdout",
++          `[paperclip] OpenCode API error (attempt ${retries + 1}/${MAX_API_RETRIES}); retrying in ${delayMs / 1000}s...\n`,
++        );
++        await sleep(delayMs);
++        retries++;
++        attempt = await runAttempt(sessionId);
++      }
++
+       const initialFailed =
+-        !initial.proc.timedOut && ((initial.proc.exitCode ?? 0) !== 0 || Boolean(initial.parsed.errorMessage));
++        !attempt.proc.timedOut && ((attempt.proc.exitCode ?? 0) !== 0 || Boolean(attempt.parsed.errorMessage));
+       if (
+         sessionId &&
++        retries === 0 &&
+         initialFailed &&
+-        isOpenCodeUnknownSessionError(initial.proc.stdout, initial.rawStderr)
++        isOpenCodeUnknownSessionError(attempt.proc.stdout, attempt.rawStderr)
+       ) {
+         await onLog(
+           "stdout",
+@@ -811,7 +855,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
+         return toResult(retry, true);
+       }
+ 
+-      return toResult(initial);
++      return toResult(attempt);
+     } finally {
+       try {
+         await providerStop.collectBeforeRestore();
+diff --git a/packages/adapters/opencode-local/src/server/parse.test.ts b/packages/adapters/opencode-local/src/server/parse.test.ts
+index 66e4604a..d71d5c83 100644
+--- a/packages/adapters/opencode-local/src/server/parse.test.ts
++++ b/packages/adapters/opencode-local/src/server/parse.test.ts
+@@ -1,5 +1,11 @@
+ import { describe, expect, it } from "vitest";
+-import { parseOpenCodeJsonl, isOpenCodeUnknownSessionError } from "./parse.js";
++import {
++  classifyOpenCodeFailure,
++  isOpenCodeApiError,
++  isOpenCodeProviderQuotaError,
++  parseOpenCodeJsonl,
++  isOpenCodeUnknownSessionError,
++} from "./parse.js";
+ 
+ describe("parseOpenCodeJsonl", () => {
+   it("parses assistant text, usage, cost, and errors", () => {
+@@ -95,3 +101,35 @@ describe("OpenCode reported usage completeness", () => {
+     expect(parseOpenCodeJsonl(line + '\n' + JSON.stringify({ type: "step_finish" }))).toMatchObject({ usageReported: true, usageComplete: false });
+   });
+ });
++
++describe("OpenCode failure classification", () => {
++  it.each([
++    "Upstream request failed: Endpoint is unavailable.",
++    "429 Too Many Requests",
++    "529 Overloaded",
++    "Selected model is at capacity. Please try a different model.",
++    "read: connection reset by peer (ECONNRESET)",
++    "Cloudflare 502 Bad Gateway",
++  ])("classifies %s as transient upstream", (message) => {
++    expect(classifyOpenCodeFailure("", message)).toEqual({
++      errorCode: "opencode_transient_upstream",
++      errorFamily: "transient_upstream",
++    });
++  });
++
++  it("classifies a provider usage wall as provider quota", () => {
++    const message =
++      "Free usage limit reached. Connect a provider or subscribe to OpenCode Go to keep going, or switch models.";
++    expect(isOpenCodeProviderQuotaError("", message)).toBe(true);
++    expect(isOpenCodeApiError("", message)).toBe(false);
++    expect(classifyOpenCodeFailure("", message)).toEqual({
++      errorCode: "provider_quota",
++      errorFamily: "provider_quota",
++    });
++  });
++
++  it("returns null for a non-transient failure so the server leaves it terminal", () => {
++    expect(classifyOpenCodeFailure("", "TypeError: cannot read properties of undefined")).toBeNull();
++    expect(classifyOpenCodeFailure("", "tool_use failed: invalid arguments")).toBeNull();
++  });
++});
+diff --git a/packages/adapters/opencode-local/src/server/parse.ts b/packages/adapters/opencode-local/src/server/parse.ts
+index c244fa0e..aef49a72 100644
+--- a/packages/adapters/opencode-local/src/server/parse.ts
++++ b/packages/adapters/opencode-local/src/server/parse.ts
+@@ -117,3 +117,50 @@ export function isOpenCodeUnknownSessionError(stdout: string, stderr: string): b
+     haystack,
+   );
+ }
++
++// Provider-level usage walls. These do not clear on the retry cadence an
++// in-run retry can afford, so they carry their own family and are handed to
++// the durable quota recovery path instead of being retried in-process.
++const OPENCODE_PROVIDER_QUOTA_RE =
++  /free usage limit reached|usage limit (?:reached|exceeded)|provider quota|quota (?:limit )?exceeded|insufficient (?:credits|balance)|out of credits|credit balance|subscribe to opencode/i;
++
++// Transient transport/provider failures: a short outage, rate limit or
++// capacity wall that may clear while the run is still alive.
++const OPENCODE_TRANSIENT_UPSTREAM_RE =
++  /rate.?limit|too.?many.?requests|\b429\b|overloaded|\b529\b|throttl|model (?:is )?at capacity|at capacity|service.?unavailable|endpoint.?unavailable|\bunavailable\b|\b503\b|socket.?hang.?up|fetch.?failed|econnreset|econnrefused|etimedout|enotfound|\beof\b|cloudflare|gateway.?error|bad.?gateway|\b50[24]\b/i;
++
++export function isOpenCodeProviderQuotaError(stdout: string, stderr: string): boolean {
++  return OPENCODE_PROVIDER_QUOTA_RE.test(`${stdout}\n${stderr}`);
++}
++
++export function isOpenCodeApiError(stdout: string, stderr: string): boolean {
++  const haystack = `${stdout}\n${stderr}`;
++  if (OPENCODE_PROVIDER_QUOTA_RE.test(haystack)) return false;
++  return OPENCODE_TRANSIENT_UPSTREAM_RE.test(haystack);
++}
++
++export type OpenCodeFailureClassification = {
++  errorCode: "provider_quota" | "opencode_transient_upstream";
++  errorFamily: "provider_quota" | "transient_upstream";
++};
++
++/**
++ * Machine-readable classification for a failed OpenCode attempt. A null
++ * result is deliberately terminal: the server must leave a non-transient
++ * failure in `error` rather than retrying it.
++ */
++export function classifyOpenCodeFailure(
++  stdout: string,
++  stderr: string,
++): OpenCodeFailureClassification | null {
++  if (isOpenCodeProviderQuotaError(stdout, stderr)) {
++    return { errorCode: "provider_quota", errorFamily: "provider_quota" };
++  }
++  if (isOpenCodeApiError(stdout, stderr)) {
++    return {
++      errorCode: "opencode_transient_upstream",
++      errorFamily: "transient_upstream",
++    };
++  }
++  return null;
++}
+diff --git a/server/src/__tests__/heartbeat-retry-scheduling.test.ts b/server/src/__tests__/heartbeat-retry-scheduling.test.ts
+index 1bb89e34..8ee24490 100644
+--- a/server/src/__tests__/heartbeat-retry-scheduling.test.ts
++++ b/server/src/__tests__/heartbeat-retry-scheduling.test.ts
+@@ -71,6 +71,8 @@ const mockedAppendHeartbeatRunEvent = vi.mocked(appendHeartbeatRunEvent);
+ const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
+ const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+ const PROVIDER_QUOTA_TEST_ADAPTER = "provider_quota_test";
++const OPENCODE_TRANSIENT_TEST_ADAPTER = "opencode_transient_test";
++const OPENCODE_TERMINAL_TEST_ADAPTER = "opencode_terminal_test";
+ 
+ if (!embeddedPostgresSupport.supported) {
+   console.warn(
+@@ -125,6 +127,40 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
+         testedAt: new Date().toISOString(),
+       }),
+     });
++    registerServerAdapter({
++      type: OPENCODE_TRANSIENT_TEST_ADAPTER,
++      execute: async () => ({
++        exitCode: 1,
++        signal: null,
++        timedOut: false,
++        errorMessage: "Upstream request failed: Endpoint is unavailable.",
++        errorCode: "opencode_transient_upstream",
++        errorFamily: "transient_upstream",
++        resultJson: { errorFamily: "transient_upstream", conversationContinuation: "continue_conversation_v1" },
++      }),
++      testEnvironment: async () => ({
++        adapterType: OPENCODE_TRANSIENT_TEST_ADAPTER,
++        status: "pass",
++        checks: [],
++        testedAt: new Date().toISOString(),
++      }),
++    });
++    registerServerAdapter({
++      type: OPENCODE_TERMINAL_TEST_ADAPTER,
++      execute: async () => ({
++        exitCode: 1,
++        signal: null,
++        timedOut: false,
++        errorMessage: "Tool crashed while parsing its arguments",
++        resultJson: { conversationContinuation: "continue_conversation_v1" },
++      }),
++      testEnvironment: async () => ({
++        adapterType: OPENCODE_TERMINAL_TEST_ADAPTER,
++        status: "pass",
++        checks: [],
++        testedAt: new Date().toISOString(),
++      }),
++    });
+   }, 20_000);
+ 
+   afterEach(async () => {
+@@ -141,6 +177,8 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
+ 
+   afterAll(async () => {
+     unregisterServerAdapter(PROVIDER_QUOTA_TEST_ADAPTER);
++    unregisterServerAdapter(OPENCODE_TRANSIENT_TEST_ADAPTER);
++    unregisterServerAdapter(OPENCODE_TERMINAL_TEST_ADAPTER);
+     await tempDb?.cleanup();
+   });
+ 
+@@ -400,6 +438,101 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
+       .toEqual({ status: "idle", errorReason: null });
+   });
+ 
++  async function seedInvokableAgent(adapterType: string, name: string) {
++    const companyId = randomUUID();
++    const agentId = randomUUID();
++    await db.insert(companies).values({
++      id: companyId,
++      name: "Paperclip",
++      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
++      requireBoardApprovalForNewAgents: false,
++      defaultResponsibleUserId: "responsible-user",
++    });
++    await db.insert(agents).values({
++      id: agentId,
++      companyId,
++      name,
++      role: "engineer",
++      status: "idle",
++      adapterType,
++      adapterConfig: {},
++      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
++      permissions: {},
++    });
++    return { companyId, agentId };
++  }
++
++  it("schedules a bounded retry and leaves the agent idle on a transient upstream failure", async () => {
++    const { agentId } = await seedInvokableAgent(OPENCODE_TRANSIENT_TEST_ADAPTER, "Transient OpenCode");
++    const run = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
++    expect(run).not.toBeNull();
++
++    const failedRun = await waitForRunToFinish(heartbeat, run!.id, 20_000);
++    expect(failedRun?.status).toBe("failed");
++    expect(failedRun?.errorCode).toBe("opencode_transient_upstream");
++    expect((failedRun?.resultJson as Record<string, unknown> | null)?.errorFamily).toBe("transient_upstream");
++
++    await expect
++      .poll(
++        () =>
++          db
++            .select({ id: heartbeatRuns.id })
++            .from(heartbeatRuns)
++            .where(eq(heartbeatRuns.retryOfRunId, run!.id))
++            .then((rows) => rows.length),
++        { timeout: 5_000, interval: 50 },
++      )
++      .toBe(1);
++
++    const retryRun = await db
++      .select({
++        status: heartbeatRuns.status,
++        scheduledRetryReason: heartbeatRuns.scheduledRetryReason,
++        scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
++      })
++      .from(heartbeatRuns)
++      .where(eq(heartbeatRuns.retryOfRunId, run!.id))
++      .then((rows) => rows[0] ?? null);
++    expect(retryRun?.status).toBe("scheduled_retry");
++    expect(retryRun?.scheduledRetryReason).toBe("transient_failure");
++    expect(retryRun?.scheduledRetryAt).toBeInstanceOf(Date);
++
++    await expect
++      .poll(
++        () =>
++          db
++            .select({ status: agents.status, errorReason: agents.errorReason })
++            .from(agents)
++            .where(eq(agents.id, agentId))
++            .then((rows) => rows[0] ?? null),
++        { timeout: 5_000, interval: 50 },
++      )
++      .toEqual({ status: "idle", errorReason: null });
++  });
++
++  it("leaves the agent in error with no retry when the failure is not transient", async () => {
++    const { agentId } = await seedInvokableAgent(OPENCODE_TERMINAL_TEST_ADAPTER, "Terminal OpenCode");
++    const run = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
++    expect(run).not.toBeNull();
++
++    const failedRun = await waitForRunToFinish(heartbeat, run!.id, 20_000);
++    expect(failedRun?.status).toBe("failed");
++    expect(failedRun?.errorCode).toBe("adapter_failed");
++
++    await expect
++      .poll(
++        () =>
++          db
++            .select({ status: agents.status, errorReason: agents.errorReason })
++            .from(agents)
++            .where(eq(agents.id, agentId))
++            .then((rows) => rows[0] ?? null),
++        { timeout: 5_000, interval: 50 },
++      )
++      .toEqual({ status: "error", errorReason: "Tool crashed while parsing its arguments" });
++    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, run!.id))).toHaveLength(0);
++  });
++
+   async function seedMaxTurnFixture(input?: {
+     companyId?: string;
+     agentId?: string;
+diff --git a/server/src/services/heartbeat/retries.ts b/server/src/services/heartbeat/retries.ts
+index 329a4da7..5fcf54bf 100644
+--- a/server/src/services/heartbeat/retries.ts
++++ b/server/src/services/heartbeat/retries.ts
+@@ -251,6 +251,7 @@ export function readHeartbeatRunErrorFamily(
+   if (
+     run.errorCode === "codex_transient_upstream" ||
+     run.errorCode === "claude_transient_upstream" ||
++    run.errorCode === "opencode_transient_upstream" ||
+     run.errorCode === "codex_harness_crash"
+   ) {
+     return "transient_upstream";
+diff --git a/server/src/services/heartbeat/run-completion.test.ts b/server/src/services/heartbeat/run-completion.test.ts
+index 39df53e1..58b149f7 100644
+--- a/server/src/services/heartbeat/run-completion.test.ts
++++ b/server/src/services/heartbeat/run-completion.test.ts
+@@ -165,6 +165,65 @@ describe.skipIf(!support.supported)("heartbeat run completion boundary", () => {
+     expect(f.deps.finalizeAgentStatus).toHaveBeenCalledWith(f.agent.id, expected, expect.any(String), expect.objectContaining({ keepIdleOnFailure: result.errorCode === "provider_quota" }));
+   });
+ 
++  it("keeps a transiently failed agent idle when a bounded retry is scheduled", async () => {
++    const f = await fixture();
++    Object.assign(f.input.adapterResult, {
++      exitCode: 1,
++      errorCode: "opencode_transient_upstream",
++      errorFamily: "transient_upstream",
++      errorMessage: "Upstream request failed: Endpoint is unavailable.",
++      resultJson: { errorFamily: "transient_upstream" },
++    });
++    f.deps.scheduleBoundedRetryForRun.mockResolvedValueOnce({
++      outcome: "scheduled", run: { id: randomUUID() }, dueAt: new Date(), attempt: 1, maxAttempts: 2, reusedExisting: false,
++    } as never);
++    await f.completion.completeRun(f.input);
++    expect(await read(f.run.id)).toMatchObject({
++      status: "failed",
++      errorCode: "opencode_transient_upstream",
++      resultJson: { errorFamily: "transient_upstream" },
++    });
++    expect(f.deps.scheduleBoundedRetryForRun).toHaveBeenCalledOnce();
++    expect(f.deps.finalizeAgentStatus).toHaveBeenCalledWith(
++      f.agent.id, "failed", expect.any(String),
++      expect.objectContaining({ keepIdleOnFailure: true }),
++    );
++  });
++
++  it("keeps the agent in error when transient retries are exhausted", async () => {
++    const f = await fixture();
++    Object.assign(f.input.adapterResult, {
++      exitCode: 1,
++      errorCode: "opencode_transient_upstream",
++      errorFamily: "transient_upstream",
++      errorMessage: "Upstream request failed: Endpoint is unavailable.",
++      resultJson: { errorFamily: "transient_upstream" },
++    });
++    f.deps.scheduleBoundedRetryForRun.mockResolvedValueOnce({
++      outcome: "retry_exhausted", attempt: 3, maxAttempts: 2,
++    } as never);
++    await f.completion.completeRun(f.input);
++    expect(f.deps.scheduleBoundedRetryForRun).toHaveBeenCalledOnce();
++    expect(f.deps.finalizeAgentStatus).toHaveBeenCalledWith(
++      f.agent.id, "failed", expect.any(String),
++      expect.objectContaining({ keepIdleOnFailure: false }),
++    );
++  });
++
++  it("does not schedule a retry and keeps the agent in error for a non-transient failure", async () => {
++    const f = await fixture();
++    Object.assign(f.input.adapterResult, {
++      exitCode: 1,
++      errorMessage: "Tool crashed while parsing its arguments",
++    });
++    await f.completion.completeRun(f.input);
++    expect(f.deps.scheduleBoundedRetryForRun).not.toHaveBeenCalled();
++    expect(f.deps.finalizeAgentStatus).toHaveBeenCalledWith(
++      f.agent.id, "failed", expect.any(String),
++      expect.objectContaining({ keepIdleOnFailure: false }),
++    );
++  });
++
+   it.each(["completeRun", "failRun"] as const)("waits for an owned Stop before %s can write a competing outcome", async operation => {
+     const f = await fixture();
+     let settle!: () => void;
+diff --git a/server/src/services/heartbeat/run-completion.ts b/server/src/services/heartbeat/run-completion.ts
+index 7f2b486d..2ba4dd57 100644
+--- a/server/src/services/heartbeat/run-completion.ts
++++ b/server/src/services/heartbeat/run-completion.ts
+@@ -721,12 +721,17 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
+     );
+ 
+     const finalizedRun = persistedRun ?? (await getRun(run.id));
++    // A classified transient failure only keeps the agent out of `error`
++    // when a bounded retry was actually queued. Exhaustion is terminal and
++    // must stay visible on the agent row.
++    let transientRetryScheduled = false;
+     const settleAgent = () => finalizeAgentStatus(agent.id, outcome, runErrorMessage, {
+       keepIdleOnFailure:
+         outcome === "failed" &&
+-        ((finalizedRun
+-          ? readHeartbeatRunErrorFamily(finalizedRun) === "provider_quota"
+-          : runErrorCode === "provider_quota") ||
++        (transientRetryScheduled ||
++          (finalizedRun
++            ? readHeartbeatRunErrorFamily(finalizedRun) === "provider_quota"
++            : runErrorCode === "provider_quota") ||
+           isWorkspaceSyncConflictFailure(adapterResult.errorMessage)),
+       wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
+     });
+@@ -936,7 +941,8 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
+         outcome === "failed" &&
+         readTransientRecoveryContractFromRun(livenessRun)
+       ) {
+-        await scheduleBoundedRetryForRun(livenessRun, agent);
++        const retry = await scheduleBoundedRetryForRun(livenessRun, agent);
++        transientRetryScheduled = retry?.outcome === "scheduled";
+       } else if (
+         outcome === "failed" &&
+         !(await legacyExecutionNeedsReconciliationWithEvidence(db, livenessRun))
+-- 
+2.47.3
+
