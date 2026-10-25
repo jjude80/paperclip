@@ -11857,6 +11857,14 @@ export function issueService(db: Db) {
             eq(issues.executionRunId, checkoutRunId),
           )
         : isNull(issues.executionRunId);
+      // A checkout claims the row for a run; it is not a review decision.
+      // `in_review` means the card sits in a reviewer's queue, so a checkout
+      // (including the mandated unbound-wake checkout) must leave it there
+      // instead of silently demoting it to `in_progress` and dropping it out of
+      // that queue. Every other status still becomes `in_progress`, and a card
+      // under review keeps its original `startedAt`.
+      const statusAfterCheckout = sql`case when ${issues.status} = 'in_review' then ${issues.status} else 'in_progress' end`;
+      const startedAtAfterCheckout = sql`case when ${issues.status} = 'in_review' then ${issues.startedAt} else ${now.toISOString()}::timestamptz end`;
       const updated = await db
         .update(issues)
         .set({
@@ -11864,8 +11872,8 @@ export function issueService(db: Db) {
           assigneeUserId: null,
           checkoutRunId,
           executionRunId: checkoutRunId,
-          status: "in_progress",
-          startedAt: now,
+          status: statusAfterCheckout,
+          startedAt: startedAtAfterCheckout,
           updatedAt: now,
         })
         .where(
