@@ -43,6 +43,12 @@ export async function uninstallCommand(
   const detect = dependencies.detectServiceManager ?? detectServiceManager;
   const platform = dependencies.platform ?? process.platform;
   const userHomeDir = dependencies.userHomeDir ?? os.homedir();
+
+  const paths = resolveInstallStorePaths();
+  const hadStore = fs.existsSync(paths.cliRoot);
+  // Refuse before touching the service: a store we will not remove must not
+  // cost the operator their running instance. These checks read only.
+  if (hadStore) assertManagedInstallStore(paths);
   const detection = await detect({ instanceId, platform });
   const otherDefinitions = otherServiceDefinitions(platform, userHomeDir, instanceId);
   if (otherDefinitions.length > 0) {
@@ -62,16 +68,17 @@ export async function uninstallCommand(
       );
     }
   }
-  if (detection.supported) {
-    const status = await detection.manager.status();
-    if (status.installed || status.active) await detection.manager.uninstall();
-  }
 
-  const paths = resolveInstallStorePaths();
-  const hadStore = fs.existsSync(paths.cliRoot);
-  if (hadStore) assertManagedInstallStore(paths);
   const shimRemoved = await withInstallStoreLock(async () => {
     if (hadStore) assertManagedInstallStore(paths);
+
+    // Mutation starts here, after every refusal path above and the store lock.
+    // A refused uninstall must never stop or remove the live service.
+    if (detection.supported) {
+      const status = await detection.manager.status();
+      if (status.installed || status.active) await detection.manager.uninstall();
+    }
+
     const removed = removeManagedShim(paths);
 
     const home = process.env.HOME;

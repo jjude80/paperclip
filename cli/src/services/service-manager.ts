@@ -41,7 +41,35 @@ export interface ServiceManager {
 export type CommandResult = { stdout: string; stderr: string };
 export type CommandRunner = (command: string, args: string[], options?: { inherit?: boolean }) => Promise<CommandResult>;
 
+const MUTATING_SERVICE_VERBS: Record<string, ReadonlySet<string>> = {
+  systemctl: new Set([
+    "start", "stop", "restart", "try-restart", "reload", "reload-or-restart",
+    "enable", "disable", "mask", "unmask", "daemon-reload", "reset-failed", "kill",
+  ]),
+  launchctl: new Set(["load", "unload", "bootstrap", "bootout", "kickstart", "stop", "start"]),
+};
+
+/**
+ * A test process must never mutate the operator's real service manager.
+ *
+ * The install/uninstall suites once reached the live unit through the default
+ * runner and ran `systemctl --user stop paperclipai.service` on the host,
+ * interrupting every in-flight agent run (NEXA-582). Tests must inject a
+ * `CommandRunner`; this guard turns a missed injection into a clear failure
+ * instead of an outage.
+ */
+export function assertNotMutatingLiveServiceFromTest(command: string, args: string[]): void {
+  if (!process.env.VITEST) return;
+  const verbs = MUTATING_SERVICE_VERBS[command];
+  if (verbs && args.some((arg) => verbs.has(arg))) {
+    throw new Error(
+      `Refusing to run mutating host service command from a test process: ${command} ${args.join(" ")}. Inject a CommandRunner instead.`,
+    );
+  }
+}
+
 export const defaultCommandRunner: CommandRunner = async (command, args, options) => {
+  assertNotMutatingLiveServiceFromTest(command, args);
   if (options?.inherit) {
     await new Promise<void>((resolve, reject) => {
       const child = execFile(command, args, { windowsHide: true }, (error) => error ? reject(error) : resolve());
