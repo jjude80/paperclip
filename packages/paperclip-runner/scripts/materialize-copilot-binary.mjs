@@ -34,14 +34,19 @@ export function materializePinnedCopilotBinary(options = {}) {
     throw new Error(`Expected ${distribution.packageName}@${COPILOT_VERSION}`);
   }
   const source = join(packageRoot, "copilot");
-  const bytes = readPinnedFile(source, 384 * 1024 * 1024, true);
+  const copying = options.targetDirectory !== undefined;
+  // npm applies the ambient umask when it extracts the vendored package, so a
+  // permissive umask such as 0002 leaves this executable group-writable. The
+  // bytes are pinned by SHA-256 and copied output is forced to 0755, so the
+  // source mode only has to be trusted when this invocation runs in place.
+  const bytes = readPinnedFile(source, 384 * 1024 * 1024, true, copying);
   const sourceDigest = createHash("sha256").update(bytes).digest("hex");
   if (sourceDigest !== distribution.executableDigest) throw new Error("Copilot executable digest does not match its pinned distribution");
   const inner = readPinnedCopilotInnerDistribution(bytes, `${options.platform ?? process.platform}-${options.architecture ?? process.arch}`);
-  const output = options.targetDirectory === undefined ? packageRoot : realpathSync(options.targetDirectory);
-  const target = options.targetDirectory === undefined ? source : join(output, "copilot");
+  const output = copying ? realpathSync(options.targetDirectory) : packageRoot;
+  const target = copying ? join(output, "copilot") : source;
   const entries = [{ path: "copilot", sha256: sourceDigest, size: bytes.length, executable: true }];
-  const files = options.targetDirectory === undefined ? [] : [{ path: "copilot", bytes, executable: true }];
+  const files = copying ? [{ path: "copilot", bytes, executable: true }] : [];
   // Preserve every embedded asset; only the hash-pinned app's message mapping
   // changes. Never import or execute any archive entry during materialization.
   for (const [path, entry] of inner) {
@@ -110,12 +115,20 @@ export function writeCopilotMaterialization(output, files) {
   }
 }
 
-function readPinnedFile(path, maxBytes, executable = false) {
+/** A group/world writable source is only tolerated when its verified bytes are
+ * copied into an output this invocation owns and chmods; it must never be
+ * launched in place in that state. */
+export function hasUnsafeExecutablePermissions(mode, { allowWritableSource = false } = {}) {
+  if ((mode & 0o111n) === 0n) return true;
+  return !allowWritableSource && (mode & 0o022n) !== 0n;
+}
+
+function readPinnedFile(path, maxBytes, executable = false, allowWritableSource = false) {
   const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
     const before = fstatSync(fd, { bigint: true });
     if (!before.isFile() || before.size < 1n || before.size > BigInt(maxBytes)) throw new Error("Copilot distribution file is not a bounded regular file");
-    if (executable && ((before.mode & 0o111n) === 0n || (before.mode & 0o022n) !== 0n)) throw new Error("Copilot executable has unsafe permissions");
+    if (executable && hasUnsafeExecutablePermissions(before.mode, { allowWritableSource })) throw new Error("Copilot executable has unsafe permissions");
     const bytes = readFileSync(fd);
     const after = fstatSync(fd, { bigint: true });
     const entry = lstatSync(path, { bigint: true });
