@@ -4,6 +4,8 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   assertForegroundRunAllowed,
+  assertNotMutatingLiveServiceFromTest,
+  defaultCommandRunner,
   detectServiceManager,
   LaunchdServiceManager,
   renderLaunchdPlist,
@@ -202,6 +204,17 @@ describe("single-writer guard", () => {
   it("allows the supervisor-owned process", async () => {
     process.env.PAPERCLIP_SERVICE_MANAGED = "1";
     await expect(assertForegroundRunAllowed("default", false, detector)).resolves.toBeUndefined();
+  });
+
+  it("refuses mutating host service commands from a test process", async () => {
+    // NEXA-582: a test once stopped the operator's live unit through the
+    // default runner. The guard must fire before anything is spawned.
+    expect(() => assertNotMutatingLiveServiceFromTest("systemctl", ["--user", "stop", "paperclipai.service"]))
+      .toThrow("mutating host service command");
+    await expect(defaultCommandRunner("systemctl", ["--user", "stop", "paperclipai.service"]))
+      .rejects.toThrow("mutating host service command");
+    expect(() => assertNotMutatingLiveServiceFromTest("systemctl", ["--user", "show-environment"])).not.toThrow();
+    expect(() => assertNotMutatingLiveServiceFromTest("systemctl", ["--user", "show", "paperclipai.service"])).not.toThrow();
   });
 
   it("refuses to replace a symlinked service definition", async () => {

@@ -27,9 +27,34 @@ import {
   writeInstallManifestAtomic,
 } from "../install-store.js";
 import { resolveCliVersion } from "../version.js";
-import { systemdServiceName } from "../services/service-manager.js";
+import { detectServiceManager, systemdServiceName } from "../services/service-manager.js";
 
 const ORIGINAL_ENV = { ...process.env };
+
+// A test must never reach the host service manager: uninstallCommand() stopping
+// the unit it finds would take the operator's live board down (NEXA-582).
+function forbiddenServiceDetection() {
+  return vi.fn(async () => {
+    throw new Error("test reached the host service manager");
+  });
+}
+
+// Records the service commands the default detector would have executed against
+// the host, without executing them. The real runner cannot be used here.
+function recordingServiceDetection(calls: string[][]): typeof detectServiceManager {
+  const detection = async (input?: Parameters<typeof detectServiceManager>[0]) =>
+    detectServiceManager({
+      ...input,
+      runner: async (file: string, args: string[]) => {
+        calls.push([file, ...args]);
+        if (file === "systemctl" && args.includes("--property=LoadState,ActiveState,UnitFileState,MainPID")) {
+          return { stdout: "LoadState=loaded\nActiveState=active\nUnitFileState=enabled\nMainPID=4242\n", stderr: "" };
+        }
+        return { stdout: "", stderr: "" };
+      },
+    });
+  return vi.fn(detection) as unknown as typeof detectServiceManager;
+}
 
 describe("managed install commands", () => {
   let root: string;
@@ -451,8 +476,23 @@ describe("managed install commands", () => {
     fs.mkdirSync(paths.cliRoot, { recursive: true });
     fs.writeFileSync(unrelatedFile, "keep");
 
-    await expect(uninstallCommand()).rejects.toThrow("unverified install store");
+    await expect(uninstallCommand({ detectServiceManager: forbiddenServiceDetection() }))
+      .rejects.toThrow("unverified install store");
     expect(fs.readFileSync(unrelatedFile, "utf8")).toBe("keep");
+  });
+
+  it("does not touch the live service when the install store cannot be removed", async () => {
+    // Regression pin for NEXA-582: uninstall validated the store only after
+    // stopping the service, so a refused uninstall still took the board down.
+    const paths = resolveInstallStorePaths();
+    fs.mkdirSync(paths.cliRoot, { recursive: true });
+    fs.writeFileSync(path.join(paths.cliRoot, "keep.txt"), "keep");
+    const calls: string[][] = [];
+
+    await expect(uninstallCommand({ detectServiceManager: recordingServiceDetection(calls) }))
+      .rejects.toThrow("unverified install store");
+
+    expect(calls).toEqual([]);
   });
 
   it("refuses to uninstall while another store mutation holds the lock", async () => {
@@ -471,13 +511,18 @@ describe("managed install commands", () => {
       previous: [],
     }, paths);
 
+    const calls: string[][] = [];
     await withInstallStoreLock(
       async () => {
-        await expect(uninstallCommand()).rejects.toThrow("already running");
+        await expect(uninstallCommand({ detectServiceManager: recordingServiceDetection(calls) }))
+          .rejects.toThrow("already running");
       },
       paths,
     );
     expect(fs.existsSync(paths.lockPath)).toBe(false);
+    const mutating = calls.filter(([file, ...args]) =>
+      file === "systemctl" && args.some((arg) => ["start", "stop", "restart", "enable", "disable", "daemon-reload", "reset-failed"].includes(arg)));
+    expect(mutating).toEqual([]);
   });
 
   it("refuses a symlinked git payload root before downloading", async () => {
