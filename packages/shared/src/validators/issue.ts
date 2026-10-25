@@ -1976,6 +1976,11 @@ export const requestItemVerdictsResultSchema = z
 
 const createIssueThreadInteractionCommon = {
   resolverPolicy: issueThreadInteractionResolverPolicySchema.optional(),
+  // Accepted alias for the name the server echoes back on every interaction
+  // (`requestedResolverPolicy`). Without this key the value used to be stripped
+  // by the schema and the request silently fell back to the inherited default,
+  // which is how a caller asking for `human_only` got an agent-resolvable card.
+  requestedResolverPolicy: issueThreadInteractionResolverPolicySchema.optional(),
   addresseeAgentId: z.string().guid().nullable().optional(),
   addresseeUserId: z.string().trim().min(1).nullable().optional(),
 };
@@ -2033,7 +2038,7 @@ const createAskUserQuestionsPayloadSchema = z.union([
   })).pipe(createLegacyAskUserQuestionsPayloadSchema),
 ]);
 
-export const createIssueThreadInteractionSchema = z.discriminatedUnion("kind", [
+const createIssueThreadInteractionUnionSchema = z.discriminatedUnion("kind", [
   z.object({
     ...createIssueThreadInteractionCommon,
     kind: z.literal("suggest_tasks"),
@@ -2100,6 +2105,36 @@ export const createIssueThreadInteractionSchema = z.discriminatedUnion("kind", [
     payload: requestItemVerdictsPayloadSchema,
   }),
 ]);
+
+export const createIssueThreadInteractionSchema =
+  createIssueThreadInteractionUnionSchema
+    .superRefine((value, ctx) => {
+      // Two spellings for one audience must never disagree: guessing which one
+      // the caller meant is how a gate gets widened.
+      if (
+        value.requestedResolverPolicy !== undefined &&
+        value.resolverPolicy !== undefined &&
+        value.resolverPolicy !== value.requestedResolverPolicy
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["requestedResolverPolicy"],
+          message:
+            "requestedResolverPolicy must match resolverPolicy when both are supplied.",
+        });
+      }
+    })
+    // The alias is an input spelling only: the service reads `resolverPolicy`,
+    // so the parsed output keeps the exact union shape it had before.
+    .transform(
+      (
+        value,
+      ): z.output<typeof createIssueThreadInteractionUnionSchema> => ({
+        ...value,
+        resolverPolicy:
+          value.resolverPolicy ?? value.requestedResolverPolicy,
+      }),
+    );
 
 export type CreateIssueThreadInteraction = z.infer<
   typeof createIssueThreadInteractionSchema
