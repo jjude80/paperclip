@@ -6642,6 +6642,92 @@ describeEmbeddedPostgres("accepted plan decomposition", () => {
   });
 });
 
+describeEmbeddedPostgres("issueService.checkout status preservation", () => {
+  let db!: ReturnType<typeof createDb>;
+  let svc!: ReturnType<typeof issueService>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issues-checkout-status-");
+    db = createDb(tempDb.connectionString);
+    svc = issueService(db);
+  }, 20_000);
+
+  afterEach(async () => {
+    await db.delete(issueComments);
+    await db.delete(activityLog);
+    await db.delete(issues);
+    await db.delete(heartbeatRuns);
+    await db.delete(agents);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  async function seedIssue(status: string) {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const runId = randomUUID();
+
+    await seedIssueCompany(db, companyId);
+    await seedCodexCoder(db, companyId, agentId);
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "running",
+      invocationSource: "manual",
+    });
+    const startedAt = new Date("2026-06-10T10:00:00.000Z");
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Checkout status",
+      status,
+      priority: "medium",
+      assigneeAgentId: agentId,
+      startedAt,
+    });
+
+    return { issueId, agentId, runId, startedAt };
+  }
+
+  it("keeps an in_review issue in review instead of demoting it", async () => {
+    const { issueId, agentId, runId, startedAt } = await seedIssue("in_review");
+
+    const checkedOut = await svc.checkout(issueId, agentId, ["in_review"], runId);
+
+    expect(checkedOut).toMatchObject({
+      status: "in_review",
+      assigneeAgentId: agentId,
+      checkoutRunId: runId,
+      executionRunId: runId,
+      startedAt,
+    });
+    const row = await db
+      .select({ status: issues.status, checkoutRunId: issues.checkoutRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toMatchObject({ status: "in_review", checkoutRunId: runId });
+  });
+
+  it("still promotes a todo issue to in_progress", async () => {
+    const { issueId, agentId, runId } = await seedIssue("todo");
+
+    const checkedOut = await svc.checkout(issueId, agentId, ["todo"], runId);
+
+    expect(checkedOut).toMatchObject({
+      status: "in_progress",
+      assigneeAgentId: agentId,
+      checkoutRunId: runId,
+    });
+  });
+});
+
 describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adoption", () => {
   let db!: ReturnType<typeof createDb>;
   let svc!: ReturnType<typeof issueService>;
