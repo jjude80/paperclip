@@ -152,6 +152,7 @@ import {
   type ParsedExecutionWorkspaceMode,
 } from "./execution-workspace-policy.js";
 import { mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
+import { isRuntimeOwnedGitBranch } from "./execution-workspace-branch-ownership.js";
 import { hasChatRunOwnedProviderInteraction } from "./chat-interaction-arbitration.js";
 import { readChatControlChronology } from "./chat-control-chronology.js";
 import { authorizeChatConversationForBoundRun } from "./native-runtime/chat-attachment-reuse.js";
@@ -10206,6 +10207,8 @@ export function issueService(db: Db) {
                 mode: executionWorkspaces.mode,
                 strategyType: executionWorkspaces.strategyType,
                 branchName: executionWorkspaces.branchName,
+                baseRef: executionWorkspaces.baseRef,
+                metadata: executionWorkspaces.metadata,
               })
               .from(executionWorkspaces)
               .where(
@@ -10227,6 +10230,10 @@ export function issueService(db: Db) {
                   sourceWorkspaceMode: sourceWorkspace.mode,
                   sourceWorkspaceStrategyType: sourceWorkspace.strategyType,
                   sourceWorkspaceBranchName: sourceWorkspace.branchName,
+                  sourceWorkspaceBaseRef: sourceWorkspace.baseRef,
+                  sourceWorkspaceBranchIsTransient: isRuntimeOwnedGitBranch(
+                    sourceWorkspace.metadata as Record<string, unknown> | null,
+                  ),
                   bindSourceWorkspace: inheritance.bindSourceWorkspace,
                 });
               }
