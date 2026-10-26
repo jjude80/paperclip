@@ -6594,6 +6594,28 @@ describeEmbeddedPostgres("issueService.checkout status preservation", () => {
     expect(row).toMatchObject({ status: "in_review", checkoutRunId: runId });
   });
 
+  // scripts/agent-report.sh binds a run to an issue before commenting, and it
+  // sends this exact payload -- the full expectedStatuses list, `in_review`
+  // included. NEXA-585 was demoted through that path, so pin the reporting
+  // script's shape rather than only the minimal single-status case above.
+  it("keeps in_review for the agent-report.sh checkout payload", async () => {
+    const { issueId, agentId, runId, startedAt } = await seedIssue("in_review");
+
+    const checkedOut = await svc.checkout(
+      issueId,
+      agentId,
+      ["todo", "backlog", "blocked", "in_review", "in_progress", "done"],
+      runId,
+    );
+
+    expect(checkedOut).toMatchObject({
+      status: "in_review",
+      startedAt,
+      checkoutRunId: runId,
+      executionRunId: runId,
+    });
+  });
+
   it("still promotes a todo issue to in_progress", async () => {
     const { issueId, agentId, runId } = await seedIssue("todo");
 
