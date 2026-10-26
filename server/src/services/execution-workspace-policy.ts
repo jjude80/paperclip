@@ -429,6 +429,19 @@ export function buildInheritedExecutionWorkspaceSettings(input: {
   sourceWorkspaceMode: string | null | undefined;
   sourceWorkspaceStrategyType?: string | null;
   sourceWorkspaceBranchName?: string | null;
+  /**
+   * The source workspace's own resolved base ref (for example `origin/main`).
+   * It is the durable ref a child should fall back to when the source branch
+   * cannot outlive the parent.
+   */
+  sourceWorkspaceBaseRef?: string | null;
+  /**
+   * True when the source workspace created its branch itself and therefore
+   * deletes it when the workspace is cleaned up. A transient branch must never
+   * become a child's base ref: the child then cannot start once the parent
+   * lands, because the ref is gone before the child's first dispatch.
+   */
+  sourceWorkspaceBranchIsTransient?: boolean;
   bindSourceWorkspace: boolean;
 }): Record<string, unknown> {
   const settings: Record<string, unknown> = { ...(input.sourceSettings ?? {}) };
@@ -441,13 +454,26 @@ export function buildInheritedExecutionWorkspaceSettings(input: {
       typeof input.sourceWorkspaceBranchName === "string"
         ? input.sourceWorkspaceBranchName.trim()
         : "";
-    const parentIntegrationBranch =
-      input.sourceWorkspaceStrategyType === "git_worktree" && sourceWorkspaceBranchName.length > 0
+    const sourceWorkspaceBaseRef =
+      typeof input.sourceWorkspaceBaseRef === "string"
+        ? input.sourceWorkspaceBaseRef.trim()
+        : "";
+    // A branch the source workspace created for its own task is deleted when
+    // that workspace is reclaimed, so it cannot be a durable base for a child
+    // that has not started yet. Keep inheriting operator-owned integration
+    // branches, which survive the parent.
+    const parentDurableBranch =
+      input.sourceWorkspaceStrategyType === "git_worktree" &&
+      !input.sourceWorkspaceBranchIsTransient &&
+      sourceWorkspaceBranchName.length > 0
         ? sourceWorkspaceBranchName
         : null;
-    const nextStrategy = retargetPinnedBranchAsBaseRef(sourceStrategy, parentIntegrationBranch);
-    if (parentIntegrationBranch) {
-      nextStrategy.baseRef = parentIntegrationBranch;
+    // Falling back to the parent's own base ref is the same retarget a human
+    // performs by hand on a stranded child (usually `origin/main`).
+    const parentBaseRef = parentDurableBranch ?? (sourceWorkspaceBaseRef.length > 0 ? sourceWorkspaceBaseRef : null);
+    const nextStrategy = retargetPinnedBranchAsBaseRef(sourceStrategy, parentBaseRef);
+    if (parentBaseRef) {
+      nextStrategy.baseRef = parentBaseRef;
       if (nextStrategy.type === undefined) {
         nextStrategy.type = "git_worktree";
       }

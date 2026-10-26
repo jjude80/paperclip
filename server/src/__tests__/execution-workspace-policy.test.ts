@@ -878,6 +878,57 @@ describe("execution workspace inheritance", () => {
     });
   });
 
+  it("bases a child on the parent's durable base, not a transient runtime branch", () => {
+    // The parent workspace created its own task branch. That branch is deleted
+    // when the parent is reclaimed, so a child that has not started yet would
+    // otherwise fail with workspace_base_ref_unresolved. Base it on the ref the
+    // parent itself started from instead.
+    expect(
+      buildInheritedExecutionWorkspaceSettings({
+        sourceSettings: { mode: "isolated_workspace" },
+        sourceWorkspaceMode: "isolated_workspace",
+        sourceWorkspaceStrategyType: "git_worktree",
+        sourceWorkspaceBranchName: "NEXA-415-feature-work",
+        sourceWorkspaceBaseRef: "origin/main",
+        sourceWorkspaceBranchIsTransient: true,
+        bindSourceWorkspace: false,
+      }),
+    ).toEqual({
+      mode: "isolated_workspace",
+      workspaceStrategy: { type: "git_worktree", baseRef: "origin/main" },
+    });
+  });
+
+  it("leaves a transient-branch child on the project default when the parent recorded no base", () => {
+    expect(
+      buildInheritedExecutionWorkspaceSettings({
+        sourceSettings: { mode: "isolated_workspace" },
+        sourceWorkspaceMode: "isolated_workspace",
+        sourceWorkspaceStrategyType: "git_worktree",
+        sourceWorkspaceBranchName: "NEXA-415-feature-work",
+        sourceWorkspaceBranchIsTransient: true,
+        bindSourceWorkspace: false,
+      }),
+    ).toEqual({ mode: "isolated_workspace" });
+  });
+
+  it("keeps inheriting an operator-owned branch that outlives the parent", () => {
+    expect(
+      buildInheritedExecutionWorkspaceSettings({
+        sourceSettings: { mode: "isolated_workspace" },
+        sourceWorkspaceMode: "isolated_workspace",
+        sourceWorkspaceStrategyType: "git_worktree",
+        sourceWorkspaceBranchName: "release/integration",
+        sourceWorkspaceBaseRef: "origin/main",
+        sourceWorkspaceBranchIsTransient: false,
+        bindSourceWorkspace: false,
+      }),
+    ).toEqual({
+      mode: "isolated_workspace",
+      workspaceStrategy: { type: "git_worktree", baseRef: "release/integration" },
+    });
+  });
+
   it("does not invent a base ref from a non-git-workspace source", () => {
     expect(
       buildInheritedExecutionWorkspaceSettings({
