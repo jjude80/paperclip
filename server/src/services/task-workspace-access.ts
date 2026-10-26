@@ -9,7 +9,7 @@ import { assertSelectedWorkspaceTrust, runRetainsIssueIdentity, taskRepositoryRu
 import { resolveCoreTrustPreset } from "./trust-preset-resolver.js";
 import { isDeepStrictEqual } from "node:util";
 import { ProjectAccessDeniedError } from "./project-access-denial.js";
-import { taskWorkspaceSelectionSchema, type TaskWorkspaceSelection } from "@paperclipai/shared";
+import { isClosedIsolatedExecutionWorkspace, taskWorkspaceSelectionSchema, type TaskWorkspaceSelection, type ExecutionWorkspace } from "@paperclipai/shared";
 import { taskWorkspaceSelectableCondition } from "./task-workspace-selection.js";
 
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
@@ -107,6 +107,21 @@ export async function assertExecutionWorkspaceRecordAccess(
   }
 }
 
+/** A closed isolated binding names no live execution. Authorization for a
+ * mutation on the task must not depend on the run that once owned it: a triage
+ * run from another task may still assign, comment, or move the card. */
+async function taskWorkspaceBindingIsClosed(
+  db: Db | DbTransaction, companyId: string, workspaceId: string | null,
+) {
+  if (!workspaceId) return false;
+  const [workspace] = await measureRunPhase("workspace.access.workspace_read", async () => db.select({
+    closedAt: executionWorkspaces.closedAt, mode: sql<ExecutionWorkspace["mode"]>`${executionWorkspaces.mode}`, status: sql<ExecutionWorkspace["status"]>`${executionWorkspaces.status}`,
+  }).from(executionWorkspaces).where(and(
+    eq(executionWorkspaces.id, workspaceId), eq(executionWorkspaces.companyId, companyId),
+  )));
+  return isClosedIsolatedExecutionWorkspace(workspace);
+}
+
 /** Authorize this task's selected execution inputs without classifying disk contents. */
 export async function assertTaskWorkspaceExecutionAccess(
   db: Db | DbTransaction,
@@ -130,8 +145,15 @@ export async function assertTaskWorkspaceExecutionAccess(
     if (actor.type === "agent" && !agent) throw forbidden("Task workspace agent is unavailable");
     const [run] = actor.runId ? await measureRunPhase("workspace.access.run_read", async () => db.select(taskRepositoryRunColumns).from(heartbeatRuns)
       .where(and(eq(heartbeatRuns.id, actor.runId!), eq(heartbeatRuns.companyId, companyId)))) : [];
+    const retainsIssueIdentity = run ? runRetainsIssueIdentity(run, task.id) : false;
+    // A task bound to a closed isolated workspace has no live execution to
+    // protect. The binding may name a workspace from a run that has ended, so a
+    // cross-task triage run must not be treated as a workspace owner. Keep the
+    // run/agent identity checks; relax only the task-binding check.
+    const closedBinding = run && !retainsIssueIdentity
+      ? await taskWorkspaceBindingIsClosed(db, companyId, task.executionWorkspaceId) : false;
     if ((actor.source === "agent_jwt" && !actor.runId) || (actor.runId && (!run
-      || run.agentId !== actor.agentId || !runRetainsIssueIdentity(run, task.id)))) {
+      || run.agentId !== actor.agentId || (!retainsIssueIdentity && !closedBinding)))) {
       throw forbidden("Task workspace run identity is unavailable");
     }
     if (run && !taskRepositoryResponsibleUserMatches(actor.onBehalfOfUserId, run.responsibleUserId)) {
