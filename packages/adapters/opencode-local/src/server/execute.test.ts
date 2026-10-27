@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs/promises";
+import fs_sync from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -355,4 +356,120 @@ describe("ensureRemoteOpenCodeModelConfiguredAndAvailable — probe is non-fatal
       ensureRemoteOpenCodeModelConfiguredAndAvailable({ ...base, model: "openai/gpt-5" }),
     ).rejects.toThrow("Configured OpenCode model is unavailable on the remote execution target");
   });
+});
+
+describe("NEXA-643 secret-file environment", () => {
+  let secretBase: string;
+
+  beforeEach(async () => {
+    secretBase = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-secret-env-"));
+    vi.stubEnv("PAPERCLIP_SECRET_FILE_DIR", secretBase);
+  });
+
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    await fs.rm(secretBase, { recursive: true, force: true });
+  });
+
+  interface SpawnSnapshot {
+    env: Record<string, string>;
+    files: Record<string, string>;
+    modes: Record<string, string>;
+  }
+
+  async function runWithSecrets(): Promise<SpawnSnapshot> {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-643-"));
+    const commandPath = path.join(root, "fake-opencode");
+    await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    runProcessMock.mockReset();
+    const snapshot: SpawnSnapshot = { env: {}, files: {}, modes: {} };
+    // The adapter deletes the directory when the run ends, so the spawn env and
+    // the carrier contents have to be captured at spawn time, not afterwards.
+    runProcessMock.mockImplementation(async (...args) => {
+      snapshot.env = { ...(args[4] as { env: Record<string, string> }).env };
+      for (const [key, file] of Object.entries(snapshot.env)) {
+        if (!key.endsWith("_FILE")) continue;
+        snapshot.files[key] = fs_sync.readFileSync(file, "utf8");
+        snapshot.modes[key] = ((fs_sync.statSync(file).mode & 0o777).toString(8));
+      }
+      return probeResult({ exitCode: 0, stdout: "" });
+    });
+    const identity = {
+      keyId: "key-1",
+      publicKeyPem: "-----BEGIN PUBLIC KEY-----\npublic\n-----END PUBLIC KEY-----",
+      privateKeyPem: "-----BEGIN PRIVATE KEY-----\nprivate\n-----END PRIVATE KEY-----",
+    };
+    try {
+      await execute({
+        runId: "run-secret-files",
+        agent: {
+          id: "agent-1",
+          companyId: "company-1",
+          name: "OpenCode",
+          adapterType: "opencode_local",
+          adapterConfig: {},
+        },
+        agentIdentity: identity,
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: { command: commandPath, cwd: root, model: "openai/gpt-5", env: { OPENCODE_ALLOW_ALL_MODELS: "1" } },
+        context: {},
+        authToken: "run-jwt-token",
+        runtimeTools: {
+          version: 1,
+          guidance: "guide",
+          mcpEndpoint: "http://127.0.0.1:3100/runtime-tools/mcp",
+          rest: {
+            connectionsSearch: "http://127.0.0.1:3100/runtime-tools/connections/search",
+            connectionRequest: "http://127.0.0.1:3100/runtime-tools/connections/request",
+          },
+          bearerToken: "runtime-tools-jwt",
+          expiresAt: "2026-10-27T00:00:00.000Z",
+          tools: ["connections_search", "connection_request"],
+        },
+        onLog: async () => {},
+      });
+      return snapshot;
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  }
+
+  it("spawns with file paths and no bearer values in the child environment", async () => {
+    const { env, files, modes } = await runWithSecrets();
+
+    expect(env.PAPERCLIP_API_KEY).toBeUndefined();
+    expect(env.PAPERCLIP_RUNTIME_TOOLS_TOKEN).toBeUndefined();
+    expect(env.PAPERCLIP_AGENT_PRIVATE_KEY).toBeUndefined();
+    expect(env.PAPERCLIP_AGENT_PUBLIC_KEY).toBeTruthy();
+
+    expect(env.PAPERCLIP_API_TOKEN_FILE).toBeTruthy();
+    expect(files.PAPERCLIP_API_TOKEN_FILE.trim()).toBe("run-jwt-token");
+    expect(files.PAPERCLIP_RUNTIME_TOOLS_TOKEN_FILE.trim()).toBe("runtime-tools-jwt");
+    expect(files.PAPERCLIP_AGENT_PRIVATE_KEY_FILE.trim()).toBe(
+      "-----BEGIN PRIVATE KEY-----\nprivate\n-----END PRIVATE KEY-----",
+    );
+    expect(modes).toEqual({
+      PAPERCLIP_API_TOKEN_FILE: "600",
+      PAPERCLIP_RUNTIME_TOOLS_TOKEN_FILE: "600",
+      PAPERCLIP_AGENT_PRIVATE_KEY_FILE: "600",
+    });
+
+    // No value survives anywhere in the environment handed to the child.
+    const serialized = JSON.stringify(env);
+    expect(serialized).not.toContain("run-jwt-token");
+    expect(serialized).not.toContain("runtime-tools-jwt");
+    expect(serialized).not.toContain("BEGIN PRIVATE KEY");
+  }, 20_000);
+
+  it("removes the private directory when the run ends", async () => {
+    const { env } = await runWithSecrets();
+    await expect(fs.stat(path.dirname(env.PAPERCLIP_API_TOKEN_FILE))).rejects.toThrow();
+  }, 20_000);
+
+  it("keeps the old env injection when the rollback flag is set", async () => {
+    vi.stubEnv("PAPERCLIP_SECRET_FILE_ENV", "0");
+    const { env } = await runWithSecrets();
+    expect(env.PAPERCLIP_API_KEY).toBe("run-jwt-token");
+    expect(env.PAPERCLIP_API_TOKEN_FILE).toBeUndefined();
+  }, 20_000);
 });
