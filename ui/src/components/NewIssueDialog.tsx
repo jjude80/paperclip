@@ -133,6 +133,7 @@ interface IssueDraft {
   assigneeChrome: boolean;
   executionWorkspaceMode?: string;
   selectedExecutionWorkspaceId?: string;
+  workspaceBaseRef?: string;
   useIsolatedExecutionWorkspace?: boolean;
   workMode?: IssueWorkMode;
   composerSettings?: ComposerRunSettings | null;
@@ -306,6 +307,7 @@ export function NewIssueDialog() {
   const [assigneeChrome, setAssigneeChrome] = useState(false);
   const [executionWorkspaceMode, setExecutionWorkspaceMode] = useState<string>("shared_workspace");
   const [selectedExecutionWorkspaceId, setSelectedExecutionWorkspaceId] = useState("");
+  const [workspaceBaseRef, setWorkspaceBaseRef] = useState("");
   const [workMode, setWorkMode] = useState<IssueWorkMode>("standard");
   const [isPrivate, setIsPrivate] = useState(false);
   const { isMobile } = useSidebar();
@@ -532,6 +534,7 @@ export function NewIssueDialog() {
         assigneeChrome,
         executionWorkspaceMode,
         selectedExecutionWorkspaceId,
+        workspaceBaseRef,
         workMode,
         isPrivate,
         composerSettings,
@@ -554,6 +557,7 @@ export function NewIssueDialog() {
       assigneeChrome,
       executionWorkspaceMode,
       selectedExecutionWorkspaceId,
+      workspaceBaseRef,
       workMode,
       isPrivate,
       composerSettings,
@@ -590,6 +594,7 @@ export function NewIssueDialog() {
     assigneeChrome,
     executionWorkspaceMode,
     selectedExecutionWorkspaceId,
+    workspaceBaseRef,
     workMode,
     newIssueOpen,
     queueDraftSave,
@@ -639,6 +644,7 @@ export function NewIssueDialog() {
       setExecutionWorkspaceMode(defaultExecutionWorkspaceMode);
       setWorkMode(nextWorkMode);
       setSelectedExecutionWorkspaceId(newIssueDefaults.executionWorkspaceId ?? "");
+      setWorkspaceBaseRef("");
       executionWorkspaceDefaultProjectId.current =
         hasExplicitProjectWorkspaceId || defaultProject ? defaultProjectId || null : null;
     } else if (newIssueDefaults.title || newIssueDefaults.description) {
@@ -664,6 +670,7 @@ export function NewIssueDialog() {
       setExecutionWorkspaceMode(defaultExecutionWorkspaceModeForIssueDefaults(newIssueDefaults, defaultProject));
       setWorkMode(nextWorkMode);
       setSelectedExecutionWorkspaceId(newIssueDefaults.executionWorkspaceId ?? "");
+      setWorkspaceBaseRef("");
       executionWorkspaceDefaultProjectId.current =
         hasExplicitProjectWorkspaceId || newIssueDefaults.executionWorkspaceId || defaultProject
           ? defaultProjectId || null
@@ -717,6 +724,7 @@ export function NewIssueDialog() {
           ? (newIssueDefaults.executionWorkspaceId ?? "")
           : (draft.selectedExecutionWorkspaceId ?? ""),
       );
+      setWorkspaceBaseRef(draft.workspaceBaseRef ?? "");
       executionWorkspaceDefaultProjectId.current =
         hasExplicitProjectWorkspaceId || hasExplicitExecutionWorkspaceId || draft.projectWorkspaceId || restoredProject
           ? restoredProjectId || null
@@ -743,6 +751,7 @@ export function NewIssueDialog() {
       setAssigneeChrome(false);
       setExecutionWorkspaceMode(defaultExecutionWorkspaceModeForIssueDefaults(newIssueDefaults, defaultProject));
       setSelectedExecutionWorkspaceId(newIssueDefaults.executionWorkspaceId ?? "");
+      setWorkspaceBaseRef("");
       executionWorkspaceDefaultProjectId.current =
         hasExplicitProjectWorkspaceId || newIssueDefaults.executionWorkspaceId || defaultProject
           ? defaultProjectId || null
@@ -777,6 +786,7 @@ export function NewIssueDialog() {
     setAssigneeChrome(false);
     setExecutionWorkspaceMode("shared_workspace");
     setSelectedExecutionWorkspaceId("");
+    setWorkspaceBaseRef("");
     setWorkMode("standard");
 
     setComposerSettings(null);
@@ -813,8 +823,18 @@ export function NewIssueDialog() {
       executionWorkspaceMode === "reuse_existing"
         ? issueExecutionWorkspaceModeForExistingWorkspace(selectedReusableExecutionWorkspace?.mode)
         : executionWorkspaceMode;
+    const trimmedWorkspaceBaseRef = workspaceBaseRef.trim();
     const executionWorkspaceSettings = executionWorkspacePolicy?.enabled
-      ? { mode: requestedExecutionWorkspaceMode }
+      ? {
+          mode: requestedExecutionWorkspaceMode,
+          // A base ref is only meaningful for a new isolated worktree. Pinning
+          // "git_worktree" here keeps an issue-level override from silently
+          // falling back to the project's strategy type when the project later
+          // changes its default.
+          ...(requestedExecutionWorkspaceMode === "isolated_workspace" && trimmedWorkspaceBaseRef
+            ? { workspaceStrategy: { type: "git_worktree" as const, baseRef: trimmedWorkspaceBaseRef } }
+            : {}),
+        }
       : null;
     const requestedProjectWorkspaceId = !workspaceIsolationControlsVisible
       ? (newIssueDefaults.projectId === projectId ? newIssueDefaults.projectWorkspaceId : undefined)
@@ -1029,6 +1049,7 @@ export function NewIssueDialog() {
       setProjectWorkspaceId(defaultProjectWorkspaceIdForProject(nextProject));
       setExecutionWorkspaceMode(defaultExecutionWorkspaceModeForProject(nextProject));
       setSelectedExecutionWorkspaceId("");
+      setWorkspaceBaseRef("");
     },
     [orderedProjects, effectiveCompanyId],
   );
@@ -1048,6 +1069,7 @@ export function NewIssueDialog() {
     setProjectWorkspaceId(defaultProjectWorkspaceIdForProject(project));
     setExecutionWorkspaceMode(defaultExecutionWorkspaceModeForProject(project));
     setSelectedExecutionWorkspaceId("");
+    setWorkspaceBaseRef("");
   }, [newIssueOpen, orderedProjects, projectId, selectedExecutionWorkspaceId]);
   const dialogViewportStyle = useMemo<NewIssueDialogViewportStyle>(() => {
     const dialogGeometry = {
@@ -1450,6 +1472,21 @@ export function NewIssueDialog() {
                         disabled={createIssue.isPending}
                         mobile={isMobile}
                         contentStyle={entityPickerViewportStyle}
+                      />
+                    ) : null}
+                    {canChooseWorktrees && executionWorkspaceMode === "isolated_workspace" ? (
+                      <input
+                        type="text"
+                        aria-label="Base branch for the new worktree"
+                        data-testid="new-issue-workspace-base-ref"
+                        value={workspaceBaseRef}
+                        onChange={(event) => setWorkspaceBaseRef(event.target.value)}
+                        placeholder="Base branch (default)"
+                        title="Branch or ref the new worktree starts from, for example origin/NEXA-415. Leave empty to use the project default."
+                        spellCheck={false}
+                        autoComplete="off"
+                        disabled={createIssue.isPending}
+                        className="h-8 min-w-0 flex-1 rounded-md border border-border bg-transparent px-2 font-mono text-xs outline-none placeholder:font-sans placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-1 focus-visible:ring-ring/40 sm:max-w-56 sm:flex-none"
                       />
                     ) : null}
                   </>

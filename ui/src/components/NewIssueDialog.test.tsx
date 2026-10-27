@@ -1241,6 +1241,47 @@ describe("NewIssueDialog", () => {
     act(() => root.unmount());
   });
 
+  it("submits an optional base branch for a new worktree", async () => {
+    enableWorktrees();
+    mockExecutionWorkspacesApi.listSummaries.mockResolvedValue([]);
+    const { root } = renderDialog(container);
+    await waitForAssertion(() => expect(container.querySelector('[aria-label="Worktrees"]')).not.toBeNull());
+    selectWorktree("isolated_workspace");
+    await flush();
+    const baseRef = container.querySelector<HTMLInputElement>('[data-testid="new-issue-workspace-base-ref"]');
+    expect(baseRef).not.toBeNull();
+    await typeTextareaValue(baseRef!, "  origin/NEXA-415  ");
+    act(() => container.querySelector<HTMLButtonElement>('[aria-label="Create task"]')!.click());
+    await waitForAssertion(() => expect(mockIssuesApi.create).toHaveBeenCalled());
+    expect(mockIssuesApi.create.mock.calls[0][1]).toMatchObject({
+      executionWorkspaceSettings: {
+        mode: "isolated_workspace",
+        workspaceStrategy: { type: "git_worktree", baseRef: "origin/NEXA-415" },
+      },
+    });
+    act(() => root.unmount());
+  });
+
+  it("omits the workspace strategy when the base branch is blank", async () => {
+    enableWorktrees();
+    mockExecutionWorkspacesApi.listSummaries.mockResolvedValue([]);
+    const { root } = renderDialog(container);
+    await waitForAssertion(() => expect(container.querySelector('[aria-label="Worktrees"]')).not.toBeNull());
+    selectWorktree("isolated_workspace");
+    await flush();
+    const baseRef = container.querySelector<HTMLInputElement>('[data-testid="new-issue-workspace-base-ref"]');
+    expect(baseRef).not.toBeNull();
+    await typeTextareaValue(baseRef!, "   ");
+    act(() => container.querySelector<HTMLButtonElement>('[aria-label="Create task"]')!.click());
+    await waitForAssertion(() => expect(mockIssuesApi.create).toHaveBeenCalled());
+    expect(mockIssuesApi.create.mock.calls[0][1]).toMatchObject({
+      executionWorkspaceSettings: { mode: "isolated_workspace" },
+    });
+    expect(mockIssuesApi.create.mock.calls[0][1].executionWorkspaceSettings)
+      .not.toHaveProperty("workspaceStrategy");
+    act(() => root.unmount());
+  });
+
   it.each(["isolated_workspace", "shared_workspace"])("restores the project checkout and clears reuse when choosing %s", async (mode) => {
     enableWorktrees();
     mockExecutionWorkspacesApi.listSummaries.mockResolvedValue([{
