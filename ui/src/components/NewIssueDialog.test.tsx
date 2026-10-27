@@ -1282,8 +1282,26 @@ describe("NewIssueDialog", () => {
     act(() => root.unmount());
   });
 
+  it("restores a base branch saved for the same project", async () => {
+    enableWorktrees();
+    dialogState.newIssueDefaults = { projectId: "project-1" };
+    mockExecutionWorkspacesApi.listSummaries.mockResolvedValue([]);
+    localStorage.setItem("paperclip:issue-draft", JSON.stringify({
+      title: "Draft task", description: "", status: "todo", priority: "", projectId: "project-1",
+      executionWorkspaceMode: "isolated_workspace", workspaceBaseRef: "origin/integration",
+    }));
+    const { root } = renderDialog(container);
+    await waitForAssertion(() => expect(container.querySelector('[aria-label="Worktrees"]')).not.toBeNull());
+    selectWorktree("isolated_workspace");
+    await flush();
+    await waitForAssertion(() => expect(container.querySelector('[data-testid="new-issue-workspace-base-ref"]')).not.toBeNull());
+    expect(container.querySelector<HTMLInputElement>('[data-testid="new-issue-workspace-base-ref"]')!.value).toBe("origin/integration");
+    act(() => root.unmount());
+  });
+
   it("does not restore a base branch saved for another project", async () => {
     enableWorktrees();
+    dialogState.newIssueDefaults = { projectId: "project-1" };
     mockExecutionWorkspacesApi.listSummaries.mockResolvedValue([]);
     localStorage.setItem("paperclip:issue-draft", JSON.stringify({
       title: "Draft task", description: "", status: "todo", priority: "", projectId: "project-2",

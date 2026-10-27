@@ -1069,7 +1069,6 @@ export function NewIssueDialog() {
     setProjectWorkspaceId(defaultProjectWorkspaceIdForProject(project));
     setExecutionWorkspaceMode(defaultExecutionWorkspaceModeForProject(project));
     setSelectedExecutionWorkspaceId("");
-    setWorkspaceBaseRef("");
   }, [newIssueOpen, orderedProjects, projectId, selectedExecutionWorkspaceId]);
   const dialogViewportStyle = useMemo<NewIssueDialogViewportStyle>(() => {
     const dialogGeometry = {
