@@ -724,7 +724,11 @@ export function NewIssueDialog() {
           ? (newIssueDefaults.executionWorkspaceId ?? "")
           : (draft.selectedExecutionWorkspaceId ?? ""),
       );
-      setWorkspaceBaseRef(draft.workspaceBaseRef ?? "");
+      setWorkspaceBaseRef(
+        !newIssueDefaults.projectId || newIssueDefaults.projectId === draft.projectId
+          ? (draft.workspaceBaseRef ?? "")
+          : "",
+      );
       executionWorkspaceDefaultProjectId.current =
         hasExplicitProjectWorkspaceId || hasExplicitExecutionWorkspaceId || draft.projectWorkspaceId || restoredProject
           ? restoredProjectId || null
@@ -827,11 +831,7 @@ export function NewIssueDialog() {
     const executionWorkspaceSettings = executionWorkspacePolicy?.enabled
       ? {
           mode: requestedExecutionWorkspaceMode,
-          // A base ref is only meaningful for a new isolated worktree. Pinning
-          // "git_worktree" here keeps an issue-level override from silently
-          // falling back to the project's strategy type when the project later
-          // changes its default.
-          ...(requestedExecutionWorkspaceMode === "isolated_workspace" && trimmedWorkspaceBaseRef
+          ...(executionWorkspaceMode === "isolated_workspace" && trimmedWorkspaceBaseRef
             ? { workspaceStrategy: { type: "git_worktree" as const, baseRef: trimmedWorkspaceBaseRef } }
             : {}),
         }
@@ -1482,7 +1482,7 @@ export function NewIssueDialog() {
                         value={workspaceBaseRef}
                         onChange={(event) => setWorkspaceBaseRef(event.target.value)}
                         placeholder="Base branch (default)"
-                        title="Branch or ref the new worktree starts from, for example origin/NEXA-415. Leave empty to use the project default."
+                        title="Branch or ref the new worktree starts from, for example origin/main. Leave empty to use the project default."
                         spellCheck={false}
                         autoComplete="off"
                         disabled={createIssue.isPending}

@@ -1250,13 +1250,13 @@ describe("NewIssueDialog", () => {
     await flush();
     const baseRef = container.querySelector<HTMLInputElement>('[data-testid="new-issue-workspace-base-ref"]');
     expect(baseRef).not.toBeNull();
-    await typeTextareaValue(baseRef!, "  origin/NEXA-415  ");
+    await typeTextareaValue(baseRef!, "  origin/integration  ");
     act(() => container.querySelector<HTMLButtonElement>('[aria-label="Create task"]')!.click());
     await waitForAssertion(() => expect(mockIssuesApi.create).toHaveBeenCalled());
     expect(mockIssuesApi.create.mock.calls[0][1]).toMatchObject({
       executionWorkspaceSettings: {
         mode: "isolated_workspace",
-        workspaceStrategy: { type: "git_worktree", baseRef: "origin/NEXA-415" },
+        workspaceStrategy: { type: "git_worktree", baseRef: "origin/integration" },
       },
     });
     act(() => root.unmount());
@@ -1279,6 +1279,46 @@ describe("NewIssueDialog", () => {
     });
     expect(mockIssuesApi.create.mock.calls[0][1].executionWorkspaceSettings)
       .not.toHaveProperty("workspaceStrategy");
+    act(() => root.unmount());
+  });
+
+  it("does not restore a base branch saved for another project", async () => {
+    enableWorktrees();
+    mockExecutionWorkspacesApi.listSummaries.mockResolvedValue([]);
+    localStorage.setItem("paperclip:issue-draft", JSON.stringify({
+      title: "Draft task", description: "", status: "todo", priority: "", projectId: "project-2",
+      executionWorkspaceMode: "isolated_workspace", workspaceBaseRef: "origin/legacy",
+    }));
+    const { root } = renderDialog(container);
+    await waitForAssertion(() => expect(container.querySelector('[aria-label="Worktrees"]')).not.toBeNull());
+    selectWorktree("isolated_workspace");
+    await flush();
+    expect(container.querySelector<HTMLInputElement>('[data-testid="new-issue-workspace-base-ref"]')!.value).toBe("");
+    act(() => container.querySelector<HTMLButtonElement>('[aria-label="Create task"]')!.click());
+    await waitForAssertion(() => expect(mockIssuesApi.create).toHaveBeenCalled());
+    expect(mockIssuesApi.create.mock.calls[0][1].executionWorkspaceSettings)
+      .not.toHaveProperty("workspaceStrategy");
+    act(() => root.unmount());
+  });
+
+  it("does not submit a base branch after switching to an existing worktree", async () => {
+    enableWorktrees();
+    mockExecutionWorkspacesApi.listSummaries.mockResolvedValue([{
+      id: "worktree-1", name: "Sign-in fix", mode: "isolated_workspace", status: "active",
+      branchName: "fix/sign-in", cwd: "/tmp/worktree-1", projectWorkspaceId: "source-1", lastUsedAt: new Date(),
+    }]);
+    const { root } = renderDialog(container);
+    await waitForAssertion(() => expect(container.querySelector('[aria-label="Worktrees"]')).not.toBeNull());
+    selectWorktree("isolated_workspace");
+    await flush();
+    await typeTextareaValue(container.querySelector<HTMLInputElement>('[data-testid="new-issue-workspace-base-ref"]')!, "origin/integration");
+    await waitForAssertion(() => expect(container.querySelector('[cmdk-item][data-value="reuse:worktree-1"]')).not.toBeNull());
+    selectWorktree("reuse:worktree-1");
+    act(() => container.querySelector<HTMLButtonElement>('[aria-label="Create task"]')!.click());
+    await waitForAssertion(() => expect(mockIssuesApi.create).toHaveBeenCalled());
+    const settings = mockIssuesApi.create.mock.calls[0][1].executionWorkspaceSettings;
+    expect(settings.mode).toBe("isolated_workspace");
+    expect(settings).not.toHaveProperty("workspaceStrategy");
     act(() => root.unmount());
   });
 
