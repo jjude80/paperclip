@@ -42,6 +42,25 @@ describe("atomic managed repository publication", () => {
     expect(await readFile(file, "utf8")).toBe("/.paperclip-repositories/\n");
     await expect(ensureManagedRepositoriesIgnored(target)).rejects.toThrow("not a git repository");
   });
+  it("recognizes a declared plain task directory when Git 2.55 rewords its fatal", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "paperclip-repository-git-version-"));
+    directories.push(root);
+    const target = path.join(root, "target");
+    await mkdir(path.join(target, ".git", "info"), { recursive: true });
+    const file = path.join(target, ".git", "info", "exclude");
+    await writeFile(file, "/.paperclip-repositories/\n");
+    const bin = path.join(root, "bin");
+    await mkdir(bin);
+    // Git 2.55 replaced the old single-line fatal with this two-line form.
+    await writeFile(path.join(bin, "git"), "#!/bin/sh\n" +
+      "printf '%s\\n' 'fatal: not a git repository (or any parent up to mount point /)' " +
+      "'Stopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).' >&2\n" +
+      "exit 128\n", { mode: 0o755 });
+    vi.stubEnv("PATH", `${bin}${path.delimiter}${process.env.PATH ?? ""}`);
+    await expect(ensureManagedRepositoriesIgnored(target, { plainTaskDirectory: true })).resolves.toBeUndefined();
+    expect(await readFile(file, "utf8")).toBe("/.paperclip-repositories/\n");
+    await expect(ensureManagedRepositoriesIgnored(target)).rejects.toThrow("not a git repository");
+  });
   it("still excludes managed repositories when a task directory contains a real checkout", async () => {
     const { source } = await fixture();
     await ensureManagedRepositoriesIgnored(source, { plainTaskDirectory: true });

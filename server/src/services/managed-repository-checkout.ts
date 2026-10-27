@@ -8,6 +8,7 @@ import { sanitizeRuntimeServiceBaseEnv } from "./runtime-service-env.js";
 import { describeGitAuthFailure, scrubGitCredentialText, type GitRemoteAuthProvider } from "./git-credentials.js";
 import { classifyGitCloneFailure, GitConnectionFailureError, readGitConnectionFailure } from "./git-connection-failure.js";
 import { isWorkspaceGitScanError, WorkspaceGitScanError } from "./workspace-git-operation-scheduler.js";
+import { isCompletedNotAGitRepositoryFailure } from "./git-command-failure.js";
 import { measureRunPhase, recordRepositoryObjectCacheDetail } from "./execution-preparation-timing.js";
 import { resolveRepositoryObjectCache, readRepositoryObjectCache, publishRepositoryObjectCache } from "./repository-object-cache.js";
 
@@ -173,10 +174,11 @@ export async function ensureManagedRepositoriesIgnored(cwd: string, options: { p
     });
     excludePath = path.resolve(cwd, result.stdout.trim());
   } catch (error) {
-    const failure = error as { code?: unknown; signal?: unknown; stderr?: unknown };
-    if (options.plainTaskDirectory && failure.code === 128 && failure.signal == null &&
-        failure.stderr === "fatal: not a git repository (or any of the parent directories): .git\n" &&
-        !process.env.GIT_DIR && !process.env.GIT_WORK_TREE && !process.env.GIT_COMMON_DIR) return;
+    // A declared plain task directory may carry inert `.git` metadata (a copied
+    // or partially removed checkout); Git then reports "not a git repository"
+    // and the directory is still safe to use. Match the stable prefix rather
+    // than one Git version's full sentence (see git-command-failure.ts).
+    if (options.plainTaskDirectory && isCompletedNotAGitRepositoryFailure(error)) return;
     throw error;
   }
   const exclude = await fs.readFile(excludePath, "utf8").catch(() => "");

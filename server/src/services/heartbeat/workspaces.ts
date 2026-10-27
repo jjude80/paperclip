@@ -6,6 +6,7 @@ import { GitCacheRestorationFailure } from "../git-workspace-restoration.js";
 import { deriveRepoNameFromRepoUrl, managedProjectCheckoutName, projectRepositoryIdentity } from "../managed-project-checkout-name.js";
 import { forbidden } from "../../errors.js";
 import { readGitConnectionFailure } from "../git-connection-failure.js";
+import { isCompletedNotAGitRepositoryFailure } from "../git-command-failure.js";
 import { materializeManagedProjectWorkspace, ensureManagedRepositoriesIgnored } from "../managed-repository-checkout.js";
 import { addNestedRepositoryWorktree, isVerifiedNestedRepositoryBase, nestedRepositoryBaseCandidates, readLinkedNestedCheckout, repairMovedNestedRepositoryWorktree } from "../nested-repository-worktrees.js";
 export { materializeManagedProjectWorkspace } from "../managed-repository-checkout.js";
@@ -847,14 +848,11 @@ async function probeGitWorktreeBase(cwd: string) {
     });
     return { isCheckout: Boolean(readNonEmptyString(result.stdout)), notRepository: false };
   } catch (error) {
-    const failure = error as { code?: unknown; signal?: unknown; stderr?: unknown };
     // Git's absence result is only a candidate: damaged metadata can produce
     // the same message. Verify its absence too. Missing Git, permission errors,
-    // corruption and I/O failures must remain reportable in Sentry.
-    const notRepository = failure.code === 128 && failure.signal == null &&
-      typeof failure.stderr === "string" &&
-      /^fatal: not a git repository \(or any of the parent directories\): \.git\r?\n?$/.test(failure.stderr) &&
-      !process.env.GIT_DIR && !process.env.GIT_WORK_TREE && !process.env.GIT_COMMON_DIR &&
+    // corruption and I/O failures must remain reportable in Sentry. The fatal's
+    // wording changes between Git versions, so match only its stable prefix.
+    const notRepository = isCompletedNotAGitRepositoryFailure(error) &&
       await hasNoGitMetadataInWorkspaceAncestors(cwd);
     return { isCheckout: false, notRepository };
   }
