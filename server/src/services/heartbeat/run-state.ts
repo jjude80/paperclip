@@ -1200,6 +1200,48 @@ export function createHeartbeatRunState(db: Db) {
       .then((rows) => rows[0] ?? null);
   }
 
+  /**
+   * Total raw input the whole session has consumed, in the same unit the
+   * per-run counter uses: input tokens, plus the separate cache counter only
+   * for writers that saved exclusive input (historical Codex/Gemini raw input
+   * includes cache reads already).
+   *
+   * This is a database aggregate rather than a sum over the `runs` page above,
+   * because that page is capped at maxSessionRuns + 1 and the raw-input
+   * threshold has to see every run in the session, including the ones beyond
+   * that cap. Every stored usage row is a per-run delta (the session-cumulative
+   * adapters are normalized to deltas before they are written), so summing them
+   * is the session total.
+   */
+  async function getSessionRawInputTokens(agentId: string, sessionId: string) {
+    // Prefer the raw counters, exactly as readRawUsageTotals does, so the sum
+    // is in the same unit as the per-run figure it replaces.
+    const counter = (rawKey: string, key: string) =>
+      sql`case when jsonb_typeof(${heartbeatRuns.usageJson} -> ${rawKey}) = 'number'
+             then (${heartbeatRuns.usageJson} ->> ${rawKey})::numeric
+             when jsonb_typeof(${heartbeatRuns.usageJson} -> ${key}) = 'number'
+             then (${heartbeatRuns.usageJson} ->> ${key})::numeric
+             else 0 end`;
+    const [row] = await db
+      .select({
+        total: sql<string>`coalesce(sum(
+          ${counter("rawInputTokens", "inputTokens")}
+          + case when ${heartbeatRuns.usageJson} ->> 'rawInputIncludesCached' = 'false'
+                 then ${counter("rawCachedInputTokens", "cachedInputTokens")}
+                 else 0 end
+        ), 0)::text`,
+      })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.agentId, agentId),
+          eq(heartbeatRuns.sessionIdAfter, sessionId),
+        ),
+      );
+    const parsed = Number(row?.total ?? 0);
+    return Number.isFinite(parsed) ? Math.max(0, Math.floor(parsed)) : 0;
+  }
+
   async function getOldestRunForSession(agentId: string, sessionId: string) {
     return db
       .select({
@@ -1313,11 +1355,16 @@ export function createHeartbeatRunState(db: Db) {
       policy.maxSessionAgeHours > 0
         ? await getOldestRunForSession(agent.id, sessionId)
         : (runs[runs.length - 1] ?? latestRun);
-    const latestRawUsage = readRawUsageTotals(latestRun?.usageJson);
-    // Historical Codex/Gemini raw input includes cache reads. Only add the
-    // separate cache counter when the writer explicitly saved exclusive input.
-    const latestRawInputTokens = (latestRawUsage?.inputTokens ?? 0) +
-      (latestRun?.usageJson?.rawInputIncludesCached === false ? latestRawUsage?.cachedInputTokens ?? 0 : 0);
+    // The threshold is a *session* budget, so it is compared against what the
+    // whole session has consumed, not against the latest run alone. Comparing
+    // one run made the cap unreachable for a session whose runs each stayed
+    // under it: measured on this board, a 23-run session consumed 6,062,469
+    // tokens against a 400,000 token cap and rotated only when a single run
+    // finally crossed it, reporting 407,746 -- 15x less than it had used.
+    const sessionRawInputTokens =
+      policy.maxRawInputTokens > 0
+        ? await getSessionRawInputTokens(agent.id, sessionId)
+        : 0;
     const sessionAgeHours =
       latestRun && oldestRun
         ? Math.max(
@@ -1333,11 +1380,10 @@ export function createHeartbeatRunState(db: Db) {
       reason = `session exceeded ${policy.maxSessionRuns} runs`;
     } else if (
       policy.maxRawInputTokens > 0 &&
-      latestRawUsage &&
-      latestRawInputTokens >= policy.maxRawInputTokens
+      sessionRawInputTokens >= policy.maxRawInputTokens
     ) {
       reason =
-        `session raw input reached ${formatCount(latestRawInputTokens)} tokens ` +
+        `session raw input reached ${formatCount(sessionRawInputTokens)} tokens ` +
         `(threshold ${formatCount(policy.maxRawInputTokens)})`;
     } else if (
       policy.maxSessionAgeHours > 0 &&
