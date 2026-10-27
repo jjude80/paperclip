@@ -370,30 +370,30 @@ describe("activity routes", () => {
 
   it("passes task read filtering when listing links for a readable company run", async () => {
     mockHeartbeatService.getRunReadAccess.mockResolvedValue({
-      id: "run-1", companyId: "company-1", scopeKind: "company", issueId: null,
+      id: "6a3f2f9c-1f3e-4a4e-9a5c-2b1d7e8f0a11", companyId: "company-1", scopeKind: "company", issueId: null,
     });
     mockActivityService.issuesForRun.mockResolvedValue([{ issueId: "public-issue", title: "Visible task" }]);
     const app = await createApp({ type: "agent", companyId: "company-1", agentId: "agent-1" });
-    const res = await requestApp(app, baseUrl => request(baseUrl).get("/api/heartbeat-runs/run-1/issues"));
+    const res = await requestApp(app, baseUrl => request(baseUrl).get("/api/heartbeat-runs/6a3f2f9c-1f3e-4a4e-9a5c-2b1d7e8f0a11/issues"));
     expect(res.status).toBe(200);
-    expect(mockHeartbeatService.getRunReadAccess).toHaveBeenCalledWith("run-1");
+    expect(mockHeartbeatService.getRunReadAccess).toHaveBeenCalledWith("6a3f2f9c-1f3e-4a4e-9a5c-2b1d7e8f0a11");
     expect(mockHeartbeatService.getRun).not.toHaveBeenCalled();
     const { issueReadSqlCondition } = await import("../services/authorization.js");
     expect(issueReadSqlCondition).toHaveBeenCalledWith({}, expect.objectContaining({
       type: "agent", companyId: "company-1", agentId: "agent-1",
     }));
-    expect(mockActivityService.issuesForRun).toHaveBeenCalledWith("run-1", {});
+    expect(mockActivityService.issuesForRun).toHaveBeenCalledWith("6a3f2f9c-1f3e-4a4e-9a5c-2b1d7e8f0a11", {});
     expect(res.body).toEqual([{ issueId: "public-issue", title: "Visible task" }]);
   });
 
   it("returns 200 [] (not 404) when listing issues for another company's run, preserving API contract and the cross-tenant oracle", async () => {
     mockHeartbeatService.getRunReadAccess.mockResolvedValue({
-      id: "run-2",
+      id: "6a3f2f9c-1f3e-4a4e-9a5c-2b1d7e8f0a11",
       companyId: "company-2",
     });
 
     const app = await createApp();
-    const res = await requestApp(app, (baseUrl) => request(baseUrl).get("/api/heartbeat-runs/run-2/issues"));
+    const res = await requestApp(app, (baseUrl) => request(baseUrl).get("/api/heartbeat-runs/6a3f2f9c-1f3e-4a4e-9a5c-2b1d7e8f0a11/issues"));
 
     expect(res.status).toBe(200);
     expect(res.body).toEqual([]);
@@ -404,16 +404,26 @@ describe("activity routes", () => {
     mockHeartbeatService.getRunReadAccess.mockResolvedValue(null);
 
     const app = await createApp();
-    const res = await requestApp(app, (baseUrl) => request(baseUrl).get("/api/heartbeat-runs/missing-run/issues"));
+    const res = await requestApp(app, (baseUrl) => request(baseUrl).get("/api/heartbeat-runs/00000000-0000-4000-8000-000000000000/issues"));
 
     expect(res.status).toBe(200);
     expect(res.body).toEqual([]);
     expect(mockActivityService.issuesForRun).not.toHaveBeenCalled();
   });
 
+  it("rejects a malformed run id before it reaches the run store", async () => {
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) => request(baseUrl).get("/api/heartbeat-runs/not-a-uuid/issues"));
+
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: "Invalid heartbeat run ID" });
+    expect(mockHeartbeatService.getRun).not.toHaveBeenCalled();
+    expect(mockHeartbeatService.getRunReadAccess).not.toHaveBeenCalled();
+  });
+
   it("rejects anonymous heartbeat run issue lookups before run existence checks", async () => {
     const app = await createApp({ type: "none", source: "none" });
-    const res = await requestApp(app, (baseUrl) => request(baseUrl).get("/api/heartbeat-runs/missing-run/issues"));
+    const res = await requestApp(app, (baseUrl) => request(baseUrl).get("/api/heartbeat-runs/not-a-uuid/issues"));
 
     expect(res.status).toBe(401);
     expect(mockHeartbeatService.getRun).not.toHaveBeenCalled();
@@ -423,7 +433,7 @@ describe("activity routes", () => {
 
   it.each([true, false])("preserves issue-scoped run authorization when read permission is %s", async (allowed) => {
     mockHeartbeatService.getRunReadAccess.mockResolvedValue({
-      id: "run-1", companyId: "company-1", scopeKind: "issue", issueId: "issue-private",
+      id: "7b4e3a2d-5c6f-4d8e-9f01-3a2b4c5d6e7f", companyId: "company-1", scopeKind: "issue", issueId: "issue-private",
     });
     mockAccessService.decide.mockImplementation(async ({ action }) => ({
       allowed: action === "issue:read" ? allowed : true,
@@ -433,23 +443,23 @@ describe("activity routes", () => {
       select: () => ({ from: () => ({ where: async () => [{ id: "issue-private" }] }) }),
     };
     const app = await createApp({ type: "agent", companyId: "company-1", agentId: "agent-1" }, db);
-    const res = await requestApp(app, baseUrl => request(baseUrl).get("/api/heartbeat-runs/run-1/issues"));
+    const res = await requestApp(app, baseUrl => request(baseUrl).get("/api/heartbeat-runs/7b4e3a2d-5c6f-4d8e-9f01-3a2b4c5d6e7f/issues"));
     expect(res.status).toBe(200);
     expect(res.body).toEqual(allowed ? [{ issueId: "visible-issue" }] : []);
     expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
       action: "issue:read", resource: expect.objectContaining({ companyId: "company-1", issueId: "issue-private" }),
     }));
-    expect(mockHeartbeatService.getRunReadAccess).toHaveBeenCalledWith("run-1");
+    expect(mockHeartbeatService.getRunReadAccess).toHaveBeenCalledWith("7b4e3a2d-5c6f-4d8e-9f01-3a2b4c5d6e7f");
     expect(mockHeartbeatService.getRun).not.toHaveBeenCalled();
     expect(mockActivityService.issuesForRun).toHaveBeenCalledTimes(allowed ? 1 : 0);
   });
 
   it("does not read issue links for a run without a trusted issue binding", async () => {
     mockHeartbeatService.getRunReadAccess.mockResolvedValue({
-      id: "run-1", companyId: "company-1", scopeKind: "issue", issueId: null,
+      id: "7b4e3a2d-5c6f-4d8e-9f01-3a2b4c5d6e7f", companyId: "company-1", scopeKind: "issue", issueId: null,
     });
     const app = await createApp();
-    const res = await requestApp(app, baseUrl => request(baseUrl).get("/api/heartbeat-runs/run-1/issues"));
+    const res = await requestApp(app, baseUrl => request(baseUrl).get("/api/heartbeat-runs/7b4e3a2d-5c6f-4d8e-9f01-3a2b4c5d6e7f/issues"));
     expect(res.status).toBe(200);
     expect(res.body).toEqual([]);
     expect(mockActivityService.issuesForRun).not.toHaveBeenCalled();
