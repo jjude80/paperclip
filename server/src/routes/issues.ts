@@ -2977,10 +2977,12 @@ type IssueListPreparedResponse =
       body: CompactIssue[];
       etag: string;
       cacheControl: string;
+      hasMore: boolean;
     }
   | {
       kind: "full";
       body: unknown[];
+      hasMore: boolean;
     };
 
 type IssueListCacheStatus = "miss" | "hit" | "coalesced" | "stale" | "retry";
@@ -8576,7 +8578,11 @@ export function issueRoutes(
       includeLiveDescendantSummary: includeLiveDescendantSummary === true,
       hasPlanDocument,
       q: req.query.q as string | undefined,
-      limit,
+      // One row past the page: the response has to be able to say whether it
+      // was truncated, and a count over the same filters would have to
+      // re-derive every filter this route supports. The extra row is dropped
+      // before projection (see `hasMore` below).
+      limit: limit + 1,
       offset,
       sortField: sortField === "updated" || sortField === "id" ? sortField : undefined,
       afterId: req.query.afterId as string | undefined,
@@ -8608,10 +8614,15 @@ export function issueRoutes(
         const visibleRows = await actorCanReadCompanyScope(req, companyId)
           ? rawResult
           : await filterIssuesForActor(req, rawResult);
-        const result = await redactIssueRelationEdgesOnRows(req, companyId, visibleRows);
+        const unpagedResult = await redactIssueRelationEdgesOnRows(req, companyId, visibleRows);
+        // `listFilters.limit` asked for one row beyond the page. If that row
+        // survived actor filtering, there is another page; drop it before any
+        // projection so the caller sees exactly `limit` rows.
+        const hasMore = unpagedResult.length > limit;
+        const result = hasMore ? unpagedResult.slice(0, limit) : unpagedResult;
         if (view === "index") {
           const body = result.map((issue) => ({ ...toCompactIssue(issue), listProjection: "index" as const }));
-          return { kind: "compact", body, etag: compactIssueListEtag(body), cacheControl: "private, must-revalidate" };
+          return { kind: "compact", body, etag: compactIssueListEtag(body), cacheControl: "private, must-revalidate", hasMore };
         }
         const issueIds = result.map((issue) => issue.id);
         const interruptions = await taskInterruptionPresentations(db, companyId, result);
@@ -8649,6 +8660,7 @@ export function issueRoutes(
             body: compactResult,
             etag: compactIssueListEtag(compactResult),
             cacheControl: "private, must-revalidate",
+            hasMore,
           };
         }
         const [handoffStates, recoveryActionByIssue] = await Promise.all([
@@ -8679,6 +8691,7 @@ export function issueRoutes(
             activeRecoveryAction: recoveryActionByIssue.get(issue.id) ?? null,
             interruption: interruptions.get(issue.id) ?? null,
           })),
+          hasMore,
         };
       },
     });
@@ -8705,6 +8718,7 @@ export function issueRoutes(
       return;
     }
 
+    res.setHeader("X-Has-More", String(coordinated.response.hasMore));
     if (coordinated.response.kind === "compact") {
       res.setHeader("Cache-Control", coordinated.response.cacheControl);
       res.setHeader("ETag", coordinated.response.etag);
