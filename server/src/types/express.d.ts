@@ -27,6 +27,10 @@ declare global {
         isInstanceAdmin?: boolean;
         canManageExperimentalSettings?: boolean;
         keyId?: string;
+        // Expiry of the credential that authenticated this request, when that
+        // credential can expire (a named board key). `null` means the key does
+        // not expire; absent means the actor is not key-authenticated at all.
+        keyExpiresAt?: Date | null;
         keyScope?: AgentApiKeyScope;
         runId?: string;
         onBehalfOfUserId?: string | null;

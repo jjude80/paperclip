@@ -295,6 +295,12 @@ databaseSuite("CLI challenge authority and transitions (real PostgreSQL)", () =>
     const identity = await request(app).get("/api/cli-auth/me").set("Authorization", `Bearer ${boardApiToken}`);
     expect(identity.body).toMatchObject({ userId: f.userId, source: "board_key" });
     expect(new Set(identity.body.companyIds)).toEqual(new Set([f.companyId, secondCompanyId]));
+    // NEXA-645: the expiry must survive the real middleware, not just the route
+    // unit test (which injects the actor). Compare against the stored row so
+    // this cannot pass by hard-coding a date.
+    const storedKey = await f.service.findBoardApiKeyByToken(boardApiToken);
+    expect(storedKey?.expiresAt).toBeInstanceOf(Date);
+    expect(identity.body.expiresAt).toBe(storedKey!.expiresAt!.toISOString());
     expect((await request(app).post("/api/cli-auth/revoke-current").set("Authorization", `Bearer ${boardApiToken}`)).status).toBe(200);
     expect((await request(app).get("/api/cli-auth/me").set("Authorization", `Bearer ${boardApiToken}`)).status).toBe(401);
   });

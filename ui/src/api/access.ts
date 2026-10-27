@@ -244,6 +244,8 @@ export type CurrentBoardAccess = {
   }>;
   source: string;
   keyId: string | null;
+  /** ISO timestamp when the authenticating board key expires; null when it does not. */
+  expiresAt?: string | null;
 };
 
 function buildInviteListQuery(options: {
