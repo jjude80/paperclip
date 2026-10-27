@@ -1,3 +1,4 @@
+import type { ConnectionManagementContext } from "./connection-management.js";
 import { githubBotCredentials } from "./chat-github-client.js";
 import { toolAccessPolicyService } from "./tool-access-policy.js";
 import { agents, toolCatalogEntries } from "@paperclipai/db";
@@ -90,7 +91,9 @@ export function githubChatManagementService(db: Db, fetchImpl = fetch) {
     endpointId: string,
     input: unknown,
     userId: string,
+    managementContext?: ConnectionManagementContext,
   ) {
+    await managementContext?.reauthorize();
     const bot = await endpoint(endpointId);
     await member(bot.companyId, userId);
     const parsed = updateGitHubChatConfigurationSchema.parse(input);
@@ -185,8 +188,7 @@ export function githubChatManagementService(db: Db, fetchImpl = fetch) {
       await syncGitHubBotTools(tx, bot, userId, config.toolsEnabled);
       await logActivity(tx as unknown as Db, {
         companyId: bot.companyId,
-        actorType: "user",
-        actorId: userId,
+        ...(managementContext?.audit ?? { actorType: "user" as const, actorId: userId }),
         action: "chat_github.configuration_updated",
         entityType: "tool_connection",
         entityId: bot.connectionId,

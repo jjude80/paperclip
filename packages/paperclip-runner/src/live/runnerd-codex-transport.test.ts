@@ -351,6 +351,51 @@ it.each(["resolved", "rejected"] as const)(
   15_000,
 );
 
+it.each([
+  "transport_reconnect_grace_exceeded",
+  "transport reconnect grace exceeded; durable state is preserved",
+])("does not restart an exhausted reconnect incident: %s", async detail => {
+  const directory = await mkdtemp(join(tmpdir(), "runnerd-exhausted-grace-"));
+  const children: ReturnType<typeof spawn>[] = [];
+  const exits: Promise<unknown>[] = [];
+  const launch = vi.fn((spec: durableControlPlane.RunnerProcessLaunchSpec) => {
+    const child = spawn(spec.command, [...spec.args], {
+      cwd: spec.cwd, env: spec.environment, stdio: "ignore",
+    });
+    children.push(child);
+    const completion = new Promise<durableControlPlane.RunnerProcessResult>((resolveExit, rejectExit) => {
+      child.once("error", rejectExit);
+      child.once("exit", (code, signal) => resolveExit({ code, signal, stdout: "", stderr: detail }));
+    });
+    exits.push(completion);
+    return { child, completion, isExitConfirmed: () => child.exitCode !== null || child.signalCode !== null };
+  });
+  const bundle = createCapabilityRunnerdCodexTransport({
+    runnerBinary: defaultCapabilityRunnerdBinary(), codexCommand: process.execPath,
+    codexArgs: [fileURLToPath(new URL("../../test/fixtures/fake-durable-codex-app-server.mjs", import.meta.url)), join(directory, "fake-state.json")], stateDirectory: directory,
+    lifecyclePolicy: { mode: "warm", idleTimeoutMs: 60_000 },
+    runnerReconnectGraceMs: 1_000, runnerProcessLauncher: launch,
+  });
+  try {
+    await bundle.transport.request("thread/start", { cwd: directory });
+    const failure = (async () => {
+      for await (const _event of bundle.transport.notifications()) {}
+    })().catch(error => error as Error);
+    children[0]!.kill("SIGKILL");
+    // The runner's terminal receipt is the exhausted incident authority.
+    const result = await Promise.race([failure, new Promise(resolve => setTimeout(() => resolve("still active"), 2_000))]);
+    expect(result).toMatchObject({ message: expect.stringContaining("transport_reconnect_grace_exceeded") });
+    expect(launch).toHaveBeenCalledTimes(1);
+  } finally {
+    const providerPid = bundle.evidence().codexPid;
+    if (providerPid) { try { process.kill(providerPid, "SIGKILL"); } catch {} }
+    await bundle.transport.detachControllerForRestart!();
+    for (const child of children) child.kill("SIGKILL");
+    await Promise.allSettled(exits);
+    await rm(directory, { recursive: true, force: true });
+  }
+}, 15_000);
+
 it("preserves the cause when a replacement runner's health cannot be verified", async () => {
   const directory = await mkdtemp(join(tmpdir(), "runnerd-replacement-health-"));
   const probeError = Object.assign(new Error("remote recovery process_verification: probe_timeout"), {
@@ -3343,6 +3388,29 @@ const fakeCodex = resolve(
   "../../runner/target/debug/fake-codex-app-server",
 );
 
+it("keeps the Copilot authentication launch requirements free of Codex search policy", async () => {
+  const root = await mkdtemp(join(tmpdir(), "runnerd-copilot-probe-policy-"));
+  let captured: RunnerProviderLaunchRequirements | undefined;
+  const launch = vi.fn(() => { throw new Error("provider process must not start"); });
+  try {
+    await expect(probeNativeRunnerEnvironment({ runtimeDirectory: root, provider: "acpx", model: "gpt-5.6-luna",
+      environment: {}, timeoutMs: 1_000,
+      transportOptions: { acpxAgent: "copilot", acpxCandidateProfile: "copilot", disableCodexWebSearch: true,
+        runnerArtifact: { version: "offline-fixture", digest: `sha256:${"a".repeat(64)}` },
+        runnerProcessLauncher: launch,
+        controlPlaneRegistration: async () => { throw new Error("registration must not start"); },
+        prepareLaunch: async requirements => {
+          captured = requirements;
+          throw new Error("offline-stop-at-Copilot-preparation");
+        },
+      },
+    })).rejects.toThrow("offline-stop-at-Copilot-preparation");
+    expect(captured).toBeDefined();
+    expect(captured?.settings).not.toHaveProperty("disableCodexWebSearch");
+    expect(launch).not.toHaveBeenCalled();
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 it.each(["stuck", "late-release", "late-release-error", "stuck-release", "cooperative-release", "launch-failure", "launch-failure-sandbox", "launch-failure-unsandboxed"] as const)(
   "bounds setup registration teardown and retains unconfirmed state (%s)",
   async mode => {
@@ -3381,7 +3449,7 @@ it.each(["stuck", "late-release", "late-release-error", "stuck-release", "cooper
         ...(mode === "launch-failure-sandbox" ? { externallySandboxed: true } : mode === "launch-failure-unsandboxed" ? { externallySandboxed: false } : {}),
         runnerBinary: resolve(import.meta.dirname, "../../package.json"),
         codexCommand: resolve(import.meta.dirname, "../../package.json"),
-        sourceCodexHome: "", runnerProcessLauncher: launch,
+        sourceCodexHome: "", runnerProcessLauncher: launch, disableCodexWebSearch: false,
         controlPlaneRegistration: async (_authority, _identity, signal) => {
           template = structuredClone(_authority.store.state.runAttachTemplate!);
           registrationSignal = signal;
@@ -3405,6 +3473,8 @@ it.each(["stuck", "late-release", "late-release-error", "stuck-release", "cooper
       expect(template).toMatchObject({ provider: { externallySandboxed: mode === "launch-failure-sandbox", readOnly: true, approvalPolicy: "never", collaborationMode: "plan" } });
       const args = (template!.provider as Record<string, unknown>).args as string[];
       expect(args).toContain("project_doc_max_bytes=0");
+      expect(args).toContain('web_search="disabled"');
+      expect(args.indexOf('web_search="disabled"')).toBeLessThan(args.indexOf("app-server"));
       expect(args[args.indexOf("project_doc_max_bytes=0") - 1]).toBe("-c");
       expect(args.indexOf("project_doc_max_bytes=0")).toBeLessThan(args.indexOf("app-server"));
       expect(args).not.toContain("--dangerously-bypass-approvals-and-sandbox");
@@ -8297,6 +8367,7 @@ async function verifyLiveRunnerAdoption(
   goalMidTurn = false,
   detachBeforeCleanup = false,
   startWithoutCheckpoint = false,
+  uncertainAtClose = false,
 ) {
   const stateDirectory = await mkdtemp(join(tmpdir(), "runnerd-live-adopt-"));
   const server = createServer();
@@ -8319,7 +8390,7 @@ async function verifyLiveRunnerAdoption(
     authority = next;
     return {
       connectUrl: `ws://127.0.0.1:${address.port}/runner`,
-      ...(mismatchedArtifact ? { checkpoint } : {}),
+      ...(mismatchedArtifact || uncertainAtClose ? { checkpoint } : {}),
       release: async () => {
         if (authority === next) authority = null;
       },
@@ -8346,6 +8417,7 @@ async function verifyLiveRunnerAdoption(
   let runnerPid: number | null = null;
   let adopted: ReturnType<typeof createCapabilityRunnerdCodexTransport> | null =
     null;
+  let restoreIntervalSpies: () => void = () => undefined;
   try {
     let opened: Record<string, unknown>;
     try {
@@ -8413,8 +8485,14 @@ async function verifyLiveRunnerAdoption(
     });
     const openedThread = opened.thread as Record<string, unknown>;
     const signal = vi.fn(() => true);
+    const probeError = new Error("fixture remote process identity is unavailable");
+    let rejectLiveness = false;
+    const intervals = uncertainAtClose ? vi.spyOn(globalThis, "setInterval") : null;
+    const clearedIntervals = uncertainAtClose ? vi.spyOn(globalThis, "clearInterval") : null;
+    restoreIntervalSpies = () => { intervals?.mockRestore(); clearedIntervals?.mockRestore(); };
     adopted = createCapabilityRunnerdCodexTransport({
       ...sharedOptions,
+      ...(uncertainAtClose ? { closeGraceMs: 2_000 } : {}),
       // Hash different stable bytes without replacing the real runner artifact
       // used by concurrent tests. Adoption must never execute this path.
       ...(mismatchedArtifact
@@ -8437,6 +8515,7 @@ async function verifyLiveRunnerAdoption(
         startedAt: new Date().toISOString(),
         signal,
         isAlive: () => {
+          if (rejectLiveness) return Promise.reject(probeError);
           try {
             process.kill(runnerPid!, 0);
             return true;
@@ -8515,6 +8594,30 @@ async function verifyLiveRunnerAdoption(
       expect(observed.params).toMatchObject({ threadId: "codex-thread-1", turnId: "provider-goal-turn-1" });
     }
     expect(duplicateLauncher).not.toHaveBeenCalled();
+    if (uncertainAtClose) {
+      const before = JSON.parse(await readFile(controlPlaneStatePath, "utf8"));
+      const retainedAuthority = authority as DurablePrpControlPlane | null;
+      rejectLiveness = true;
+      await expect(adopted.transport.close()).rejects.toBe(probeError);
+      expect(retainedAuthority?.activeRunnerConnectionCount()).toBe(0);
+      expect(intervals!.mock.results.length).toBeGreaterThan(0);
+      for (const interval of intervals!.mock.results) if (interval.type === "return") expect(clearedIntervals).toHaveBeenCalledWith(interval.value);
+      const notificationsClosed = (async () => { for await (const _event of adopted!.transport.notifications()) {} return true; })();
+      let queueDeadline: ReturnType<typeof setTimeout> | undefined;
+      try {
+        expect(await Promise.race([notificationsClosed, new Promise<boolean>(resolve => { queueDeadline = setTimeout(() => resolve(false), 250); })])).toBe(true);
+      } finally { clearTimeout(queueDeadline); }
+      await expect(adopted.transport.close()).rejects.toBe(probeError);
+      expect(adopted.transport.processInfo()).toMatchObject({ exited: false });
+      expect(() => process.kill(runnerPid!, 0)).not.toThrow();
+      expect(signal).not.toHaveBeenCalled();
+      expect(checkpoint).not.toHaveBeenCalled();
+      expect(duplicateLauncher).not.toHaveBeenCalled();
+      const retained = JSON.parse(await readFile(controlPlaneStatePath, "utf8"));
+      expect(retained.identity).toEqual(before.identity);
+      expect(retained.commands).toEqual(before.commands);
+      return;
+    }
     expect(adopted.evidence().diagnostics).toContain(
       `adopted runner ${runnerPid} authenticated to its durable PRP authority`,
     );
@@ -8538,6 +8641,15 @@ async function verifyLiveRunnerAdoption(
     }
   } finally {
     await adopted?.transport.close().catch(() => undefined);
+    if (uncertainAtClose) {
+      const providerPid = adopted?.evidence().codexPid;
+      if (providerPid) {
+        try { process.kill(providerPid, "SIGKILL"); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
+      }
+      await (authority as DurablePrpControlPlane | null)?.stop();
+    }
+    restoreIntervalSpies();
     if (runnerPid) {
       try {
         process.kill(-runnerPid, "SIGKILL");
@@ -8560,6 +8672,8 @@ it(
   () => verifyLiveRunnerAdoption(false),
   30_000,
 );
+
+it("retains authenticated adopted-runner ownership when a close probe rejects", () => verifyLiveRunnerAdoption(false, false, false, false, false, true), 30_000);
 
 it(
   "blocks adopted runner artifact drift without duplicate launch, checkpoint replacement, or process signals",

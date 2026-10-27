@@ -1,3 +1,4 @@
+import { connectionActorUserId } from "../actor.js";
 import { toConnection, toConnectionInstall } from "./projection.js";
 import { actorBinding } from "../actor.js";
 import { lockToolAssignmentAgents, lockToolConnectionRuntimeInputs } from "../assignment-locks.js";
@@ -147,6 +148,7 @@ export function createConnectionInstalls(db: Db, { now, getConnectionRow, assert
       input: PutToolConnectionInstalls,
       actor?: ActorInfo,
     ): Promise<ToolConnectionInstallSnapshot> => {
+      await actor?.managementContext?.reauthorize();
       const connection = await getConnectionRow(connectionId);
       const requested = new Map(
         input.installs.map((install) => [
@@ -267,7 +269,7 @@ export function createConnectionInstalls(db: Db, { now, getConnectionRow, assert
               createdByAgentId:
                 actor?.actorType === "agent" ? (actor.actorId ?? null) : null,
               createdByUserId:
-                actor?.actorType === "user" ? (actor.actorId ?? null) : null,
+                connectionActorUserId(actor),
             })),
           );
         }
@@ -289,7 +291,7 @@ export function createConnectionInstalls(db: Db, { now, getConnectionRow, assert
                 createdByAgentId:
                   actor?.actorType === "agent" ? (actor.actorId ?? null) : null,
                 createdByUserId:
-                  actor?.actorType === "user" ? (actor.actorId ?? null) : null,
+                  connectionActorUserId(actor),
               })
               .onConflictDoNothing()
               .returning({ id: toolProfileBindings.id });

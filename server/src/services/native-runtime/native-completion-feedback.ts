@@ -9,7 +9,7 @@ import { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
 import { issueService } from "../issues.js";
 import { isConversation } from "../agent-conversations.js";
 import { issueTreeControlService } from "../issue-tree-control.js";
-import { resolveExternalChatResponseWaitAuthorization } from "./chat-attachment-reuse.js";
+import { isPublishedGitHubReviewCompletionContinuation, readPublishedGitHubReviewCompletionContinuation, resolveExternalChatResponseWaitAuthorization } from "./chat-attachment-reuse.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./native-review-participant.js";
 import { and, eq, inArray, notInArray } from "drizzle-orm";
 import {
@@ -68,6 +68,12 @@ export async function nativeCompletionFeedback(
     )
     .then((rows) => rows[0]);
   if (!issue) throw new Error("Completion task no longer exists.");
+  if (result.reportedWorkDisposition === "yielded" && isPublishedGitHubReviewCompletionContinuation(result.continuation)) {
+    const current = await readPublishedGitHubReviewCompletionContinuation({ db,
+      binding: { companyId: run.companyId, issueId: issue.id, runId, agentId: run.agentId } });
+    if (!current || current.idempotencyKey !== result.continuation!.idempotencyKey)
+      throw new Error("The published GitHub review wait is no longer authorized for this run. Reassess current task state without repeating the published review.");
+  }
   const acceptedHandoff = await assertNativeCaseHandoffResult(db, runId, issue.id, result);
   if (acceptedHandoff) return "The persisted case handoff controls this turn. End the turn; the task remains open for its next agent.";
   const reviewContext = readNativeReviewAssignmentContext(run.contextSnapshot);

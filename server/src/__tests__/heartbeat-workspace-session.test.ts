@@ -613,6 +613,31 @@ describe("assertGitWorktreeBaseWorkspaceReady", () => {
     } finally { await fs.rm(cwd, { recursive: true, force: true }); }
   });
 
+  it("marks the same non-Git local path when Git 2.55 rewords its fatal", async () => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-local-path-git-version-"));
+    const bin = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-local-path-git-bin-"));
+    try {
+      // Git 2.55 replaced the old single-line fatal with this two-line form.
+      await fs.writeFile(path.join(bin, "git"), "#!/bin/sh\n" +
+        "printf '%s\\n' 'fatal: not a git repository (or any parent up to mount point /)' " +
+        "'Stopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).' >&2\n" +
+        "exit 128\n", { mode: 0o755 });
+      vi.stubEnv("PATH", `${bin}${path.delimiter}${process.env.PATH ?? ""}`);
+      await expect(assertGitWorktreeBaseWorkspaceReady(configuredLocalPathInput(cwd))).rejects.toMatchObject({
+        code: "workspace_validation_failed",
+        message: expect.stringContaining("is not a git checkout"),
+        resultJson: { workspaceValidation: {
+          reason: "git_worktree_base_not_git_checkout",
+          configurationReason: "local_path_requires_git_checkout",
+        } },
+      });
+    } finally {
+      vi.unstubAllEnvs();
+      await fs.rm(cwd, { recursive: true, force: true });
+      await fs.rm(bin, { recursive: true, force: true });
+    }
+  });
+
   it.each(["legacy", "repository", "fallback", "materialization", "session", "unbound"])(
     "does not mark ambiguous non-Git workspace evidence as a configuration-only failure: %s", async (kind) => {
       const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-ambiguous-workspace-"));
@@ -2420,6 +2445,57 @@ describe("effective run session config freshness", () => {
         configuredModel: "gpt-5.4-mini",
         taskSessionParams: sessionParamsWithConfigMetadata(base),
         configMetadata: workspaceChanged,
+      }),
+    ).toMatchObject({
+      reset: true,
+      changedCategories: ["workspaceConfig"],
+    });
+  });
+
+  it.each([null, "2026-06-01T00:00:00.000Z"])("does not reset for project row timestamps (%s) but still resets for project policy", async (revision) => {
+    const base = await buildSessionConfigMetadata({
+      workspaceConfig: {
+        requestedMode: "agent_default",
+        effectiveMode: "agent_default",
+        projectConfigRevisionAt: revision,
+        projectPolicy: null,
+      },
+    });
+    const projectTouched = await buildSessionConfigMetadata({
+      workspaceConfig: {
+        requestedMode: "agent_default",
+        effectiveMode: "agent_default",
+        projectConfigRevisionAt: "2026-06-01T00:05:00.000Z",
+        projectPolicy: null,
+      },
+    });
+    const policyChanged = await buildSessionConfigMetadata({
+      workspaceConfig: {
+        requestedMode: "agent_default",
+        effectiveMode: "agent_default",
+        projectConfigRevisionAt: "2026-06-01T00:05:00.000Z",
+        projectPolicy: { enabled: true, defaultMode: "isolated_workspace" },
+      },
+    });
+
+    expect(
+      resolveTaskSessionConfigFreshness({
+        hasTaskSession: true,
+        configuredModel: "gpt-5.4-mini",
+        taskSessionParams: sessionParamsWithConfigMetadata(base),
+        configMetadata: projectTouched,
+      }),
+    ).toMatchObject({
+      reset: false,
+      changedCategories: [],
+      reasons: [],
+    });
+    expect(
+      resolveTaskSessionConfigFreshness({
+        hasTaskSession: true,
+        configuredModel: "gpt-5.4-mini",
+        taskSessionParams: sessionParamsWithConfigMetadata(base),
+        configMetadata: policyChanged,
       }),
     ).toMatchObject({
       reset: true,

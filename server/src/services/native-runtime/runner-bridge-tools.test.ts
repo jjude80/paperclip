@@ -155,7 +155,11 @@ if sys.argv[1] != "completion":
     expect(await readFile(join(directory, "output.txt"), "utf8")).toBe("hello");
     const read = await executeWorkspaceTool(directory, "workspace_run", { program: "/bin/cat", args: [secret] }, authorize);
     expect(read).toMatchObject({ exitCode: 1 }); expect(String((read as any).output)).not.toContain("PRIVATE");
-    const write = await executeWorkspaceTool(directory, "workspace_run", { program: "/bin/sh", args: ["-c", 'printf stolen > "$1"', "sh", secret] }, authorize);
+    // dash (the Ubuntu /bin/sh) exits 2 when a redirection cannot open its
+    // target, bash exits 1. Normalize the denial to 1 so the assertion still
+    // distinguishes "the sandbox denied the write" from "the sandbox failed
+    // to start" (which keeps bubblewrap's own exit code).
+    const write = await executeWorkspaceTool(directory, "workspace_run", { program: "/bin/sh", args: ["-c", 'printf stolen > "$1" || exit 1', "sh", secret] }, authorize);
     expect(write).toMatchObject({ exitCode: 1 }); expect(await readFile(secret, "utf8")).toBe("PRIVATE");
   });
   it.skipIf(!workspaceCommandSandboxAvailable())("stops its owned process on authority loss and bounds output", async () => {

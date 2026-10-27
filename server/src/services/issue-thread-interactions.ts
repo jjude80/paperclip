@@ -197,7 +197,7 @@ export type IssueThreadInteractionServiceOptions = {
 };
 
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
-type InteractionResolutionMutationOptions = {
+export type InteractionResolutionMutationOptions = {
   /** Confirmation accept/reject nested in an outer transaction must defer these
    * effects and flush them with the root database only after its commit. */
   deferConfirmationCommitEffects?: (effect: (committedDb: Db) => Promise<void>) => void;
@@ -2613,6 +2613,16 @@ export function issueThreadInteractionService(
       },
     ) => {
       const payload = connectionIntentPayloadSchema.parse(input.payload);
+      const sameSavedSetup = (candidate: typeof payload) =>
+        candidate.savedSetup?.endpointId === payload.savedSetup?.endpointId
+        && candidate.savedSetup?.connectionId === payload.savedSetup?.connectionId
+        && candidate.savedSetup?.action === payload.savedSetup?.action
+        && Boolean(candidate.savedSetup?.credentialRotation) === Boolean(payload.savedSetup?.credentialRotation)
+        && candidate.savedSetup?.credentialEntry?.requireAll === payload.savedSetup?.credentialEntry?.requireAll
+        // Preserve the original generation boundary on retries, while keeping
+        // requests for different credential fields distinct.
+        && isDeepStrictEqual(Object.keys(candidate.savedSetup?.credentialEntry?.previousGenerations ?? {}).sort(),
+          Object.keys(payload.savedSetup?.credentialEntry?.previousGenerations ?? {}).sort());
       const existing = await getIdempotentInteraction({
         issueId: issue.id,
         companyId: issue.companyId,
@@ -2624,7 +2634,7 @@ export function issueThreadInteractionService(
           || existing.sourceRunId !== input.sourceRunId
           || existing.addresseeUserId !== input.addresseeUserId
           || (existing.kind === "connection_intent"
-            ? (connectionIntentPayloadSchema.parse(existing.payload).serviceSlug !== payload.serviceSlug || connectionIntentPayloadSchema.parse(existing.payload).purpose !== payload.purpose || !isDeepStrictEqual(connectionIntentPayloadSchema.parse(existing.payload).accessRequest, payload.accessRequest))
+            ? (connectionIntentPayloadSchema.parse(existing.payload).serviceSlug !== payload.serviceSlug || connectionIntentPayloadSchema.parse(existing.payload).purpose !== payload.purpose || !sameSavedSetup(connectionIntentPayloadSchema.parse(existing.payload)) || !isDeepStrictEqual(connectionIntentPayloadSchema.parse(existing.payload).accessRequest, payload.accessRequest))
             : !isDeepStrictEqual(existing.payload, payload))
         ) {
           throw conflict(
@@ -2634,7 +2644,9 @@ export function issueThreadInteractionService(
             },
           );
         }
-        return hydrateInteraction(existing) as ConnectionIntentInteraction;
+        const interaction = hydrateInteraction(existing) as ConnectionIntentInteraction;
+        await enqueueIssueInteractionChatPublications(db, interaction);
+        return interaction;
       }
 
       let inserted = false;
@@ -2661,8 +2673,11 @@ export function issueThreadInteractionService(
           eq(issueThreadInteractions.addresseeUserId, input.addresseeUserId),
         ));
         const reusable = pending.find((candidate) =>
-          connectionIntentPayloadSchema.parse(candidate.payload).serviceSlug === payload.serviceSlug && connectionIntentPayloadSchema.parse(candidate.payload).purpose === payload.purpose && isDeepStrictEqual(connectionIntentPayloadSchema.parse(candidate.payload).accessRequest, payload.accessRequest));
-        if (reusable) return reusable;
+          connectionIntentPayloadSchema.parse(candidate.payload).serviceSlug === payload.serviceSlug && connectionIntentPayloadSchema.parse(candidate.payload).purpose === payload.purpose && sameSavedSetup(connectionIntentPayloadSchema.parse(candidate.payload)) && isDeepStrictEqual(connectionIntentPayloadSchema.parse(candidate.payload).accessRequest, payload.accessRequest));
+        if (reusable) {
+          await enqueueIssueInteractionChatPublications(tx as unknown as Db, hydrateInteraction(reusable));
+          return reusable;
+        }
 
         const [sourceRun] = await tx.select({ context: heartbeatRuns.contextSnapshot }).from(heartbeatRuns)
           .where(and(eq(heartbeatRuns.id, input.sourceRunId), eq(heartbeatRuns.companyId, issue.companyId)));
@@ -2684,8 +2699,11 @@ export function issueThreadInteractionService(
             sourceRunId: input.sourceRunId,
             originCommentIds,
             sourceIdentityContextId: input.sourceIdentityContextId ?? null,
-            title: payload.accessRequest ? `Grant ${payload.serviceName} access to ${payload.requestingAgentName}?` : `Connect ${payload.serviceName}`,
-            summary: `${payload.requestingAgentName} needs this connection to continue.`,
+            title: payload.accessRequest ? `Grant ${payload.serviceName} access to ${payload.requestingAgentName}?`
+              : payload.savedSetup?.action === "rotate_credentials" ? `Rotate ${payload.serviceName} webhook secret` : `Connect ${payload.serviceName}`,
+            summary: payload.savedSetup?.action === "rotate_credentials"
+              ? `${payload.requestingAgentName} needs you to rotate the signing secret and reconnect the saved App.`
+              : `${payload.requestingAgentName} needs this connection to continue.`,
             createdByAgentId: payload.requestingAgentId,
             addresseeUserId: input.addresseeUserId,
             payload,
@@ -2723,7 +2741,7 @@ export function issueThreadInteractionService(
           await tx
             .delete(toolOauthStates)
             .where(inArray(toolOauthStates.interactionId, supersededIds));
-          await tx
+          const superseded = await tx
             .update(issueThreadInteractions)
             .set({
               status: "expired",
@@ -2735,10 +2753,15 @@ export function issueThreadInteractionService(
               resolvedAt: now(),
               updatedAt: now(),
             })
-            .where(inArray(issueThreadInteractions.id, supersededIds));
+            .where(inArray(issueThreadInteractions.id, supersededIds))
+            .returning();
+          for (const previous of superseded) {
+            await enqueueTerminalIssueInteractionChatPublications(tx as unknown as Db, hydrateInteraction(previous));
+          }
         }
         await touchIssue(tx, issue.id);
         inserted = true;
+        await enqueueIssueInteractionChatPublications(tx as unknown as Db, hydrateInteraction(row));
         await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
         return row;
       });
@@ -2790,6 +2813,7 @@ export function issueThreadInteractionService(
         ? NonNullable<T>
         : never,
       actor: InteractionActor,
+      mutationOptions: InteractionResolutionMutationOptions = {},
     ) => {
       const result = connectionIntentResultSchema.parse(resultInput);
       const current = await getPendingInteractionForResolution({
@@ -2812,6 +2836,7 @@ export function issueThreadInteractionService(
             : "expired";
       const resolvedAt = now();
       const updated = await db.transaction(async (tx) => {
+        await mutationOptions.beforeResolveInTransaction?.(tx);
         const [row] = await tx
         .update(issueThreadInteractions)
         .set({
@@ -2835,6 +2860,8 @@ export function issueThreadInteractionService(
           await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
           await tx.insert(connectionIntentDeliveries).values({ interactionId, companyId: issue.companyId }).onConflictDoNothing();
         }
+        await mutationOptions.afterResolveInTransaction?.(tx, hydrateInteraction(row));
+        await enqueueTerminalIssueInteractionChatPublications(tx as unknown as Db, hydrateInteraction(row));
         return row;
       });
       if (!updated) throw interactionAlreadyResolvedError();
@@ -3867,6 +3894,7 @@ export function issueThreadInteractionService(
             interactionId,
             data,
             actor,
+            mutationOptions,
           );
         case "request_confirmation": {
           await assertIssueWorkspaceFinalizedForAccept({
@@ -3924,6 +3952,7 @@ export function issueThreadInteractionService(
       interactionId: string,
       input: AcceptIssueThreadInteraction,
       actor: InteractionActor,
+      mutationOptions: InteractionResolutionMutationOptions = {},
     ) => {
       assertIssueOpenForInteractionResolution(issue);
       const current = await db
@@ -4007,6 +4036,7 @@ export function issueThreadInteractionService(
       const createdWakeTargets: IssueWakeTarget[] = [];
 
       await db.transaction(async (tx) => {
+        await mutationOptions.beforeResolveInTransaction?.(tx);
         await assertInteractionRunWriteAllowed(tx as unknown as Db, issue, actor);
         const resolvedAt = new Date();
         const [claimed] = await tx
@@ -4097,6 +4127,8 @@ export function issueThreadInteractionService(
           .returning();
 
         await touchIssue(tx, issue.id);
+        await mutationOptions.afterResolveInTransaction?.(tx, hydrateInteraction(updated));
+        await enqueueTerminalIssueInteractionChatPublications(tx as unknown as Db, hydrateInteraction(updated));
         current.status = updated.status;
         current.result = updated.result;
         current.resolvedByAgentId = updated.resolvedByAgentId;
@@ -4136,6 +4168,7 @@ export function issueThreadInteractionService(
             data,
             actor,
             current,
+            mutationOptions,
           );
         case "request_confirmation":
         case "request_checkbox_confirmation":
@@ -4158,6 +4191,7 @@ export function issueThreadInteractionService(
       interactionId: string,
       input: SubmitIssueThreadInteractionVerdicts,
       actor: InteractionActor,
+      mutationOptions: InteractionResolutionMutationOptions = {},
     ): Promise<{
       interaction: IssueThreadInteraction;
       newlyResolvedItemIds: string[];
@@ -4165,6 +4199,7 @@ export function issueThreadInteractionService(
       assertIssueOpenForInteractionResolution(issue);
       const data = submitIssueThreadInteractionVerdictsSchema.parse(input);
       const submission = await db.transaction(async (tx) => {
+        await mutationOptions.beforeResolveInTransaction?.(tx);
         await assertInteractionRunWriteAllowed(tx as unknown as Db, issue, actor);
         const current = await tx
           .select()
@@ -4268,6 +4303,8 @@ export function issueThreadInteractionService(
         }
 
         await touchIssue(tx, issue.id);
+        await mutationOptions.afterResolveInTransaction?.(tx, hydrateInteraction(updated));
+        if (complete) await enqueueTerminalIssueInteractionChatPublications(tx as unknown as Db, hydrateInteraction(updated));
         return {
           interaction: hydrateInteraction(updated),
           newlyResolvedItemIds,
@@ -4288,6 +4325,7 @@ export function issueThreadInteractionService(
       input: RejectIssueThreadInteraction,
       actor: InteractionActor,
       current: IssueThreadInteractionRow,
+      mutationOptions: InteractionResolutionMutationOptions = {},
     ) => {
       assertIssueOpenForInteractionResolution(issue);
       if (
@@ -4304,8 +4342,9 @@ export function issueThreadInteractionService(
       }
 
       const [updated] = await db.transaction(async (tx) => {
+        await mutationOptions.beforeResolveInTransaction?.(tx);
         await assertInteractionRunWriteAllowed(tx as unknown as Db, issue, actor);
-        return tx.update(issueThreadInteractions)
+        const rows = await tx.update(issueThreadInteractions)
         .set({
           status: "rejected",
           result: {
@@ -4325,6 +4364,9 @@ export function issueThreadInteractionService(
           ),
         )
         .returning();
+        if (rows[0]) await mutationOptions.afterResolveInTransaction?.(tx, hydrateInteraction(rows[0]));
+        if (rows[0]) await enqueueTerminalIssueInteractionChatPublications(tx as unknown as Db, hydrateInteraction(rows[0]));
+        return rows;
       });
 
       if (!updated) {
@@ -4597,7 +4639,8 @@ export function issueThreadInteractionService(
         }
 
         for (const row of itemVerdictRows) {
-          const [updated] = await db
+          const updated = await db.transaction(async tx => {
+            const [retired] = await tx
             .update(issueThreadInteractions)
             .set({
               status: "expired",
@@ -4614,6 +4657,9 @@ export function issueThreadInteractionService(
               ),
             )
             .returning();
+            if (retired) await enqueueTerminalIssueInteractionChatPublications(tx as unknown as Db, hydrateInteraction(retired));
+            return retired;
+          });
           if (updated) expired.push(hydrateInteraction(updated));
         }
 
@@ -4783,7 +4829,10 @@ export function issueThreadInteractionService(
             eq(issueThreadInteractions.status, "pending"),
           ))
           .returning();
-        if (updated) expired.push(updated);
+        if (updated) {
+          await enqueueTerminalIssueInteractionChatPublications(db, hydrateInteraction(updated));
+          expired.push(updated);
+        }
       }
       if (expired.length) await db.delete(toolOauthStates).where(inArray(toolOauthStates.interactionId, expired.map((item) => item.id)));
       return expired;

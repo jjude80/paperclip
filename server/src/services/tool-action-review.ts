@@ -115,7 +115,7 @@ export async function commitToolActionReview(
       !invocation ||
       invocation.issueId !== current.issueId ||
       (current.requestedByAgentId &&
-        invocation.agentId !== current.requestedByAgentId)
+        (invocation.actorType === "agent" ? invocation.actorId : invocation.agentId) !== current.requestedByAgentId)
     )
       throw conflict("Tool invocation context does not match");
     if (current.expiresAt && current.expiresAt <= new Date())

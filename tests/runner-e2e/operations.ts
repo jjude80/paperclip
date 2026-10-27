@@ -37,7 +37,7 @@ export function validateEvalOperationsManifest(value: EvalOperationsManifest, ex
   for (const model of value.models) {
     fields(model, ["provider", "price", "maximumInputTokens", "maximumOutputTokens", "timeoutMs", "provisionalBound"]);
     const rateFields = ["inputUsdPerMillion", "cachedReadUsdPerMillion", "outputUsdPerMillion", "cacheWrite5mUsdPerMillion", "cacheWrite1hUsdPerMillion", "cacheWrite30mUsdPerMillion", "cacheWrite12hUsdPerMillion"];
-    fields(model.price, ["provider", "model", "version", "sourceUrl", "longContext", ...rateFields]);
+    fields(model.price, ["provider", "model", "responseModels", "version", "sourceUrl", "longContext", ...rateFields]);
     if (model.price.longContext) { fields(model.price.longContext, ["aboveInputTokens", "rates"]); fields(model.price.longContext.rates, rateFields); }
     const url = new URL(model.price.sourceUrl);
     if (!["openai", "anthropic"].includes(model.provider) || url.protocol !== "https:" || url.username || url.password || url.search || url.hash) throw new Error("Invalid model price provenance");

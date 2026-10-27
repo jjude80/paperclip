@@ -1,7 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { getTableName } from "drizzle-orm";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { HttpError } from "../errors.js";
 
 vi.mock("../services/fast-responses.js", () => ({
@@ -376,6 +376,15 @@ function createScheduledRetry() {
 }
 
 describe("issue comment reopen routes", () => {
+  beforeAll(async () => {
+    // Load the route graph within the setup budget. A first-test import can
+    // time out and continue into the next test after its mocks are reset.
+    await Promise.all([
+      import("../routes/issues.js"),
+      import("../middleware/index.js"),
+    ]);
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
     mockIssueService.getById.mockReset();

@@ -1,3 +1,4 @@
+import type { ConnectionManagementContext } from "./connection-management.js";
 import { createHash } from "node:crypto";
 import { boundRunIssueIdSql } from "./run-task-binding.js";
 import { and, asc, desc, eq, gt, inArray, isNull, ne, sql } from "drizzle-orm";
@@ -17,6 +18,7 @@ import {
   toolCallEvents,
   toolInvocations,
   toolMcpGateways,
+  toolMcpGatewayTokens,
   toolPolicies,
   toolProfileBindings,
   toolProfileEntries,
@@ -189,7 +191,7 @@ function sha256(value: unknown): string {
   return createHash("sha256").update(stableStringify(value)).digest("hex");
 }
 
-type ConsumedRateAdmission = { policyId: string; versionHash: string };
+type ConsumedRateAdmission = { policyId: string; versionHash: string; bucketKey?: string };
 function ratePolicyVersionHash(policy: typeof toolPolicies.$inferSelect): string {
   return sha256({ ...policy, createdAt: policy.createdAt.toISOString(), updatedAt: policy.updatedAt.toISOString() });
 }
@@ -784,6 +786,8 @@ function scopeAllowsTool(scope: Record<string, unknown> | null, ctx: ToolAccessC
 }
 
 export function toolAccessPolicyService(db: Db, options: { toolActionSigningSecret?: string } = {}) {
+  // Policy administration includes authorized self-targeted changes. It cannot
+  // resolve governed action requests or modify principal permission grants.
   async function listPolicies(companyId: string) {
     return db
       .select()
@@ -792,12 +796,13 @@ export function toolAccessPolicyService(db: Db, options: { toolActionSigningSecr
       .orderBy(asc(toolPolicies.priority), desc(toolPolicies.updatedAt));
   }
 
-  async function reorderPolicies(companyId: string, body: ReorderToolPolicies) {
+  async function reorderPolicies(companyId: string, body: ReorderToolPolicies, managementContext?: ConnectionManagementContext) {
     const uniquePolicyIds = [...new Set(body.policyIds)];
     if (uniquePolicyIds.length !== body.policyIds.length) {
       throw badRequest("policyIds must not contain duplicates");
     }
 
+    await managementContext?.reauthorize();
     return db.transaction(async (tx) => {
       const rows = await tx
         .select()
@@ -839,6 +844,7 @@ export function toolAccessPolicyService(db: Db, options: { toolActionSigningSecr
     policyId: string;
     body: DuplicateToolPolicy;
     actor?: { agentId?: string | null; userId?: string | null };
+    managementContext?: ConnectionManagementContext;
   }) {
     const existing = await getGenericPolicyRow(db, input.companyId, input.policyId);
     assertSupportedGenericPolicyShape(existing.policyType, existing.conditions ?? null, existing.config ?? null);
@@ -854,6 +860,7 @@ export function toolAccessPolicyService(db: Db, options: { toolActionSigningSecr
       while (names.has(`${baseName} ${suffix}`)) suffix += 1;
       name = `${baseName} ${suffix}`;
     }
+    await input.managementContext?.reauthorize();
     const now = new Date();
     const [policy] = await db
       .insert(toolPolicies)
@@ -880,8 +887,10 @@ export function toolAccessPolicyService(db: Db, options: { toolActionSigningSecr
     companyId: string,
     body: CreateToolPolicy,
     actor?: { agentId?: string | null; userId?: string | null },
+    managementContext?: ConnectionManagementContext,
   ) {
     assertSupportedGenericPolicyShape(body.policyType, body.conditions ?? null, body.config ?? null);
+    await managementContext?.reauthorize();
     const now = new Date();
     const [policy] = await db
       .insert(toolPolicies)
@@ -908,12 +917,14 @@ export function toolAccessPolicyService(db: Db, options: { toolActionSigningSecr
     companyId: string;
     policyId: string;
     body: UpdateToolPolicy;
+    managementContext?: ConnectionManagementContext;
   }) {
     const existing = await getGenericPolicyRow(db, input.companyId, input.policyId);
     const nextPolicyType = input.body.policyType ?? existing.policyType;
     const nextConditions = input.body.conditions !== undefined ? input.body.conditions ?? null : existing.conditions ?? null;
     const nextConfig = input.body.config !== undefined ? input.body.config ?? null : existing.config ?? null;
     assertSupportedGenericPolicyShape(nextPolicyType, nextConditions, nextConfig);
+    await input.managementContext?.reauthorize();
     const now = new Date();
     const [policy] = await db
       .update(toolPolicies)
@@ -933,8 +944,9 @@ export function toolAccessPolicyService(db: Db, options: { toolActionSigningSecr
     return policy;
   }
 
-  async function deletePolicy(input: { companyId: string; policyId: string }) {
+  async function deletePolicy(input: { companyId: string; policyId: string; managementContext?: ConnectionManagementContext }) {
     const existing = await getGenericPolicyRow(db, input.companyId, input.policyId);
+    await input.managementContext?.reauthorize();
     const [deleted] = await db
       .delete(toolPolicies)
       .where(eq(toolPolicies.id, existing.id))
@@ -992,6 +1004,10 @@ export function toolAccessPolicyService(db: Db, options: { toolActionSigningSecr
       agentId = agent.id;
     }
 
+    const originatingAgentId = input.runContext?.originatingAgentId;
+    if (originatingAgentId && (input.actor.actorType !== "agent" || input.actor.actorId !== originatingAgentId)) {
+      return { ok: false, redaction, decision: decision("deny", "deny_run_context_mismatch", "Run origin does not match the authenticated actor.", [], [], { redactionPlan: redaction.redactionPlan }) };
+    }
     if (heartbeatRunId) {
       const runId = heartbeatRunId;
       const [run] = await cachedRead(cache, `run:${runId}`, async () =>
@@ -1005,10 +1021,10 @@ export function toolAccessPolicyService(db: Db, options: { toolActionSigningSecr
           })
           .from(heartbeatRuns)
           .where(eq(heartbeatRuns.id, runId)));
-      if (!run || run.companyId !== input.companyId || (input.actor.actorType === "agent" && run.agentId !== agentId)) {
+      if (!run || run.companyId !== input.companyId || (input.actor.actorType === "agent" && run.agentId !== (originatingAgentId ?? agentId))) {
         return { ok: false, redaction, decision: decision("deny", "deny_run_context_mismatch", "Supplied run context does not match the authenticated actor.", [], [], { redactionPlan: redaction.redactionPlan }) };
       }
-      agentId = run.agentId;
+      agentId = originatingAgentId ? agentId : run.agentId;
       const runIssueId = nonBlankString(run.issueId);
       const runProjectId = nonBlankString(run.projectId);
       const runRoutineId = nonBlankString(run.routineId);
@@ -1371,16 +1387,22 @@ export function toolAccessPolicyService(db: Db, options: { toolActionSigningSecr
       status: toolInvocations.status, policyDecision: toolInvocations.policyDecision, approvalState: toolInvocations.approvalState,
       policyExplanation: toolInvocations.policyExplanation,
     }).from(toolInvocations).where(and(eq(toolInvocations.companyId, ctx.companyId), eq(toolInvocations.id, invocationId)));
-    const authorized = invocation && invocation.status === "executing"
-      && (invocation.policyDecision === "allow" || (invocation.policyDecision === "require_approval" && invocation.approvalState === "approved"))
-      && invocation.actorType === ctx.actorType && invocation.actorId === ctx.actorId && invocation.agentId === ctx.agentId
+    const delegated = invocation?.policyExplanation?.delegatedConnectionTest as { agentId?: string } | undefined;
+    const gatewayIssuer = invocation?.gatewayId ? invocation.policyExplanation?.delegatedGatewayIssuer : undefined;
+    const isDelegatedCaller = invocation?.actorType === "agent" && invocation.actorId === ctx.agentId
+      && (delegated?.agentId === ctx.agentId || gatewayIssuer === ctx.agentId) && invocation.agentId !== ctx.agentId;
+    const authorized = invocation && (
+      (invocation.status === "executing" && (invocation.policyDecision === "allow" || (invocation.policyDecision === "require_approval" && invocation.approvalState === "approved")))
+      || (invocation.status === "awaiting_approval" && invocation.policyDecision === "require_approval" && ["pending", "approved"].includes(invocation.approvalState))
+    )
+      && invocation.actorType === ctx.actorType && invocation.actorId === ctx.actorId && (invocation.agentId === ctx.agentId || isDelegatedCaller)
       && invocation.runId === ctx.heartbeatRunId && invocation.issueId === ctx.issueId && invocation.gatewayId === ctx.gatewayId
       && invocation.applicationId === ctx.applicationId && invocation.connectionId === ctx.connectionId
       && invocation.catalogEntryId === ctx.catalogEntryId && invocation.toolName === ctx.toolName
       && invocation.providerType === ctx.providerType && invocation.applicationKey === ctx.applicationKey
       && invocation.upstreamToolName === ctx.upstreamToolName
       && invocation.argumentsHash === ctx.argumentsHash;
-    const stored = authorized ? invocation.policyExplanation?.consumedRateAdmissions : null;
+    const stored = authorized ? invocation.policyExplanation?.[isDelegatedCaller ? "delegatedCallerConsumedRateAdmissions" : "consumedRateAdmissions"] : null;
     return Array.isArray(stored) ? stored.filter((item): item is ConsumedRateAdmission => isRecord(item)
       && typeof item.policyId === "string" && CANONICAL_UUID_RE.test(item.policyId)
       && typeof item.versionHash === "string" && /^[a-f0-9]{64}$/.test(item.versionHash)) : [];
@@ -1393,7 +1415,7 @@ export function toolAccessPolicyService(db: Db, options: { toolActionSigningSecr
    */
   async function decide(
     input: ToolAccessDecisionInput,
-    options: { cache?: ToolAccessDecisionCache; admittedInvocationId?: string } = {},
+    options: { cache?: ToolAccessDecisionCache; admittedInvocationId?: string; sharedRateDecision?: ToolAccessDecision } = {},
   ): Promise<ToolAccessDecision> {
     const consumedRateAdmissions: ConsumedRateAdmission[] = [];
     const result = await decideInternal(input, options, consumedRateAdmissions);
@@ -1404,7 +1426,7 @@ export function toolAccessPolicyService(db: Db, options: { toolActionSigningSecr
 
   async function decideInternal(
     input: ToolAccessDecisionInput,
-    options: { cache?: ToolAccessDecisionCache; admittedInvocationId?: string },
+    options: { cache?: ToolAccessDecisionCache; admittedInvocationId?: string; sharedRateDecision?: ToolAccessDecision },
     consumedRateAdmissions: ConsumedRateAdmission[],
   ): Promise<ToolAccessDecision> {
     // A decision that consumes a rate limit can also record a trust-rule hit
@@ -1492,11 +1514,20 @@ export function toolAccessPolicyService(db: Db, options: { toolActionSigningSecr
         }
         const versionHash = ratePolicyVersionHash(policy);
         if (admittedRates.some(admission => admission.policyId === policy.id && admission.versionHash === versionHash)) continue;
+        // Paired caller/target checks for one delegated test share a slot only
+        // when the exact policy version and counter bucket are identical.
+        const shared = options.sharedRateDecision?.policyExplanation?.consumedRateAdmissions;
+        const bucketKey = `${policy.id}:${rateBucket(rateLimitRule(policy)!, ctx)}`;
+        if (input.consumeRateLimit === true && Array.isArray(shared) && shared.some(item => isRecord(item)
+          && item.policyId === policy.id && item.versionHash === versionHash && item.bucketKey === bucketKey)) {
+          consumedRateAdmissions.push({ policyId: policy.id, versionHash, bucketKey });
+          continue;
+        }
         const state = await enforceRateLimit(policy, ctx, input.consumeRateLimit === true);
         if (state?.limited) {
           return decision("rate_limited", "rate_limited", "Tool access rate limit exceeded.", effectiveProfileIds, [policy.id], { rateLimitState: state, redactionPlan: redaction.redactionPlan, policyExplanation });
         }
-        if (state && input.consumeRateLimit === true) consumedRateAdmissions.push({ policyId: policy.id, versionHash });
+        if (state && input.consumeRateLimit === true) consumedRateAdmissions.push({ policyId: policy.id, versionHash, bucketKey: state.bucketKey });
         continue;
       }
       if (policy.policyType === "trust_rule") {
@@ -1723,6 +1754,9 @@ export function toolAccessPolicyService(db: Db, options: { toolActionSigningSecr
       issueId: ctx.issueId,
       runId: ctx.heartbeatRunId,
       gatewayId: ctx.gatewayId,
+      ...(input.runContext?.gatewayTokenId ? { gatewayTokenId: sql`(select ${toolMcpGatewayTokens.id} from ${toolMcpGatewayTokens}
+        where ${toolMcpGatewayTokens.id} = ${input.runContext.gatewayTokenId} and ${toolMcpGatewayTokens.companyId} = ${ctx.companyId}
+          and ${toolMcpGatewayTokens.gatewayId} = ${ctx.gatewayId})` } : {}),
       applicationId: ctx.applicationId,
       connectionId: ctx.connectionId,
       catalogEntryId: ctx.catalogEntryId,
@@ -1753,7 +1787,7 @@ export function toolAccessPolicyService(db: Db, options: { toolActionSigningSecr
         status: "pending",
         canonicalArgumentsHash: requestIdentityHash!,
         canonicalArgumentsSummary: redaction.summary,
-        requestedByAgentId: ctx.actorType === "agent" ? ctx.agentId : null,
+        requestedByAgentId: ctx.actorType === "agent" ? ctx.actorId : null,
         requestedByUserId: ctx.actorType === "user" ? ctx.actorId : null,
       }).returning();
     }

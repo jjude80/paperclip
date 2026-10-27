@@ -33,6 +33,26 @@ it("rejects credentials in the manifest and unknown pricing/billing policy field
   expect(() => validateEvalOperationsManifest(changed, [cell], 0)).toThrow("fields");
   expect(() => validateEvalOperationsManifest({ ...manifest(), route: "braintrust" }, [cell], 0)).toThrow("project UUID");
 });
+it("admits a bounded exact response mapping without widening the selected request model", () => {
+  const value = manifest();
+  value.models[0]!.price.responseModels = [`${cell.profile.model}-2026-03-17`];
+  expect(validateEvalOperationsManifest(value, [cell], 0)).toBe(value);
+  value.models[0]!.price.responseModels = Array.from({ length: 16 }, (_, index) => `${cell.profile.model}-snapshot-${index}`);
+  expect(validateEvalOperationsManifest(value, [cell], 0)).toBe(value);
+  const changed = structuredClone(value); changed.models[0]!.price.model = "other";
+  changed.models[0]!.price.responseModels = [cell.profile.model];
+  expect(() => validateEvalOperationsManifest(changed, [cell], 0)).toThrow("Missing exact model");
+});
+it.each([null, "fixture", [], [""], [" leading-space"], ["fixture?query"], [4], ["a", "a"],
+  new Array(1), Array.from({ length: 17 }, (_, index) => `fixture-${index}`),
+].map(responseModels => ({ responseModels })))("rejects malformed or excessive response model mappings: $responseModels", ({ responseModels }) => {
+  const value = manifest(); Object.assign(value.models[0]!.price, { responseModels });
+  expect(() => validateEvalOperationsManifest(value, [cell], 0)).toThrow("response model");
+});
+it("rejects a response mapping that repeats the exact request identity", () => {
+  const value = manifest(); value.models[0]!.price.responseModels = [cell.profile.model];
+  expect(() => validateEvalOperationsManifest(value, [cell], 0)).toThrow("response model");
+});
 
 it("rejects an unaffordable selected request before opening a ledger or checking credentials", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "eval-unaffordable-preflight-"));

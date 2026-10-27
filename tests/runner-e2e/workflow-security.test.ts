@@ -15,6 +15,30 @@ const everydayOracleImage =
   "python@sha256:9d2e5553305c7c7b0097999bb17187c69b921ccd6bc9d40e4bb5ebe652c00285";
 
 describe("public repository paid workflow security", () => {
+  it("exposes Copilot only to selected cells in the protected, reauthorized paid jobs", async () => {
+    for (const [filename, jobName, nextJobName, stepName] of [
+      ["runner-full-stack-e2e.yml", "test", "report", "Run paid cell"],
+      ["runner-protocol-live-evals.yml", "eval_shard_0", "eval_shard_1", "Run one immutable direct protocol cell"],
+    ] as const) {
+      const workflow = await readFile(path.join(repositoryRoot, ".github/workflows", filename), "utf8");
+      const credentialSteps = workflow.split(/\n(?= {6}- )/u).filter(step => step.includes("secrets.COPILOT_GITHUB_TOKEN"));
+      expect(credentialSteps, filename).toHaveLength(1);
+      const credentialStep = credentialSteps[0]!;
+      expect(credentialStep, filename).toContain(`name: ${stepName}`);
+      expect(credentialStep, filename).toContain("COPILOT_GITHUB_TOKEN: ${{ matrix.credentialName == 'COPILOT_GITHUB_TOKEN' && secrets.COPILOT_GITHUB_TOKEN || '' }}");
+      const jobStart = workflow.indexOf(`\n  ${jobName}:`);
+      const jobEnd = workflow.indexOf(`\n  ${nextJobName}:`, jobStart + 1);
+      expect(jobStart, filename).toBeGreaterThanOrEqual(0);
+      expect(jobEnd, filename).toBeGreaterThan(jobStart);
+      const paidJob = workflow.slice(jobStart, jobEnd);
+      expect(paidJob, filename).toContain("name: runner-e2e-paid");
+      expect(paidJob, filename).toContain(credentialStep);
+      const reauthorizationIndex = paidJob.indexOf("Reauthorize paid execution before provider access");
+      expect(reauthorizationIndex, filename).toBeGreaterThanOrEqual(0);
+      expect(reauthorizationIndex, filename).toBeLessThan(paidJob.indexOf("secrets.COPILOT_GITHUB_TOKEN"));
+    }
+  });
+
   it("keeps the manual hosted Linux image build credential-free and pins the authorized target", async () => {
     const workflow = await readFile(path.join(repositoryRoot, ".github/workflows/docker-runner-check.yml"), "utf8");
     const manual = workflow.slice(workflow.indexOf("  authorize_manual:"));
@@ -549,6 +573,7 @@ describe("public repository paid workflow security", () => {
       OPENROUTER_API_KEY: "matrix.credentialName == 'OPENROUTER_API_KEY'",
       XAI_API_KEY: "matrix.credentialName == 'XAI_API_KEY'",
       GROK_AUTH_JSON: "matrix.credentialName == 'GROK_AUTH_JSON'",
+      COPILOT_GITHUB_TOKEN: "matrix.credentialName == 'COPILOT_GITHUB_TOKEN'",
       DAYTONA_API_KEY: "matrix.environmentId == 'daytona'",
     })) {
       expect(fullStack).toContain(
@@ -576,7 +601,7 @@ describe("public repository paid workflow security", () => {
       );
       const providerSecretReferences = [
         ...contents.matchAll(
-          /secrets(?:\.(?:OPENAI_API_KEY|ANTHROPIC_API_KEY|OPENROUTER_API_KEY|XAI_API_KEY|GROK_AUTH_JSON|DAYTONA_API_KEY)\b|\[['"](?:OPENAI_API_KEY|ANTHROPIC_API_KEY|OPENROUTER_API_KEY|XAI_API_KEY|GROK_AUTH_JSON|DAYTONA_API_KEY)['"]\])/g,
+          /secrets(?:\.(?:OPENAI_API_KEY|ANTHROPIC_API_KEY|OPENROUTER_API_KEY|XAI_API_KEY|GROK_AUTH_JSON|DAYTONA_API_KEY|COPILOT_GITHUB_TOKEN)\b|\[['"](?:OPENAI_API_KEY|ANTHROPIC_API_KEY|OPENROUTER_API_KEY|XAI_API_KEY|GROK_AUTH_JSON|DAYTONA_API_KEY|COPILOT_GITHUB_TOKEN)['"]\])/g,
         ),
       ];
       if (providerSecretReferences.length > 0) {

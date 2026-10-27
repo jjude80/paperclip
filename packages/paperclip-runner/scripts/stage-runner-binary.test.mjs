@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
-import { copyFile, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
+import { appendFile, copyFile, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -110,7 +110,11 @@ async function withOwnedChildren(root, action) {
 
 test("atomically publishes while the previous executable is running", { skip: process.platform === "win32", timeout: 15_000 }, async () => {
   const root = await mkdtemp(path.join(tmpdir(), "runnerd-stage-test-"));
-  const destination = path.join(root, "paperclip-runnerd");
+  // Name the fixture for the applet it contains. The Ubuntu 26.04 runner image
+  // ships uutils coreutils, one multicall binary that resolves its applet from
+  // the executable's own path. A copy named "paperclip-runnerd" is "unknown
+  // program" there, so it exits before it can stay resident.
+  const destination = path.join(root, "sleep");
   await withOwnedChildren(root, async start => {
     await stageRunnerBinary("/bin/sleep", destination);
     const previous = await stat(destination);
@@ -122,7 +126,7 @@ test("atomically publishes while the previous executable is running", { skip: pr
     assert.equal(published.mode & 0o777, 0o755);
     assert.equal(old.child.exitCode, null);
     assert.equal(old.child.signalCode, null);
-    assert.deepEqual(await readdir(root), ["paperclip-runnerd"]);
+    assert.deepEqual(await readdir(root), ["sleep"]);
     const next = start(destination, ["0"]);
     await next.spawned; await next.closed;
     assert.equal(next.child.exitCode, 0);
@@ -149,9 +153,19 @@ test("a source rebuild selects fresh dev bytes while preserving release binaries
     await mkdir(path.dirname(source), { recursive: true });
     await writeFile(source, "fn main() {}\n");
     await mkdir(path.dirname(built), { recursive: true });
-    await copyHostFixture("/bin/echo", built);
+    // A multicall coreutils store (Ubuntu 26.04) gives /bin/echo and /bin/sleep
+    // identical bytes, so a plain copy cannot prove that a rebuild published
+    // fresh bytes. Use the Node binary for the rebuild on Linux and append a
+    // trailer the ELF loader ignores. Darwin keeps the two distinct signed
+    // coreutils binaries.
+    const rebuiltArgs = process.platform === "darwin" ? ["rebuilt"] : ["-e", ""];
+    if (process.platform === "darwin") await copyHostFixture("/bin/echo", built);
+    else {
+      await copyHostFixture(process.execPath, built);
+      await appendFile(built, "\n// rebuilt fixture\n");
+    }
     const previousBuild = path.join(root, "previous-build");
-    await copyHostFixture("/bin/sleep", previousBuild);
+    await copyHostFixture(process.execPath, previousBuild);
     await stageRunnerBinary(previousBuild, hostTarget);
     await stageRunnerBinary(built, path.join(binaryRoot, "paperclip-runnerd"));
     const platforms = {}, releaseBytes = new Map();
@@ -177,7 +191,7 @@ test("a source rebuild selects fresh dev bytes while preserving release binaries
     const manifestPath = path.join(binaryRoot, "release-manifest.json");
     const manifest = JSON.stringify({ schema: "paperclip.runner.release-binaries.v1", sourceRevision: "a".repeat(40), platforms });
     await writeFile(manifestPath, manifest);
-    const old = start(hostTarget, ["30"]);
+    const old = start(hostTarget, ["-e", "setTimeout(() => {}, 30000)"]);
     await old.spawned;
     const requirement = { repoRoot: root, nativeRunnerRequired: true };
     assert.equal(paperclipRunnerBinaryNeedsBuild(requirement), true);
@@ -197,7 +211,7 @@ test("a source rebuild selects fresh dev bytes while preserving release binaries
     assert.equal(paperclipRunnerBinaryNeedsBuild(requirement), false);
     assert.equal(old.child.exitCode, null);
     assert.equal(old.child.signalCode, null);
-    const next = start(selected.binary, ["rebuilt"]);
+    const next = start(selected.binary, rebuiltArgs);
     await next.spawned; await next.closed;
     assert.equal(next.child.exitCode, 0);
   });
