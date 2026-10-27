@@ -62,6 +62,11 @@ import {
 } from "./models.js";
 import { removeMaintainerOnlySkillSymlinks } from "@paperclipai/adapter-utils/server-utils";
 import { apiKeyBillingType } from "@paperclipai/adapter-utils/api-billing-type";
+import {
+  disposeSecretFileEnv,
+  materializeSecretFileEnv,
+  sweepSecretFileDirs,
+} from "@paperclipai/adapter-utils/secret-file-env";
 import { prepareOpenCodeRuntimeConfig, prepareManagedOpenCodeRemoteHomes } from "./runtime-config.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 import { resolveOpenCodeSkillsHome } from "./skills.js";
@@ -504,6 +509,31 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       }
     }
 
+    // NEXA-643: the bearers do not belong in the child's environment. Every
+    // shell OpenCode spawns -- `env`, a build script, a `make` recipe -- inherits
+    // it, and each of those can write it somewhere the redactor has to find
+    // later. Write each value to a private 0600 file and hand over the path.
+    //
+    // This is the last env mutation before the spawn: everything above reads the
+    // values it needs (the bridge takes `PAPERCLIP_API_KEY`, the runtime config
+    // resolves provider keys) and nothing below needs a value rather than a path.
+    //
+    // Remote targets are deliberately excluded for now. The file would be
+    // written on the control-plane host while the child runs on another machine,
+    // so the path would point at nothing and the run would lose its bearer. That
+    // half needs a carrier on the target itself and is tracked separately on
+    // NEXA-643; until then a remote run keeps the old behaviour rather than
+    // breaking.
+    const secretFiles = executionTargetIsRemote
+      ? null
+      : await materializeSecretFileEnv({ env: preparedRuntimeConfig.env, label: "run" });
+    if (secretFiles) {
+      preparedRuntimeConfig.env = secretFiles.env;
+      // Crash leftovers from earlier runs hold live bearers; sweep them on the
+      // way through rather than only in a timer nobody runs on a small board.
+      void sweepSecretFileDirs().catch(() => undefined);
+    }
+
     const runtimeSessionParams = parseObject(runtime.sessionParams);
     const runtimeSessionId = asString(runtimeSessionParams.sessionId, runtime.sessionId ?? "");
     const runtimeSessionCwd = asString(runtimeSessionParams.cwd, "");
@@ -819,6 +849,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         await Promise.all([
           paperclipBridge?.stop(),
           restoreRemoteWorkspace?.(),
+          disposeSecretFileEnv(secretFiles?.dir),
           localSkillsDir ? fs.rm(path.dirname(localSkillsDir), { recursive: true, force: true }).catch(() => undefined) : Promise.resolve(),
         ]);
       }
