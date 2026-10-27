@@ -85,11 +85,8 @@ test("release metadata rejects incompatible native, harness and protocol contrac
 
 async function withOwnedChildren(root, action) {
   const owned = [];
-  const start = (command, args, argv0) => {
-    // uutils coreutils (the Ubuntu 26.04 runner image) ships one multicall
-    // binary for every applet and dispatches on argv[0]. A copied applet keeps
-    // the store's argv[0] unless the fixture sets it explicitly.
-    const child = spawn(command, args, { env: { PATH: "/usr/bin:/bin" }, stdio: "ignore", ...(argv0 ? { argv0 } : {}) });
+  const start = (command, args) => {
+    const child = spawn(command, args, { env: { PATH: "/usr/bin:/bin" }, stdio: "ignore" });
     // close follows both exit and spawn error. A failed second spawn must not
     // interrupt retirement of the first still-running executable.
     const closed = new Promise(resolve => child.once("close", resolve));
@@ -113,11 +110,15 @@ async function withOwnedChildren(root, action) {
 
 test("atomically publishes while the previous executable is running", { skip: process.platform === "win32", timeout: 15_000 }, async () => {
   const root = await mkdtemp(path.join(tmpdir(), "runnerd-stage-test-"));
-  const destination = path.join(root, "paperclip-runnerd");
+  // Name the fixture for the applet it contains. The Ubuntu 26.04 runner image
+  // ships uutils coreutils, one multicall binary that resolves its applet from
+  // the executable's own path. A copy named "paperclip-runnerd" is "unknown
+  // program" there, so it exits before it can stay resident.
+  const destination = path.join(root, "sleep");
   await withOwnedChildren(root, async start => {
     await stageRunnerBinary("/bin/sleep", destination);
     const previous = await stat(destination);
-    const old = start(destination, ["30"], "sleep");
+    const old = start(destination, ["30"]);
     await old.spawned;
     await stageRunnerBinary("/bin/sleep", destination);
     const published = await stat(destination);
@@ -125,8 +126,8 @@ test("atomically publishes while the previous executable is running", { skip: pr
     assert.equal(published.mode & 0o777, 0o755);
     assert.equal(old.child.exitCode, null);
     assert.equal(old.child.signalCode, null);
-    assert.deepEqual(await readdir(root), ["paperclip-runnerd"]);
-    const next = start(destination, ["0"], "sleep");
+    assert.deepEqual(await readdir(root), ["sleep"]);
+    const next = start(destination, ["0"]);
     await next.spawned; await next.closed;
     assert.equal(next.child.exitCode, 0);
   });
@@ -152,15 +153,19 @@ test("a source rebuild selects fresh dev bytes while preserving release binaries
     await mkdir(path.dirname(source), { recursive: true });
     await writeFile(source, "fn main() {}\n");
     await mkdir(path.dirname(built), { recursive: true });
-    await copyHostFixture("/bin/echo", built);
     // A multicall coreutils store (Ubuntu 26.04) gives /bin/echo and /bin/sleep
     // identical bytes, so a plain copy cannot prove that a rebuild published
-    // fresh bytes. The ELF/Mach-O header the resolver reads stays untouched;
-    // the trailer only makes these two fixtures distinct on Linux, where the
-    // loader ignores trailing bytes. Darwin keeps the signed copy intact.
-    if (process.platform !== "darwin") await appendFile(built, "\n// rebuilt fixture\n");
+    // fresh bytes. Use the Node binary for the rebuild on Linux and append a
+    // trailer the ELF loader ignores. Darwin keeps the two distinct signed
+    // coreutils binaries.
+    const rebuiltArgs = process.platform === "darwin" ? ["rebuilt"] : ["-e", ""];
+    if (process.platform === "darwin") await copyHostFixture("/bin/echo", built);
+    else {
+      await copyHostFixture(process.execPath, built);
+      await appendFile(built, "\n// rebuilt fixture\n");
+    }
     const previousBuild = path.join(root, "previous-build");
-    await copyHostFixture("/bin/sleep", previousBuild);
+    await copyHostFixture(process.execPath, previousBuild);
     await stageRunnerBinary(previousBuild, hostTarget);
     await stageRunnerBinary(built, path.join(binaryRoot, "paperclip-runnerd"));
     const platforms = {}, releaseBytes = new Map();
@@ -186,7 +191,7 @@ test("a source rebuild selects fresh dev bytes while preserving release binaries
     const manifestPath = path.join(binaryRoot, "release-manifest.json");
     const manifest = JSON.stringify({ schema: "paperclip.runner.release-binaries.v1", sourceRevision: "a".repeat(40), platforms });
     await writeFile(manifestPath, manifest);
-    const old = start(hostTarget, ["30"], "sleep");
+    const old = start(hostTarget, ["-e", "setTimeout(() => {}, 30000)"]);
     await old.spawned;
     const requirement = { repoRoot: root, nativeRunnerRequired: true };
     assert.equal(paperclipRunnerBinaryNeedsBuild(requirement), true);
@@ -206,7 +211,7 @@ test("a source rebuild selects fresh dev bytes while preserving release binaries
     assert.equal(paperclipRunnerBinaryNeedsBuild(requirement), false);
     assert.equal(old.child.exitCode, null);
     assert.equal(old.child.signalCode, null);
-    const next = start(selected.binary, ["rebuilt"], "echo");
+    const next = start(selected.binary, rebuiltArgs);
     await next.spawned; await next.closed;
     assert.equal(next.child.exitCode, 0);
   });
