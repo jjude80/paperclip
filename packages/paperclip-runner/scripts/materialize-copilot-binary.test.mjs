@@ -5,7 +5,7 @@ import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
-import { COPILOT_DISTRIBUTIONS, materializePinnedCopilotBinary, resolveCopilotDistribution, writeCopilotMaterialization } from "./materialize-copilot-binary.mjs";
+import { COPILOT_DISTRIBUTIONS, hasUnsafeExecutablePermissions, materializePinnedCopilotBinary, resolveCopilotDistribution, writeCopilotMaterialization } from "./materialize-copilot-binary.mjs";
 const directories = [];
 afterEach(async () => { await Promise.all(directories.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
 async function fixture(version = "1.0.88") {
@@ -39,6 +39,17 @@ test("refuses executable symlinks, directory entries and writable binaries", asy
   assert.throws(() => materializePinnedCopilotBinary({ packageRoot, platform: "linux", architecture: "x64" }));
   await rm(binary); await mkdir(binary);
   assert.throws(() => materializePinnedCopilotBinary({ packageRoot, platform: "linux", architecture: "x64" }), /regular file/);
+});
+
+test("tolerates a group-writable source only when copying into an owned target", () => {
+  assert.equal(hasUnsafeExecutablePermissions(0o755n), false);
+  assert.equal(hasUnsafeExecutablePermissions(0o775n), true);
+  assert.equal(hasUnsafeExecutablePermissions(0o777n), true);
+  assert.equal(hasUnsafeExecutablePermissions(0o775n, { allowWritableSource: true }), false);
+  assert.equal(hasUnsafeExecutablePermissions(0o777n, { allowWritableSource: true }), false);
+  // A missing execute bit stays fatal even when the source is about to be copied.
+  assert.equal(hasUnsafeExecutablePermissions(0o644n, { allowWritableSource: true }), true);
+  assert.equal(hasUnsafeExecutablePermissions(0o664n, { allowWritableSource: true }), true);
 });
 
 const outputFiles = () => [
