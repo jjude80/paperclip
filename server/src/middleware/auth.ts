@@ -350,6 +350,7 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
           memberships: access.memberships,
           isInstanceAdmin: access.isInstanceAdmin,
           keyId: boardKey.id,
+          keyExpiresAt: boardKey.expiresAt ?? null,
           runId: runIdHeader || undefined,
           source: "board_key",
         };

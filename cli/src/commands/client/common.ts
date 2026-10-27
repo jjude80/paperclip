@@ -190,6 +190,32 @@ function canAttemptInteractiveBoardAuth(): boolean {
   return Boolean(process.stdin.isTTY && process.stdout.isTTY);
 }
 
+const BOARD_KEY_EXPIRY_WARNING_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * Say something about a stored board key that is close to expiring, or nothing
+ * at all. NEXA-645: `GET /api/cli-auth/me` reports the expiry now, and this is
+ * the consumer that turns it into a warning instead of a surprise 401.
+ *
+ * Returns null when there is no key, the expiry is unparseable, or the key has
+ * more than a week left -- the CLI must not nag on every normal command.
+ */
+export function boardKeyExpiryNotice(
+  expiresAt: string | null | undefined,
+  now: Date = new Date(),
+): string | null {
+  if (!expiresAt) return null;
+  const expires = new Date(expiresAt);
+  if (Number.isNaN(expires.getTime())) return null;
+  const remainingMs = expires.getTime() - now.getTime();
+  if (remainingMs <= 0) {
+    return `This board key expired at ${expires.toISOString()}. Run "paperclipai auth login" to store a fresh one.`;
+  }
+  if (remainingMs > BOARD_KEY_EXPIRY_WARNING_MS) return null;
+  const hours = Math.ceil(remainingMs / (60 * 60 * 1000));
+  return `This board key expires in ${hours}h (${expires.toISOString()}). Run "paperclipai auth login" before then.`;
+}
+
 export function printOutput(data: unknown, opts: { json?: boolean; label?: string } = {}): void {
   if (opts.json) {
     console.log(JSON.stringify(data, null, 2));

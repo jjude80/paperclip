@@ -4,7 +4,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { writeContext } from "../client/context.js";
 import { setStoredBoardCredential } from "../client/board-auth.js";
-import { apiPath, inferContentTypeFromPath, resolveApiBase, resolveCommandContext } from "../commands/client/common.js";
+import { apiPath, boardKeyExpiryNotice, inferContentTypeFromPath, resolveApiBase, resolveCommandContext } from "../commands/client/common.js";
 
 const ORIGINAL_ENV = { ...process.env };
 
@@ -197,5 +197,33 @@ describe("apiPath", () => {
     expect(() => apiPath`/api/issues/${undefined}`).toThrow("Cannot build API path with an empty path segment.");
     expect(() => apiPath`/api/issues/${null}`).toThrow("Cannot build API path with an empty path segment.");
     expect(() => apiPath`/api/issues/${" "}`).toThrow("Cannot build API path with an empty path segment.");
+  });
+});
+
+describe("boardKeyExpiryNotice", () => {
+  const now = new Date("2026-10-27T15:00:00.000Z");
+
+  it("says nothing when the key does not expire or has more than a week left", () => {
+    expect(boardKeyExpiryNotice(null, now)).toBe(null);
+    expect(boardKeyExpiryNotice(undefined, now)).toBe(null);
+    expect(boardKeyExpiryNotice("2026-11-04T15:00:01.000Z", now)).toBe(null);
+  });
+
+  it("warns inside the last week, naming the remaining hours and the fix", () => {
+    const notice = boardKeyExpiryNotice("2026-10-29T17:22:13.000Z", now);
+
+    expect(notice).toContain("expires in 51h");
+    expect(notice).toContain("2026-10-29T17:22:13.000Z");
+    expect(notice).toContain('paperclipai auth login');
+  });
+
+  it("reports an already-expired key as expired instead of counting down", () => {
+    const notice = boardKeyExpiryNotice("2026-10-27T14:59:59.000Z", now);
+
+    expect(notice).toContain("expired at 2026-10-27T14:59:59.000Z");
+  });
+
+  it("stays silent on an unparseable date rather than printing NaN", () => {
+    expect(boardKeyExpiryNotice("not-a-date", now)).toBe(null);
   });
 });

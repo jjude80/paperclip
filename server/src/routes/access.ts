@@ -2886,6 +2886,7 @@ export function accessRoutes(
       throw unauthorized("Board authentication required");
     }
     const accessSnapshot = await boardAuth.resolveBoardAccess(req.actor.userId);
+    const isBoardKey = req.actor.source === "board_key";
     res.json({
       user: accessSnapshot.user,
       userId: req.actor.userId,
@@ -2893,7 +2894,13 @@ export function accessRoutes(
       companyIds: accessSnapshot.companyIds,
       memberships: accessSnapshot.memberships,
       source: req.actor.source ?? "none",
-      keyId: req.actor.source === "board_key" ? req.actor.keyId ?? null : null,
+      keyId: isBoardKey ? req.actor.keyId ?? null : null,
+      // A named board key can expire, and when it does every subsequent call
+      // returns 401 with no advance warning (NEXA-512). The caller needs the
+      // date to answer "how long do I have left?" without a board-admin
+      // credential it may not hold. `null` means "this credential does not
+      // expire"; a session actor has no key to expire.
+      expiresAt: isBoardKey ? req.actor.keyExpiresAt?.toISOString() ?? null : null,
     });
   });
 

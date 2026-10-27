@@ -8,6 +8,7 @@ import {
 import {
   addCommonClientOptions,
   apiPath,
+  boardKeyExpiryNotice,
   handleCommandError,
   printOutput,
   resolveCommandContext,
@@ -126,8 +127,16 @@ export function registerClientAuthCommands(auth: Command): void {
             companyIds: string[];
             source: string;
             keyId: string | null;
+            expiresAt: string | null;
           }>("/api/cli-auth/me");
           printOutput(me, { json: ctx.json });
+          // The whole point of the field is that an expiring key must not be
+          // discovered by a 401. Keep the human-readable path loud about it;
+          // --json callers get the raw date and decide for themselves.
+          if (!ctx.json) {
+            const notice = boardKeyExpiryNotice(me?.expiresAt);
+            if (notice) console.error(notice);
+          }
         } catch (err) {
           handleCommandError(err);
         }

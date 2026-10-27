@@ -561,4 +561,78 @@ describe("cli auth routes", () => {
     expect(mockBoardAuthService.getBoardApiKeyForUser).not.toHaveBeenCalled();
     expect(mockBoardAuthService.revokeBoardApiKey).not.toHaveBeenCalled();
   });
+
+  it("reports the expiry of the board key that authenticated the caller", async () => {
+    // NEXA-645: without this the CLI cannot answer "how long do I have left?"
+    // and only discovers an expired key when every call starts returning 401.
+    const expiresAt = new Date("2026-10-29T17:22:13.000Z");
+    mockBoardAuthService.resolveBoardAccess.mockResolvedValue({
+      user: { id: "user-1", name: "operator", email: "operator@example.com" },
+      isInstanceAdmin: true,
+      companyIds: ["company-1"],
+      memberships: [{ companyId: "company-1", membershipRole: "owner", status: "active" }],
+    });
+
+    const app = await createApp({
+      type: "board",
+      userId: "user-1",
+      source: "board_key",
+      keyId: "key-1",
+      keyExpiresAt: expiresAt,
+      isInstanceAdmin: true,
+      companyIds: ["company-1"],
+    });
+
+    const res = await request(app).get("/api/cli-auth/me");
+
+    expect(res.status).toBe(200);
+    expect(res.body.source).toBe("board_key");
+    expect(res.body.keyId).toBe("key-1");
+    expect(res.body.expiresAt).toBe("2026-10-29T17:22:13.000Z");
+  });
+
+  it("reports a non-expiring board key as expiresAt null rather than omitting the field", async () => {
+    mockBoardAuthService.resolveBoardAccess.mockResolvedValue({
+      user: { id: "user-1", name: "operator", email: "operator@example.com" },
+      isInstanceAdmin: false,
+      companyIds: ["company-1"],
+      memberships: [{ companyId: "company-1", membershipRole: "member", status: "active" }],
+    });
+
+    const app = await createApp({
+      type: "board",
+      userId: "user-1",
+      source: "board_key",
+      keyId: "key-1",
+      keyExpiresAt: null,
+      companyIds: ["company-1"],
+    });
+
+    const res = await request(app).get("/api/cli-auth/me");
+
+    expect(res.status).toBe(200);
+    expect(res.body).toHaveProperty("expiresAt", null);
+  });
+
+  it("does not report an expiry for a session actor that has no key", async () => {
+    mockBoardAuthService.resolveBoardAccess.mockResolvedValue({
+      user: { id: "user-1", name: "operator", email: "operator@example.com" },
+      isInstanceAdmin: false,
+      companyIds: ["company-1"],
+      memberships: [{ companyId: "company-1", membershipRole: "member", status: "active" }],
+    });
+
+    const app = await createApp({
+      type: "board",
+      userId: "user-1",
+      source: "session",
+      companyIds: ["company-1"],
+    });
+
+    const res = await request(app).get("/api/cli-auth/me");
+
+    expect(res.status).toBe(200);
+    expect(res.body.keyId).toBe(null);
+    expect(res.body.expiresAt).toBe(null);
+  });
 });

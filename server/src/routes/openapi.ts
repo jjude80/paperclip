@@ -7170,7 +7170,38 @@ registry.registerPath({
   path: "/api/cli-auth/me",
   tags: ["access"],
   summary: "Get current CLI auth session",
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  responses: {
+    200: r.ok(
+      z.object({
+        user: z
+          .object({
+            id: z.string(),
+            email: z.string().nullable(),
+            name: z.string().nullable(),
+            image: z.string().nullable(),
+          })
+          .nullable(),
+        userId: z.string(),
+        isInstanceAdmin: z.boolean(),
+        companyIds: z.array(z.string()),
+        memberships: z
+          .array(
+            z.object({
+              companyId: z.string(),
+              membershipRole: z.string().nullable().optional(),
+              status: z.string().optional(),
+            }),
+          )
+          .optional(),
+        source: z.string(),
+        keyId: z.string().nullable(),
+        // NEXA-645: the CLI cannot warn before its own stored key dies unless
+        // the endpoint reports the date. null = this key does not expire.
+        expiresAt: z.string().nullable(),
+      }),
+    ),
+    401: r.unauthorized,
+  },
 });
 
 registry.registerPath({
