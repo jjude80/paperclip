@@ -276,6 +276,45 @@ describePostgres("heartbeat run state database wiring", () => {
     expect(decision.handoffMarkdown).not.toContain("omit this");
   });
 
+  it("counts every run in the session, not just the latest one", async () => {
+    const { companyId, agent, issue, state } = await fixture();
+    // No single run reaches the 100 token cap; the session does. The runs page
+    // used for the other thresholds holds four rows, so a sum over that page
+    // would still miss the first two runs.
+    for (let index = 0; index < 6; index += 1) {
+      await db.insert(heartbeatRuns).values({
+        companyId, agentId: agent.id, invocationSource: "assignment", sessionIdAfter: "summed",
+        createdAt: new Date(Date.UTC(2026, 0, 1, 0, index)),
+        usageJson: { rawInputTokens: 30 },
+      });
+    }
+    const decision = await state.evaluateSessionCompaction({
+      agent: { ...agent, runtimeConfig: { heartbeat: { sessionCompaction: { maxRawInputTokens: 100 } } } },
+      sessionId: "summed", issueId: issue.id,
+    });
+    expect(decision).toMatchObject({
+      rotate: true, reason: "session raw input reached 180 tokens (threshold 100)",
+    });
+  });
+
+  it("adds the cache counter to the session total only for exclusive-input writers", async () => {
+    const { companyId, agent, issue, state } = await fixture();
+    const write = (sessionId: string, usageJson: Record<string, unknown>) =>
+      db.insert(heartbeatRuns).values({
+        companyId, agentId: agent.id, invocationSource: "assignment", sessionIdAfter: sessionId,
+        usageJson: { rawInputTokens: 10, rawCachedInputTokens: 40, ...usageJson },
+      });
+    for (let index = 0; index < 3; index += 1) await write("exclusive", { rawInputIncludesCached: false });
+    for (let index = 0; index < 3; index += 1) await write("inclusive", { rawInputIncludesCached: true });
+    const cap = { runtimeConfig: { heartbeat: { sessionCompaction: { maxRawInputTokens: 100 } } } };
+    expect(await state.evaluateSessionCompaction({
+      agent: { ...agent, ...cap }, sessionId: "exclusive", issueId: issue.id,
+    })).toMatchObject({ rotate: true, reason: "session raw input reached 150 tokens (threshold 100)" });
+    expect(await state.evaluateSessionCompaction({
+      agent: { ...agent, ...cap }, sessionId: "inclusive", issueId: issue.id,
+    })).toMatchObject({ rotate: false, reason: null });
+  });
+
   it.each(["superseded", "cancelled"] as const)("fences %s conversation session writes and clears", async (scenario) => {
     const { companyId, agent, issue, state } = await fixture();
     await db.update(issues).set({
