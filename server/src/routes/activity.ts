@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { z } from "zod";
 import type { Db } from "@paperclipai/db";
-import { normalizeIssueIdentifier } from "@paperclipai/shared";
+import { isUuidLike, normalizeIssueIdentifier } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
 import { activityService, normalizeActivityLimit } from "../services/activity.js";
 import { assertAuthenticated, assertBoard, assertCompanyAccess, getAccessibleResource, hasCompanyAccess } from "./authz.js";
@@ -362,6 +362,17 @@ export function activityRoutes(db: Db) {
   router.get("/heartbeat-runs/:runId/issues", async (req, res) => {
     assertAuthenticated(req);
     const runId = req.params.runId as string;
+    // A run id is a database UUID key, and the existence probe below hands it
+    // straight to a `where heartbeat_runs.id = $1`. An arbitrary path segment
+    // makes PostgreSQL raise `invalid input syntax for type uuid`, which reached
+    // the caller as a 500 and the log as an unhandled error -- the one answer
+    // this route promised never to give. A value that cannot name a run is
+    // rejected before the query, with the same 400 its sibling route
+    // `GET /heartbeat-runs/:runId` uses, so the two ways of asking about a run
+    // agree on what a bad id is.
+    if (runId !== runId.trim() || !isUuidLike(runId)) {
+      throw badRequest("Invalid heartbeat run ID");
+    }
     const run = await heartbeat.getRun(runId);
     if (!run || !hasCompanyAccess(req, run.companyId)) {
       // Return `200 []` for both "doesn't exist" and "cross-tenant" — preserves the

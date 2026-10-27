@@ -309,12 +309,12 @@ describe("activity routes", () => {
 
   it("returns 200 [] (not 404) when listing issues for another company's run, preserving API contract and the cross-tenant oracle", async () => {
     mockHeartbeatService.getRun.mockResolvedValue({
-      id: "run-2",
+      id: "6a3f2f9c-1f3e-4a4e-9a5c-2b1d7e8f0a11",
       companyId: "company-2",
     });
 
     const app = await createApp();
-    const res = await requestApp(app, (baseUrl) => request(baseUrl).get("/api/heartbeat-runs/run-2/issues"));
+    const res = await requestApp(app, (baseUrl) => request(baseUrl).get("/api/heartbeat-runs/6a3f2f9c-1f3e-4a4e-9a5c-2b1d7e8f0a11/issues"));
 
     expect(res.status).toBe(200);
     expect(res.body).toEqual([]);
@@ -325,16 +325,25 @@ describe("activity routes", () => {
     mockHeartbeatService.getRun.mockResolvedValue(null);
 
     const app = await createApp();
-    const res = await requestApp(app, (baseUrl) => request(baseUrl).get("/api/heartbeat-runs/missing-run/issues"));
+    const res = await requestApp(app, (baseUrl) => request(baseUrl).get("/api/heartbeat-runs/00000000-0000-4000-8000-000000000000/issues"));
 
     expect(res.status).toBe(200);
     expect(res.body).toEqual([]);
     expect(mockActivityService.issuesForRun).not.toHaveBeenCalled();
   });
 
+  it("rejects a malformed run id before it reaches the run store", async () => {
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) => request(baseUrl).get("/api/heartbeat-runs/not-a-uuid/issues"));
+
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: "Invalid heartbeat run ID" });
+    expect(mockHeartbeatService.getRun).not.toHaveBeenCalled();
+  });
+
   it("rejects anonymous heartbeat run issue lookups before run existence checks", async () => {
     const app = await createApp({ type: "none", source: "none" });
-    const res = await requestApp(app, (baseUrl) => request(baseUrl).get("/api/heartbeat-runs/missing-run/issues"));
+    const res = await requestApp(app, (baseUrl) => request(baseUrl).get("/api/heartbeat-runs/not-a-uuid/issues"));
 
     expect(res.status).toBe(401);
     expect(mockHeartbeatService.getRun).not.toHaveBeenCalled();
