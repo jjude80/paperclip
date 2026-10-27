@@ -85,6 +85,7 @@ async function makeRepo() {
     "packages/paperclip-runner/dist/bin/paperclip-runnerd": "binary\n",
     "packages/paperclip-runner/dist/cli/acpx-runtime-sidecar.cjs": "module.exports = {};\n",
     "packages/paperclip-runner/dist-browser/index.js": "browser\n",
+    "packages/paperclip-runner/provider-assets/copilot/linux-x64/copilot": "built asset\n",
     "packages/paperclip-runner/node_modules/dep/index.js": "dep\n",
     "packages/paperclip-runner/.vite/cache.json": "{}\n",
     "packages/paperclip-eval-kernel/src/index.ts": "export const kernel = 1;\n",
@@ -161,6 +162,10 @@ test("the digest is stable, ignores outputs and caches, and tracks every kind of
       "packages/paperclip-runner/.vite/cache.json": '{"changed":true}\n',
       "packages/paperclip-runner/runner/target/release/paperclip-runnerd": "rebuilt\n",
       "packages/paperclip-eval-kernel/dist/index.js": "changed\n",
+      // install-copilot-assets.mjs writes this during build:typescript, after
+      // --begin captured the inputs. Counting it made every build that
+      // installed assets end with a digest mismatch, so no stamp was recorded.
+      "packages/paperclip-runner/provider-assets/copilot/linux-x64/copilot": "reinstalled asset\n",
     });
     assert.equal(computeBuildInputsDigest(repoRoot).digest, before.digest, "an output changed the digest");
 

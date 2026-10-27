@@ -160,8 +160,10 @@ shared infrastructure ownership separately before removing those resources.
 
 ### Typecheck Rust dependency cache
 
-Source verification's typecheck job builds the native Runner binary through the
-server's `prepare:runner-vendor` command. It restores and saves compiled Rust
+Source verification's typecheck job compiles the Runner's Rust workspace through
+the Runner package's own `typecheck:rust` step; the server typecheck builds only
+the Runner's TypeScript output (`prepare:runner-vendor:types`). It restores and
+saves compiled Rust
 dependencies only for canonical master pushes that verify the event's exact SHA.
 The `release-typecheck-v2` cache is separate from Runner verification because
 those jobs compile different profiles. The pinned toolchain is selected before

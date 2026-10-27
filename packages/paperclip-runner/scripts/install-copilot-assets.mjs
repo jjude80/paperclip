@@ -19,6 +19,15 @@ export async function installCopilotAssets() {
   if (!Object.prototype.hasOwnProperty.call(COPILOT_DISTRIBUTIONS, target)) {
     return { status: "unsupported-platform", target };
   }
+  // The server typecheck builds only the Runner's TypeScript output and never
+  // opens these assets (`prepare:runner-vendor:types`). Installing or
+  // re-verifying 170 MB of native runtime there made a type result depend on a
+  // verification of bytes `tsc` does not read, and an interrupted earlier
+  // install could fail every later typecheck. Record the skip instead of
+  // silently pretending the assets were installed.
+  if (process.env.PAPERCLIP_RUNNER_TYPES_ONLY === "1") {
+    return { status: "skipped-types-only", target };
+  }
   const verifierPath = join(runtimeRoot, "drivers/acpx/copilot-installation.js");
   try { await access(verifierPath); }
   catch (error) {

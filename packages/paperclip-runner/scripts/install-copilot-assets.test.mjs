@@ -16,9 +16,9 @@ const distribution = COPILOT_DISTRIBUTIONS[target];
 const require = createRequire(import.meta.url);
 const helpers = ["install-copilot-assets.mjs", "materialize-copilot-binary.mjs", "copilot-inner-distribution.mjs"];
 
-function invoke(script) {
+function invoke(script, extraEnv = {}) {
   return spawnSync(process.execPath, [script], {
-    env: { PATH: `${dirname(process.execPath)}:/usr/bin:/bin`, TMPDIR: tmpdir() },
+    env: { PATH: `${dirname(process.execPath)}:/usr/bin:/bin`, TMPDIR: tmpdir(), ...extraEnv },
     encoding: "utf8", timeout: 120_000, maxBuffer: 64 * 1024,
   });
 }
@@ -96,8 +96,27 @@ for (const owner of ["runner", "server"]) {
   });
 }
 
-test("an unbuilt source workspace defers installation; a published package with missing build output fails", async () => {
-  const root = await realpath(await mkdtemp(join(tmpdir(), "copilot-install-bootstrap-")));
+test("a typecheck-only build records the skip and never reads or rewrites the native assets", {
+  skip: !distribution && "Copilot does not advertise this platform",
+}, async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "copilot-install-types-only-")));
+  try {
+    await writeFile(join(root, "package.json"), JSON.stringify({ name: "@paperclipai/paperclip-runner", type: "module" }));
+    const scriptRoot = join(root, "scripts");
+    await mkdir(scriptRoot, { recursive: true });
+    for (const name of helpers) await cp(join(runnerRoot, "scripts", name), join(scriptRoot, name));
+    const closure = join(root, "provider-assets", "copilot", target, ".paperclip-copilot-closure.json");
+    await mkdir(dirname(closure), { recursive: true });
+    // Evidence that an earlier interrupted install left an unverifiable tree:
+    // a typecheck must not fail on it, and must not overwrite it either.
+    await writeFile(closure, '{"entries":[]}\n');
+    const result = invoke(join(scriptRoot, "install-copilot-assets.mjs"), { PAPERCLIP_RUNNER_TYPES_ONLY: "1" });
+    succeeded(result, "skipped-types-only");
+    assert.equal(await readFile(closure, "utf8"), '{"entries":[]}\n', "the skip must not touch the asset tree");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("an unbuilt source workspace defers installation; a published package with missing build output fails", async () => {  const root = await realpath(await mkdtemp(join(tmpdir(), "copilot-install-bootstrap-")));
   try {
     const server = join(root, "server");
     await mkdir(join(server, "scripts"), { recursive: true });

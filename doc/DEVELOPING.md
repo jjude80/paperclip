@@ -798,7 +798,8 @@ build. It used to run the Runner's full `build` every time. Now the Runner's
 `build` brackets itself with `scripts/record-build-inputs.mjs`: `--begin`, its
 first step, forgets the previous stamp and records a digest of the build's
 inputs (every file under `packages/paperclip-runner` except `dist`,
-`dist-browser`, `runner/target`, `node_modules` and dot-directories; every
+`dist-browser`, `runner/target`, `provider-assets`, `node_modules` and
+dot-directories; every
 file under `packages/paperclip-eval-kernel` except `dist` and `node_modules`;
 every file under the root `patches` directory, which the acpx profile check
 hashes and the provider entrypoint bundler copies into `dist`; and the root
@@ -824,6 +825,22 @@ stamp is only written after a Runner build that passed every step, and both
 the Runner's first build step and the prepare step remove any existing stamp
 before a rebuild starts, so a build that stops partway never leaves a stamp
 that vouches for it.
+
+`provider-assets` is a build output: `build:typescript` ends by installing the
+native Copilot runtime there, so counting it as an input made the post-build
+digest differ from the one captured at `--begin`. No build that installed
+assets could record a stamp, and every consumer rebuilt the Runner.
+
+`pnpm --filter @paperclipai/server typecheck` uses
+`prepare:runner-vendor:types` instead. It reuses a current full build when one
+is recorded; otherwise it runs only
+`pnpm --filter @paperclipai/paperclip-runner build:typescript` with
+`PAPERCLIP_RUNNER_TYPES_ONLY=1`, which makes `install-copilot-assets.mjs`
+report `skipped-types-only` and leave the asset tree alone. `tsc` reads the
+Runner's type declarations, never the native runtime, so a type result no
+longer depends on a 170 MB install that an interrupted earlier build can
+leave unverifiable. A types-only build never writes a build stamp, so the next
+full build still produces the Rust binary, goldens and provider assets.
 
 ### Task search evaluation
 

@@ -34,6 +34,16 @@ import {
 
 /** The command the server build has always run here; the rebuild path is unchanged. */
 export const RUNNER_VENDOR_BUILD_COMMAND = "pnpm --filter @paperclipai/paperclip-runner build";
+/**
+ * The typecheck path only reads the Runner's TypeScript output (`tsc` never
+ * loads the native provider assets), so it builds those and nothing else. The
+ * full `build` also compiles the Rust binary, generates goldens and installs
+ * the Copilot runtime, none of which a type result depends on.
+ */
+export const RUNNER_VENDOR_TYPES_COMMAND =
+  "pnpm --filter @paperclipai/paperclip-runner build:typescript";
+/** Read by packages/paperclip-runner/scripts/install-copilot-assets.mjs. */
+export const TYPES_ONLY_VARIABLE = "PAPERCLIP_RUNNER_TYPES_ONLY";
 export const FORCE_REBUILD_VARIABLE = "PAPERCLIP_RUNNER_VENDOR_REBUILD";
 export const TIMING_SCHEMA = "paperclip.runner-vendor.timing.v1";
 
@@ -91,6 +101,7 @@ export function prepareRunnerVendor({
   run = runBuildCommand,
   log = console.log,
   now = () => performance.now(),
+  typesOnly = false,
 }) {
   const packageRoot = path.join(repoRoot, "packages", "paperclip-runner");
   const checkStart = now();
@@ -104,14 +115,21 @@ export function prepareRunnerVendor({
     return 0;
   }
 
-  log(`prepare:runner-vendor: rebuilding the Runner (${decision.detail})`);
+  const command = typesOnly ? RUNNER_VENDOR_TYPES_COMMAND : RUNNER_VENDOR_BUILD_COMMAND;
+  const buildEnv = typesOnly ? { ...env, [TYPES_ONLY_VARIABLE]: "1" } : env;
+  log(
+    typesOnly
+      ? `prepare:runner-vendor: rebuilding the Runner types (${decision.detail}); native provider assets are not needed by tsc`
+      : `prepare:runner-vendor: rebuilding the Runner (${decision.detail})`,
+  );
   // A build that stops partway must not leave a stamp that vouches for it. The
   // Runner's own build removes the stamp in its first step and writes a fresh
   // one in its last; removing it here as well covers a build command that
-  // fails before its first step runs.
+  // fails before its first step runs. A types-only build never writes a stamp,
+  // so the next full build still rebuilds from scratch.
   removeBuildInputsStamp(assessment.stampPath);
   const buildStart = now();
-  const status = run(RUNNER_VENDOR_BUILD_COMMAND, { cwd: path.join(repoRoot, "server"), env });
+  const status = run(command, { cwd: path.join(repoRoot, "server"), env: buildEnv });
   const buildMs = Math.round(now() - buildStart);
   log(
     `${TIMING_SCHEMA},action:rebuild,reason:${decision.code},check_ms:${checkMs},build_ms:${buildMs},status:${status}`,
@@ -121,6 +139,7 @@ export function prepareRunnerVendor({
 
 export function parseArguments(argv) {
   let repoRoot = null;
+  let typesOnly = false;
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
     if (argument === "--repo-root") {
@@ -129,15 +148,19 @@ export function parseArguments(argv) {
       index += 1;
       continue;
     }
+    if (argument === "--types-only") {
+      typesOnly = true;
+      continue;
+    }
     throw new Error(`unknown argument ${argument}`);
   }
-  return { repoRoot };
+  return { repoRoot, typesOnly };
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const { repoRoot: requested } = parseArguments(process.argv.slice(2));
+  const { repoRoot: requested, typesOnly } = parseArguments(process.argv.slice(2));
   const repoRoot = requested
     ? path.resolve(requested)
     : path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
-  process.exitCode = prepareRunnerVendor({ repoRoot });
+  process.exitCode = prepareRunnerVendor({ repoRoot, typesOnly });
 }

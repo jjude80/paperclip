@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { RUNNER_VENDOR_BUILD_COMMAND } from "../../scripts/prepare-runner-vendor.mjs";
+import { RUNNER_VENDOR_BUILD_COMMAND, RUNNER_VENDOR_TYPES_COMMAND } from "../../scripts/prepare-runner-vendor.mjs";
 
 const packageJsonPath = fileURLToPath(
   new URL("../../package.json", import.meta.url),
@@ -71,6 +71,22 @@ describe("server package build script", () => {
     expect(packageJson.scripts?.build.startsWith("pnpm run prepare:runner-vendor && ")).toBe(true);
     expect(packageJson.scripts?.build).toContain(
       "cp -Rf ../packages/paperclip-runner/dist/. dist/vendor/paperclip-runner/",
+    );
+  });
+
+  it("typechecks against the Runner's TypeScript output without installing native provider assets", () => {
+    // A type result must not depend on the 170 MB Copilot runtime: tsc never
+    // reads it, and an interrupted install used to make every later typecheck
+    // fail with COPILOT_INSTALLATION_INVALID before tsc ran.
+    const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8")) as {
+      scripts?: Record<string, string>;
+    };
+    expect(packageJson.scripts?.["prepare:runner-vendor:types"]).toBe(
+      "node scripts/prepare-runner-vendor.mjs --types-only",
+    );
+    expect(packageJson.scripts?.typecheck.startsWith("pnpm run prepare:runner-vendor:types && ")).toBe(true);
+    expect(RUNNER_VENDOR_TYPES_COMMAND).toBe(
+      "pnpm --filter @paperclipai/paperclip-runner build:typescript",
     );
   });
 

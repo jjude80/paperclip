@@ -76,7 +76,15 @@ const ROOT_INPUT_FILES = [
 ];
 const OUTPUT_DIRECTORY_RELATIVE = "dist";
 const SKIPPED_DIRECTORY_NAMES = new Set(["node_modules", "dist", "dist-browser"]);
-const RUNNER_SKIPPED_DIRECTORIES = new Set([`${RUNNER_PACKAGE_RELATIVE}/runner/target`]);
+const RUNNER_SKIPPED_DIRECTORIES = new Set([
+  `${RUNNER_PACKAGE_RELATIVE}/runner/target`,
+  // The build writes this tree itself (`install-copilot-assets.mjs`, the last
+  // step of build:typescript). Counting it as an input makes the post-build
+  // digest differ from the one captured before the build, so a build that
+  // installed assets could never record its stamp and every consumer rebuilt
+  // the Runner for minutes. It is an output, not an input.
+  `${RUNNER_PACKAGE_RELATIVE}/provider-assets`,
+]);
 
 export function runnerPackageRootFromScripts() {
   return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");

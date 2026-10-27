@@ -43,7 +43,8 @@
     "build:runtime": "node scripts/bundle-runtime.mjs",
     "start": "node dist/index.js",
     "prepare:runner-vendor": "node scripts/prepare-runner-vendor.mjs",
-    "typecheck": "pnpm run prepare:runner-vendor && pnpm --filter @paperclipai/plugin-sdk ensure-build-deps && tsc --noEmit",
+    "prepare:runner-vendor:types": "node scripts/prepare-runner-vendor.mjs --types-only",
+    "typecheck": "pnpm run prepare:runner-vendor:types && pnpm --filter @paperclipai/plugin-sdk ensure-build-deps && tsc --noEmit",
     "postinstall": "node scripts/install-copilot-assets.mjs"
   },
   "dependencies": {

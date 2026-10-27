@@ -17,7 +17,9 @@ import {
 import {
   FORCE_REBUILD_VARIABLE,
   RUNNER_VENDOR_BUILD_COMMAND,
+  RUNNER_VENDOR_TYPES_COMMAND,
   TIMING_SCHEMA,
+  TYPES_ONLY_VARIABLE,
   decideRunnerVendorAction,
   prepareRunnerVendor,
   resolvePnpmInvocation,
@@ -189,6 +191,59 @@ describe("prepareRunnerVendor", () => {
     expect(lines[1]).toMatch(
       new RegExp(`^${TIMING_SCHEMA},action:rebuild,reason:inputs_changed,check_ms:\\d+,build_ms:\\d+,status:0$`),
     );
+  });
+
+  it("runs only the Runner's TypeScript build, with native asset installation skipped, on the typecheck path", () => {
+    const { repoRoot, packageRoot } = makeRepo();
+    const observed = [];
+    const lines = [];
+    const env = { npm_execpath: "/corepack/pnpm.cjs" };
+
+    const status = prepareRunnerVendor({
+      repoRoot,
+      env,
+      typesOnly: true,
+      run: (command, options) => {
+        observed.push({ command, ...options });
+        return 0;
+      },
+      log: (line) => lines.push(line),
+    });
+
+    expect(status).toBe(0);
+    expect(observed).toEqual([
+      {
+        command: RUNNER_VENDOR_TYPES_COMMAND,
+        cwd: path.join(repoRoot, "server"),
+        env: { ...env, [TYPES_ONLY_VARIABLE]: "1" },
+      },
+    ]);
+    expect(lines[0]).toMatch(/^prepare:runner-vendor: rebuilding the Runner types \(no build stamp/);
+    expect(lines[0]).toMatch(/native provider assets are not needed by tsc/);
+    // A types-only build never writes a stamp: the next real build must still
+    // produce the Rust binary and the rest of the full output.
+    expect(readBuildInputsStamp(buildInputsStampPath(packageRoot))).toBeNull();
+    expect(lines[1]).toMatch(/,action:rebuild,.*,status:0$/);
+  });
+
+  it("reuses a current full build on the typecheck path instead of rebuilding", () => {
+    const { repoRoot, packageRoot } = makeRepo();
+    recordCurrentBuild({ repoRoot, packageRoot });
+    let runs = 0;
+
+    const status = prepareRunnerVendor({
+      repoRoot,
+      env: {},
+      typesOnly: true,
+      run: () => {
+        runs += 1;
+        return 0;
+      },
+      log: () => {},
+    });
+
+    expect(status).toBe(0);
+    expect(runs).toBe(0);
   });
 
   it("rebuilds when a file the build left under dist is gone, even one no consumer imports", () => {

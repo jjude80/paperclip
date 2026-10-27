@@ -32,8 +32,11 @@ export async function verifyCopilotInstallation(profile: AcpxReleaseProfile): Pr
     executable: "copilot", fixedArguments: COPILOT_LAUNCH_ARGUMENTS,
     isolatedCacheEnvironmentName: "COPILOT_PKG_CACHE_HOME",
     copilotDistributionDirectory: "distribution",
-  }); } catch {
-    throw Object.assign(new Error("Install the verified Copilot runtime beside the admitted sidecar."), { code: "COPILOT_INSTALLATION_INVALID", retryable: false });
+  }); } catch (cause) {
+    // Keep the verification reason: the generic message is what an operator
+    // acts on, but only the cause says whether the tree is missing, truncated,
+    // or has a manifest that no longer matches its pin.
+    throw Object.assign(new Error("Install the verified Copilot runtime beside the admitted sidecar.", { cause }), { code: "COPILOT_INSTALLATION_INVALID", retryable: false });
   }
   // The host identity binds the versioned profile. Native admission independently
   // binds the complete platform closure before creating each single-use lease.
