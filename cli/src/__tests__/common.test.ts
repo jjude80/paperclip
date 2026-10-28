@@ -18,6 +18,7 @@ describe("resolveCommandContext", () => {
     process.env = { ...ORIGINAL_ENV };
     delete process.env.PAPERCLIP_API_URL;
     delete process.env.PAPERCLIP_API_KEY;
+    delete process.env.PAPERCLIP_API_TOKEN_FILE;
     delete process.env.PAPERCLIP_COMPANY_ID;
     delete process.env.PAPERCLIP_AUTH_STORE;
     delete process.env.PAPERCLIP_SERVER_PORT;
@@ -156,6 +157,82 @@ describe("resolveCommandContext", () => {
     const explicitResolved = resolveCommandContext({ context: contextPath, apiKey: "explicit-token" });
     expect(explicitResolved.api.apiKey).toBe("explicit-token");
     expect(explicitResolved.authSource).toBe("explicit");
+  });
+});
+
+describe("resolveCommandContext board bearer carrier", () => {
+  // NEXA-643 stops handing PAPERCLIP_API_KEY to child shells and passes a 0600
+  // file named by PAPERCLIP_API_TOKEN_FILE instead. One binary has to read both.
+  const contextPath = createTempPath("context.json");
+
+  beforeEach(() => {
+    process.env = { ...ORIGINAL_ENV };
+    delete process.env.PAPERCLIP_API_URL;
+    delete process.env.PAPERCLIP_API_KEY;
+    delete process.env.PAPERCLIP_API_TOKEN_FILE;
+    delete process.env.PAPERCLIP_AUTH_STORE;
+    process.env.PAPERCLIP_AUTH_STORE = createTempPath("auth.json");
+    writeContext(
+      {
+        version: 2,
+        currentProfile: "default",
+        profiles: { default: { apiBase: "http://localhost:3100" } },
+      },
+      contextPath,
+    );
+  });
+
+  afterEach(() => {
+    process.env = { ...ORIGINAL_ENV };
+  });
+
+  function writeTokenFile(contents: string): string {
+    const filePath = createTempPath("board-token");
+    fs.writeFileSync(filePath, contents, { mode: 0o600 });
+    return filePath;
+  }
+
+  it("reads the bearer from PAPERCLIP_API_TOKEN_FILE when the env value is gone", () => {
+    process.env.PAPERCLIP_API_TOKEN_FILE = writeTokenFile("token-from-file\n");
+
+    const resolved = resolveCommandContext({ context: contextPath });
+    expect(resolved.api.apiKey).toBe("token-from-file");
+    expect(resolved.authSource).toBe("file");
+  });
+
+  it("prefers the file over a legacy PAPERCLIP_API_KEY value", () => {
+    process.env.PAPERCLIP_API_TOKEN_FILE = writeTokenFile("token-from-file\n");
+    process.env.PAPERCLIP_API_KEY = "token-from-env";
+
+    const resolved = resolveCommandContext({ context: contextPath });
+    expect(resolved.api.apiKey).toBe("token-from-file");
+    expect(resolved.authSource).toBe("file");
+  });
+
+  it("still lets --api-key win over the file", () => {
+    process.env.PAPERCLIP_API_TOKEN_FILE = writeTokenFile("token-from-file\n");
+
+    const resolved = resolveCommandContext({ context: contextPath, apiKey: "explicit-token" });
+    expect(resolved.api.apiKey).toBe("explicit-token");
+    expect(resolved.authSource).toBe("explicit");
+  });
+
+  it("falls back to the legacy variable when the named file cannot be read", () => {
+    process.env.PAPERCLIP_API_TOKEN_FILE = path.join(os.tmpdir(), "paperclip-cli-common-absent", "board-token");
+    process.env.PAPERCLIP_API_KEY = "token-from-env";
+
+    const resolved = resolveCommandContext({ context: contextPath });
+    expect(resolved.api.apiKey).toBe("token-from-env");
+    expect(resolved.authSource).toBe("env");
+  });
+
+  it("ignores an empty token file instead of authenticating with nothing", () => {
+    process.env.PAPERCLIP_API_TOKEN_FILE = writeTokenFile("\n");
+    process.env.PAPERCLIP_API_KEY = "token-from-env";
+
+    const resolved = resolveCommandContext({ context: contextPath });
+    expect(resolved.api.apiKey).toBe("token-from-env");
+    expect(resolved.authSource).toBe("env");
   });
 });
 
