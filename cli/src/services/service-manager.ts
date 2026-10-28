@@ -57,9 +57,17 @@ const MUTATING_SERVICE_VERBS: Record<string, ReadonlySet<string>> = {
  * interrupting every in-flight agent run (NEXA-582). Tests must inject a
  * `CommandRunner`; this guard turns a missed injection into a clear failure
  * instead of an outage.
+ *
+ * Read the test marker once, at import time, rather than on every call: many
+ * test files replace `process.env` wholesale, and any such replacement that
+ * does not carry `VITEST` forward would silently disarm this guard. What makes
+ * the process a test process does not change mid-run, so import time is the
+ * only moment the answer needs to be read.
  */
+const IS_TEST_PROCESS = Boolean(process.env.VITEST);
+
 export function assertNotMutatingLiveServiceFromTest(command: string, args: string[]): void {
-  if (!process.env.VITEST) return;
+  if (!IS_TEST_PROCESS) return;
   const verbs = MUTATING_SERVICE_VERBS[command];
   if (verbs && args.some((arg) => verbs.has(arg))) {
     throw new Error(

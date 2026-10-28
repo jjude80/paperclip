@@ -217,6 +217,22 @@ describe("single-writer guard", () => {
     expect(() => assertNotMutatingLiveServiceFromTest("systemctl", ["--user", "show", "paperclipai.service"])).not.toThrow();
   });
 
+  it("stays armed after a test replaces process.env without VITEST", async () => {
+    // NEXA-714: the first guard read process.env.VITEST on every call, so a
+    // test that rebuilt process.env from scratch could disarm it and let the
+    // real systemctl through. The marker is now read when the module loads.
+    const original = process.env;
+    try {
+      process.env = { PATH: "/usr/bin:/bin" };
+      expect(() => assertNotMutatingLiveServiceFromTest("systemctl", ["--user", "stop", "paperclipai.service"]))
+        .toThrow("mutating host service command");
+      await expect(defaultCommandRunner("systemctl", ["--user", "restart", "paperclipai.service"]))
+        .rejects.toThrow("mutating host service command");
+    } finally {
+      process.env = original;
+    }
+  });
+
   it("refuses to replace a symlinked service definition", async () => {
     const userHome = await temporaryDirectory();
     const manager = new SystemdServiceManager("default", async () => ({ stdout: "", stderr: "" }), path.join(userHome, ".paperclip"), path.join(userHome, ".local/bin/paperclipai"), userHome);
