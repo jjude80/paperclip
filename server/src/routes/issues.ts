@@ -1386,6 +1386,11 @@ const ISSUE_WAKE_DIAGNOSTIC_KNOWN_SOURCES = new Set([
   "automation",
 ]);
 
+// These are reason codes written by the server, not free-form operator text.
+// A gate that records a new code must be added here or its skip is projected
+// as "other", which is how a silently skipped hand-off looks healthy. The
+// hand-off path in particular records execution_reconciliation_required when
+// the interrupted run still owns the issue's execution lease.
 const ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS = new Set([
   "issue_execution_deferred",
   "chat_task_completed",
@@ -1402,6 +1407,32 @@ const ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS = new Set([
   "heartbeat.timer.no_actionable_work",
   "heartbeat.wakeup.no_actionable_work",
   "heartbeat.wakeOnDemand.disabled",
+  "heartbeat.daily_run_limit",
+  "execution_reconciliation_required",
+  "chat_control_recovery_proof_unresolved",
+  "issue_state_guard_mismatch",
+  "issue_execution_promoted",
+  "issue_status_changed",
+  "issue_recovery_action_restored",
+  "issue_reopened_via_comment",
+  "issue_assignment_recovery",
+  "issue_children_completed",
+  "issue_continuation_needed",
+  "issue_disposition_repair",
+  "issue_monitor_due",
+  "issue_monitor_recovery",
+  "issue_review_path_lost",
+  "issue_unblock_requested",
+  "issue_checked_out",
+  "issue_human_assignment",
+  "interaction_pending",
+  "provider_quota_recovery",
+  "transient_failure_retry",
+  "retry_failed_run",
+  "resume_process_lost_run",
+  "task_retry",
+  "approval_approved",
+  "finish_successful_run_handoff",
 ]);
 
 const ISSUE_WAKE_DIAGNOSTIC_KNOWN_STATUSES = new Set([
@@ -1440,9 +1471,12 @@ function wakeFailureClass(
   status: string,
   rawError: string | null,
 ): IssueWakeDiagnosticWakeFailureClass | null {
-  if (status === "failed" || rawError) return "failed";
-  if (status === "cancelled") return "cancelled";
+  // A skipped row deliberately carries the gate's next-action text in `error`.
+  // That is the reason it was skipped, not evidence the wake failed; reporting
+  // failureClass "failed" hides a clean, visible skip behind a scary label.
   if (status === "skipped") return "skipped";
+  if (status === "cancelled") return "cancelled";
+  if (status === "failed" || rawError) return "failed";
   return null;
 }
 
