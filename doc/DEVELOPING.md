@@ -761,6 +761,22 @@ verifying Vite/HMR behavior.
 
 For normal issue work, start with the smallest targeted check that proves the change. Reserve repo-wide typecheck/build/test runs for PR-ready handoff or changes broad enough that narrow checks do not cover the risk.
 
+Vitest projects are selected with `--project`, never with a bare positional name.
+The positional argument is a test-path substring filter: `vitest run cli` also
+matches every `paperclip*` and `*client*` path and therefore runs the server,
+db and UI suites as well. Measured in a worktree at `76c0bbea`,
+`vitest list --filesOnly cli` selected 108 test files where
+`--project paperclipai` selected the 66 CLI files. Use:
+
+```sh
+pnpm exec vitest run --project paperclipai cli/src/__tests__/some.test.ts
+pnpm exec vitest run --project @paperclipai/server server/src/__tests__/some.test.ts
+pnpm exec vitest run --project @paperclipai/ui ui/src/pages/Some.test.tsx
+```
+
+`scripts/check-vitest-project-filter.mjs` rejects the bare form in scripts, CI
+workflows and `package.json` command surfaces.
+
 #### Embedded Postgres template cache
 
 Suites that call `startEmbeddedPostgresTestDatabase` (from `@paperclipai/db`)
