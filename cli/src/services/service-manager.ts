@@ -177,6 +177,16 @@ Environment="PAPERCLIP_HOME=${escapeSystemd(input.homeDir)}"
 WorkingDirectory=%h
 Restart=always
 RestartSec=5
+# Startup recovery (reconciling interrupted runs, chat channels, embedded
+# PostgreSQL) routinely outlives systemd's 90s default on a board with
+# accumulated history: on 2026-10-27 a boot served HTTP for >90s without
+# sending READY=1 and was killed, then crash-looped six times in nine minutes.
+# A hand-written drop-in with 420s stopped it. Drop-ins survive `install`
+# (it only rewrites this fragment), but they are host-local: a fresh install
+# that never ran the host script gets the 90s default. Carry the measured
+# floor here as well, and let the server publish STATUS= per boot phase so a
+# slow boot is distinguishable from a hung one (see server/src/index.ts).
+TimeoutStartSec=420
 TimeoutStopSec=300
 
 [Install]

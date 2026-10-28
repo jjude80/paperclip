@@ -165,7 +165,7 @@ import {
   loadWithoutCoordinatedShutdownSignalHooks,
 } from "./shutdown.js";
 import { initializeCloudRuntimeIdentity } from "./services/cloud-runtime-identity.js";
-import { systemdNotify } from "./services/systemd-notify.js";
+import { systemdNotify, notifyStartupStatus } from "./services/systemd-notify.js";
 import { flushInFlightRunLogMirrors } from "./services/run-log-store.js";
 import {
   createEmbeddedPostgresSupervisor,
@@ -247,7 +247,9 @@ export async function startServer(): Promise<StartedServer> {
 async function startServerWithDatabaseTeardown(
   startupDatabase: StartupDatabaseTeardown,
 ): Promise<StartedServer> {
+  const bootStartedAt = Date.now();
   setStartupRecoveryPhase("starting");
+  notifyStartupStatus("Starting: loading configuration");
   warnIfUnsupportedNodeVersion(process.versions.node, (message) => logger.warn(message));
 
   // Tracing must be active (or have failed and logged) before the first DB
@@ -1044,6 +1046,7 @@ async function startServerWithDatabaseTeardown(
   });
 
   setStartupRecoveryPhase("recovering");
+  notifyStartupStatus("Starting: recovering interrupted run state");
   // Bind the shared HTTP/PRP listener before native startup recovery. A
   // runnerd process that survived a controller crash is already reconnecting
   // to this address; delaying listen until after orphan reconciliation makes
@@ -2046,8 +2049,9 @@ async function startServerWithDatabaseTeardown(
 
   markIdleStartupComplete({ scheduledBackups: config.databaseBackupEnabled });
   setStartupRecoveryPhase("ready");
-  logger.info(`Server startup recovery complete on ${config.host}:${listenPort}`);
-  void systemdNotify(["--ready", `--status=Listening on ${config.host}:${listenPort}`]).then((notified) => {
+  const bootMs = Date.now() - bootStartedAt;
+  logger.info(`Server startup recovery complete on ${config.host}:${listenPort} (boot took ${(bootMs / 1000).toFixed(1)}s)`);
+  void systemdNotify(["--ready", `--status=Listening on ${config.host}:${listenPort} (boot ${(bootMs / 1000).toFixed(1)}s)`]).then((notified) => {
     if (notified) logger.info("Notified systemd that Paperclip is ready");
   });
   if (process.env.PAPERCLIP_OPEN_ON_LISTEN === "true") {

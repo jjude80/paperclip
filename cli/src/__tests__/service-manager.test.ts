@@ -36,6 +36,10 @@ describe("service definition generation", () => {
     expect(unit).toContain('ExecStart="/home/alice/.local/bin/paperclipai" run --instance "team-a"');
     expect(unit).toContain("Restart=always");
     expect(unit).toContain("TimeoutStopSec=300");
+    // A board with accumulated history can need minutes to finish startup
+    // recovery; systemd's 90s default killed such a boot repeatedly
+    // (NEXA-663). The generated unit must keep the raised value.
+    expect(unit).toContain("TimeoutStartSec=420");
     expect(unit).not.toContain("API_KEY");
   });
 
