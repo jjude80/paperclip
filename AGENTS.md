@@ -204,6 +204,16 @@ Run the browser suites only when your change touches them or when you are explic
 
 For normal issue work, run the smallest relevant verification first. Do not default to repo-wide typecheck/build/test on every heartbeat when a narrower check is enough to prove the change.
 
+Vitest projects are selected with `--project`, never with a bare positional name. `vitest run cli` is a **test-path substring filter**, not the `cli` project: it also matches every `paperclip*` and `*client*` path, so it runs the server, db and UI suites too. Use:
+
+```sh
+pnpm exec vitest run --project paperclipai cli/src/__tests__/some.test.ts
+pnpm exec vitest run --project @paperclipai/server server/src/__tests__/some.test.ts
+pnpm exec vitest run --project @paperclipai/ui ui/src/pages/Some.test.tsx
+```
+
+`scripts/check-vitest-project-filter.mjs` enforces this in executable command surfaces (scripts, CI workflows and `package.json`).
+
 Run this full check before claiming repo work done in a PR-ready hand-off, or when the change scope is broad enough that targeted checks are not sufficient:
 
 ```sh
