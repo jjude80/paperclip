@@ -23,6 +23,7 @@ import {
 import { verifyLocalAgentJwt } from "../agent-auth-jwt.js";
 import { agentRunWritesRevoked } from "../agent-run-cancellation.js";
 import { loadAgentRunAuthentication } from "./agent-run-authentication.js";
+import { agentRunTokenExpired } from "../agent-run-token.js";
 import { isUuidLike, normalizeAgentApiKeyScope, type DeploymentMode } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { logger } from "./logger.js";
@@ -421,6 +422,15 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
         companyId: claims.company_id,
         agentId: claims.sub,
       });
+      // A run token dies with its run. NEXA-720: a token minted for a run that
+      // finished hours ago was still a full agent bearer, because validity was
+      // signature + exp (48h) and no per-run revocation exists. Rejecting here
+      // ends the token's authority at the lifecycle boundary instead of at exp.
+      if (agentRunTokenExpired(identityRun)) {
+        _res.status(401).json({ error: "This agent run has ended; run tokens are not valid after the run completes",
+          code: "agent_run_ended", runId: claims.run_id });
+        return;
+      }
       if (agentRunWritesRevoked(identityRun)
         && !["GET", "HEAD", "OPTIONS"].includes(req.method)) {
         const conversation = identityRun?.contextSnapshot?.conversationMode === true;

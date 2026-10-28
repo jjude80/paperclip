@@ -10,6 +10,7 @@ export function loadAgentRunAuthentication(db: Db, input: {
     activeIdentityContextId: heartbeatRuns.activeIdentityContextId,
     responsibleUserId: heartbeatRuns.responsibleUserId,
     status: heartbeatRuns.status,
+    finishedAt: heartbeatRuns.finishedAt,
     resultJson: sql<Record<string, unknown>>`jsonb_build_object(
       'executionCancellation', jsonb_build_object(
         'state', ${heartbeatRuns.resultJson}->'executionCancellation'->'state'

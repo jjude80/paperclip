@@ -34,7 +34,8 @@ function createDbState(input: {
   agent: { id: string; companyId: string; status?: string; lifecycleHolds?: string[] };
   agentKey?: { id: string; agentId: string; companyId: string; keyHash: string; responsibleUserId?: string | null };
   run?: { id: string; companyId: string; agentId: string; responsibleUserId?: string | null;
-    status?: string; contextSnapshot?: Record<string, unknown>; resultJson?: Record<string, unknown> };
+    status?: string; finishedAt?: Date | string | null;
+    contextSnapshot?: Record<string, unknown>; resultJson?: Record<string, unknown> };
 }) {
   const activity: Array<Record<string, unknown>> = [];
   const agentRow = {
@@ -61,6 +62,7 @@ function createDbState(input: {
         agentId: input.run.agentId,
         responsibleUserId: input.run.responsibleUserId ?? null,
         status: input.run.status ?? "running",
+        finishedAt: input.run.finishedAt ?? null,
         contextSnapshot: input.run.contextSnapshot ?? {},
         resultJson: input.run.resultJson ?? {},
       }
@@ -205,6 +207,51 @@ describe("agent auth middleware", () => {
     const read = await request(client).get(endpoint).set("Authorization", `Bearer ${token}`);
     expect(read.status).toBe(200);
     expect(read.body.readable).toBe(true);
+  });
+
+  it("rejects a run token once its run has finished", async () => {
+    const agentId = randomUUID();
+    const companyId = randomUUID();
+    const runId = randomUUID();
+    const { db } = createDbState({
+      agent: { id: agentId, companyId },
+      run: { id: runId, companyId, agentId, status: "succeeded",
+        finishedAt: new Date(Date.now() - 10 * 60 * 1000) },
+    });
+    const token = createLocalAgentJwt(agentId, companyId, "codex_local", runId, null);
+    const client = createApp(db);
+    const endpoint = `/companies/${companyId}/issues/${randomUUID()}`;
+
+    const read = await request(client).get(endpoint).set("Authorization", `Bearer ${token}`);
+    const write = await request(client).patch(endpoint)
+      .set("Authorization", `Bearer ${token}`)
+      .set("X-Paperclip-Run-Id", runId)
+      .send({ status: "done" });
+
+    expect(read.status).toBe(401);
+    expect(read.body.code).toBe("agent_run_ended");
+    expect(write.status).toBe(401);
+    expect(write.body.code).toBe("agent_run_ended");
+  });
+
+  it("keeps a run token usable inside the post-finish grace window", async () => {
+    const agentId = randomUUID();
+    const companyId = randomUUID();
+    const runId = randomUUID();
+    const { db } = createDbState({
+      agent: { id: agentId, companyId },
+      run: { id: runId, companyId, agentId, status: "succeeded",
+        finishedAt: new Date(Date.now() - 5_000) },
+    });
+    const token = createLocalAgentJwt(agentId, companyId, "codex_local", runId, null);
+
+    const res = await request(createApp(db))
+      .get("/actor")
+      .set("Authorization", `Bearer ${token}`)
+      .set("X-Paperclip-Run-Id", runId);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ type: "agent", runId, source: "agent_jwt" });
   });
 
   it("keeps header-less local requests as the implicit board actor with their run id", async () => {
