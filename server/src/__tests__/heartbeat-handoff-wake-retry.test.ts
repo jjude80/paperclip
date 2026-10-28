@@ -25,7 +25,7 @@ const support = await getEmbeddedPostgresTestSupport();
   }, 90_000);
   afterAll(async () => { await database?.cleanup(); });
 
-  async function seedHandoff(input: { oldRunStatus: "cancelled" | "succeeded"; holdLease: boolean }) {
+  async function seedHandoff(input: { oldRunStatus: "cancelled" | "succeeded"; holdLease: boolean; acknowledgeCancellation?: boolean }) {
     const companyId = randomUUID();
     const oldAgentId = randomUUID();
     const newAgentId = randomUUID();
@@ -53,7 +53,10 @@ const support = await getEmbeddedPostgresTestSupport();
       startedAt: new Date(Date.now() - 120_000),
       finishedAt: new Date(Date.now() - 60_000),
       contextSnapshot: { issueId, taskId: issueId },
-      resultJson: { conversationContinuation: "continue_conversation_v1" },
+      resultJson: {
+        conversationContinuation: "continue_conversation_v1",
+        ...(input.acknowledgeCancellation ? { executionCancellation: { state: "acknowledged" } } : {}),
+      },
     });
     if (input.oldRunStatus === "cancelled") {
       await db.update(issues).set({ executionRunId: null }).where(eq(issues.id, issueId));
@@ -134,6 +137,38 @@ const support = await getEmbeddedPostgresTestSupport();
     expect((await handoffWakes(f))[0]).toMatchObject({ status: "queued", runId: runs[0]!.id });
 
     // A second recovery pass must not promote the same hand-off again.
+    await heartbeatService(db).resumeQueuedRuns();
+    expect(await newAssigneeRuns(f)).toHaveLength(1);
+    expect(await handoffWakes(f)).toHaveLength(1);
+  }, 60_000);
+
+  it("promotes the hand-off after an acknowledged reassignment cancellation", async () => {
+    const f = await seedHandoff({ oldRunStatus: "cancelled", holdLease: true, acknowledgeCancellation: true });
+    // A receipt left over from the previous assignee's own queue. Nothing
+    // swept it, and it must not be replayed ahead of the new assignee.
+    const [stale] = await db.insert(agentWakeupRequests).values({
+      companyId: f.companyId, agentId: f.oldAgentId, source: "automation",
+      reason: "issue_execution_deferred", status: "deferred_issue_execution",
+      payload: { issueId: f.issueId, _paperclipWakeContext: { issueId: f.issueId, wakeReason: "issue_blockers_resolved" } },
+    }).returning();
+
+    expect(await handoffWake(f)).toBeNull();
+    const [deferred] = await handoffWakes(f);
+    expect(deferred).toMatchObject({ status: "deferred_issue_execution", runId: null });
+    expect(deferred!.payload?.executionWait).toMatchObject({ deferredHandoff: true });
+
+    await db.update(environmentLeases).set({ status: "released", releasedAt: new Date() })
+      .where(eq(environmentLeases.id, f.leaseId!));
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+
+    await heartbeatService(db).resumeQueuedRuns();
+    const runs = await newAssigneeRuns(f);
+    expect(runs).toHaveLength(1);
+    expect(runs[0]).toMatchObject({ agentId: f.newAgentId, status: "queued" });
+    expect((await handoffWakes(f))[0]).toMatchObject({ status: "queued", runId: runs[0]!.id });
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, stale!.id)))[0])
+      .toMatchObject({ status: "deferred_issue_execution", runId: null });
+
     await heartbeatService(db).resumeQueuedRuns();
     expect(await newAssigneeRuns(f)).toHaveLength(1);
     expect(await handoffWakes(f)).toHaveLength(1);

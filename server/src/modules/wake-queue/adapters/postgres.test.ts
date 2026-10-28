@@ -158,6 +158,8 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     companyId: string;
     agentId: string;
     issueId: string;
+    source?: string;
+    reason?: string;
     requestedByActorType?: string;
     requestedByActorId?: string | null;
     payload?: Record<string, unknown>;
@@ -167,8 +169,8 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
       id,
       companyId: input.companyId,
       agentId: input.agentId,
-      source: "automation",
-      reason: "issue_commented",
+      source: input.source ?? "automation",
+      reason: input.reason ?? "issue_commented",
       status: "deferred_issue_execution",
       requestedByActorType: input.requestedByActorType ?? "user",
       requestedByActorId: input.requestedByActorId ?? null,
@@ -581,6 +583,87 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
       expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(1);
     });
   }
+
+  it("promotes a durable hand-off wake past an acknowledged reassignment cancellation", async () => {
+    const companyId = await seedCompany();
+    const oldAgentId = await seedAgent({ companyId, name: "Implementer" });
+    const newAgentId = await seedAgent({ companyId, name: "Reviewer" });
+    const issueId = await seedIssue({ companyId, assigneeAgentId: newAgentId, status: "in_review" });
+    const runId = await seedRun({ companyId, agentId: oldAgentId, status: "cancelled",
+      contextSnapshot: { issueId }, errorCode: "issue_reassigned" });
+    await db.update(heartbeatRuns).set({ finishedAt: new Date(), resultJson: {
+      conversationContinuation: "continue_conversation_v1",
+      executionCancellation: { state: "acknowledged" },
+    } }).where(eq(heartbeatRuns.id, runId));
+    await db.update(issues).set({ executionRunId: runId, checkoutRunId: runId }).where(eq(issues.id, issueId));
+    // An older deferred receipt still belongs to the previous assignee. The
+    // retry must promote the hand-off, not replay that receipt in its place.
+    const staleId = await seedDeferredWake({ companyId, agentId: oldAgentId, issueId,
+      payload: { _paperclipWakeContext: { issueId, wakeReason: "issue_blockers_resolved" } } });
+    const handoffId = await seedDeferredWake({ companyId, agentId: newAgentId, issueId,
+      source: "assignment", reason: "issue_assigned",
+      payload: { interruptedRunId: runId,
+        executionWait: { reason: "execution_reconciliation_required", deferredHandoff: true },
+        _paperclipWakeContext: { issueId, wakeReason: "issue_assigned", wakeSource: "assignment", interruptedRunId: runId } } });
+    const release = createReleaseIssueExecution({
+      issueLock: createPostgresWakeQueueAdapter(db, stubDeps),
+      recovery: { escalateStrandedAssignedIssue: async () => undefined, escalateStrandedRecoveryIssueInPlace: async () => undefined },
+    });
+    const input = { companyId, runId, now: new Date(), suppressImmediateRecovery: true, resumeStrandedQueue: true };
+
+    // The run's own cancellation release keeps the acknowledgement's early
+    // return: it must not replay anything by itself.
+    expect((await release({ ...input, resumeStrandedQueue: false })).outcome.kind).toBe("released");
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, handoffId)))[0])
+      .toMatchObject({ status: "deferred_issue_execution", runId: null });
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, newAgentId))).toHaveLength(0);
+
+    // The stranded retry is the one path allowed to promote the receiver.
+    expect((await release(input)).outcome.kind).toBe("promoted");
+    const [handoff] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, handoffId));
+    expect(handoff).toMatchObject({ status: "queued", runId: expect.any(String) });
+    const [promoted] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, handoff.runId!));
+    expect(promoted).toMatchObject({ agentId: newAgentId, status: "queued" });
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, staleId)))[0])
+      .toMatchObject({ status: "deferred_issue_execution", runId: null });
+
+    // Exactly-once: the next tick has no hand-off receipt left to promote.
+    await release(input);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, newAgentId))).toHaveLength(1);
+  });
+
+  it("leaves the previous assignee's wake stranded when the hand-off receiver cannot be woken", async () => {
+    const companyId = await seedCompany();
+    const oldAgentId = await seedAgent({ companyId, name: "Implementer" });
+    const newAgentId = await seedAgent({ companyId, name: "Reviewer" });
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, newAgentId));
+    const issueId = await seedIssue({ companyId, assigneeAgentId: newAgentId, status: "in_review" });
+    const runId = await seedRun({ companyId, agentId: oldAgentId, status: "cancelled",
+      contextSnapshot: { issueId }, errorCode: "issue_reassigned" });
+    await db.update(heartbeatRuns).set({ finishedAt: new Date(), resultJson: {
+      conversationContinuation: "continue_conversation_v1",
+      executionCancellation: { state: "acknowledged" },
+    } }).where(eq(heartbeatRuns.id, runId));
+    await db.update(issues).set({ executionRunId: runId, checkoutRunId: runId }).where(eq(issues.id, issueId));
+    const staleId = await seedDeferredWake({ companyId, agentId: oldAgentId, issueId,
+      payload: { _paperclipWakeContext: { issueId, wakeReason: "issue_blockers_resolved" } } });
+    const handoffId = await seedDeferredWake({ companyId, agentId: newAgentId, issueId,
+      source: "assignment", reason: "issue_assigned",
+      payload: { interruptedRunId: runId,
+        executionWait: { reason: "execution_reconciliation_required", deferredHandoff: true },
+        _paperclipWakeContext: { issueId, wakeReason: "issue_assigned", wakeSource: "assignment" } } });
+    const release = createReleaseIssueExecution({
+      issueLock: createPostgresWakeQueueAdapter(db, stubDeps),
+      recovery: { escalateStrandedAssignedIssue: async () => undefined, escalateStrandedRecoveryIssueInPlace: async () => undefined },
+    });
+    await release({ companyId, runId, now: new Date(), suppressImmediateRecovery: true, resumeStrandedQueue: true });
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, handoffId)))[0])
+      .toMatchObject({ status: "deferred_issue_execution", runId: null });
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, staleId)))[0])
+      .toMatchObject({ status: "deferred_issue_execution", runId: null });
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, oldAgentId))).toHaveLength(1);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, newAgentId))).toHaveLength(0);
+  });
 
   it("releases an acknowledged native handoff without blocking or restarting the old owner", async () => {
     const companyId = await seedCompany();

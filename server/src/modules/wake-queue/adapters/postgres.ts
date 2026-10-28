@@ -218,7 +218,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
         paused: !invokability.invokable && invokability.reason === "paused" };
     },
 
-    async findNextDeferredWake({ companyId, issueId, excludedWakeIds }) {
+    async findNextDeferredWake({ companyId, issueId, excludedWakeIds, wakeId }) {
       while (true) {
         const row = await tx
           .select()
@@ -227,6 +227,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
             and(
               eq(agentWakeupRequests.companyId, companyId),
               eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
+              wakeId ? eq(agentWakeupRequests.id, wakeId) : undefined,
               excludedWakeIds?.length ? notInArray(agentWakeupRequests.id, excludedWakeIds) : undefined,
               sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
               interruptQueueId ? eq(agentWakeupRequests.id, interruptQueueId) : undefined,
@@ -1045,6 +1046,35 @@ export function createWakeAdmissionWriter(): WakeAdmissionWriter {
   };
 }
 
+/**
+ * NEXA-738: the durable hand-off receipt a reassignment left behind. It is
+ * addressed to the issue's current assignee, and it exists because the
+ * finishing run was cancelled by that same reassignment. The stranded retry
+ * must promote it without replaying older deferred work for the previous
+ * assignee, so the caller pins this exact wake id.
+ */
+async function findDeferredHandoffWakeId(
+  tx: Db,
+  companyId: string,
+  issueId: string,
+  assigneeAgentId: string | null,
+): Promise<string | null> {
+  if (!assigneeAgentId) return null;
+  const [wake] = await tx
+    .select({ id: agentWakeupRequests.id })
+    .from(agentWakeupRequests)
+    .where(and(
+      eq(agentWakeupRequests.companyId, companyId),
+      eq(agentWakeupRequests.agentId, assigneeAgentId),
+      eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
+      sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
+      sql`${agentWakeupRequests.payload}->'executionWait'->>'deferredHandoff' = 'true'`,
+    ))
+    .orderBy(asc(agentWakeupRequests.requestedAt))
+    .limit(1);
+  return wake?.id ?? null;
+}
+
 export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAdapterDeps): IssueLockWriter {
   return {
     async withIssueExecutionLock(input, fn): Promise<ReleaseTransactionResult & { run: RunSnapshot }> {
@@ -1165,7 +1195,15 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
             (run.status === "cancelled" &&
             (queuedOperatorStop || parseObject(run.resultJson?.executionCancellation).state === "acknowledged" || isAcknowledgedNativeStop(run)) &&
             !interruptedQueue),
+          // Only the stranded retry looks for the hand-off receipt, and only a
+          // receipt addressed to the current assignee can be its successor.
+          durableHandoffWakePending: false,
         };
+        const durableHandoffWakeId =
+          input.resumeStrandedQueue && preDrainFacts.executionCancellationAcknowledged && issueRow
+            ? await findDeferredHandoffWakeId(tx, input.companyId, issueRow.id, issueRow.assigneeAgentId)
+            : null;
+        preDrainFacts.durableHandoffWakePending = durableHandoffWakeId !== null;
         const preDrain = decidePreDrain(preDrainFacts);
 
         if (preDrain.kind === "released") {
@@ -1249,7 +1287,8 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
         }
 
-        const locked: LockedIssueExecution = { primaryIssue: toIssueSnapshot(issueRow), run: runSnapshot, recoveryOnly };
+        const locked: LockedIssueExecution = { primaryIssue: toIssueSnapshot(issueRow), run: runSnapshot, recoveryOnly,
+          ...(durableHandoffWakeId ? { preferredWakeId: durableHandoffWakeId } : {}) };
         const result = await fn(locked, { host: buildHost(tx, deps), transaction: buildTransaction(tx, deps, db, run) });
         // Explicit retry admission requires the exact source's task claim.
         // Preserve it only when the existing queue-first recovery policy
