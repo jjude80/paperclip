@@ -260,6 +260,7 @@ describe("buildPaperclipTaskMarkdown", () => {
       '"contentPath":"/api/attachments/attachment-text/content"',
     );
     expect(markdown).toContain("PAPERCLIP_API_URL");
+    expect(markdown).toContain("PAPERCLIP_API_TOKEN_FILE");
     expect(markdown).toContain("PAPERCLIP_API_KEY");
     expect(markdown).toContain("never invoke `npx`");
     expect(markdown).toContain(

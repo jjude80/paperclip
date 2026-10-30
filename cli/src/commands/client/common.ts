@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import pc from "picocolors";
 import type { Command } from "commander";
 import { getStoredBoardCredential, loginBoardCli } from "../../client/board-auth.js";
@@ -24,7 +25,7 @@ export interface ResolvedClientContext {
   profileName: string;
   profile: ClientContextProfile;
   json: boolean;
-  authSource: "explicit" | "env" | "profile_env" | "stored_board" | "none";
+  authSource: "explicit" | "file" | "env" | "profile_env" | "stored_board" | "none";
 }
 
 export function addCommonClientOptions(command: Command, opts?: { includeCompany?: boolean }): Command {
@@ -164,12 +165,39 @@ export function inferContentTypeFromPath(filePath: string): string | undefined {
   }[ext];
 }
 
+/**
+ * Read a secret that the runtime hands over as a 0600 file instead of an env value.
+ *
+ * NEXA-643 deletes `PAPERCLIP_API_KEY` from every child shell of an agent run and
+ * passes `PAPERCLIP_API_TOKEN_FILE` instead, so the CLI has to read both shapes or
+ * it calls the board unauthenticated after that payload activates. The file wins
+ * when it is present and non-empty; the legacy value stays as the fallback, so one
+ * binary behaves the same before and after the migration.
+ *
+ * A missing, unreadable or empty file is not an error here: the caller falls
+ * through to the next source, which is what a non-agent run looks like.
+ * Mirrors `readSecretCarrier({ key, fileKey })` in `@paperclipai/shared`; when that
+ * helper is available on this branch this becomes a one-line replacement.
+ */
+function readSecretFileCarrier(fileKey: string): string | undefined {
+  const filePath = process.env[fileKey]?.trim();
+  if (!filePath) return undefined;
+  try {
+    return fs.readFileSync(filePath, "utf8").trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function resolveApiKey(
   options: Pick<BaseClientOptions, "apiKey">,
   profile: ClientContextProfile,
-): { value: string | undefined; source: "explicit" | "env" | "profile_env" | "none" } {
+): { value: string | undefined; source: "explicit" | "file" | "env" | "profile_env" | "none" } {
   const optionValue = options.apiKey?.trim();
   if (optionValue) return { value: optionValue, source: "explicit" };
+
+  const fileValue = readSecretFileCarrier("PAPERCLIP_API_TOKEN_FILE");
+  if (fileValue) return { value: fileValue, source: "file" };
 
   const envValue = process.env.PAPERCLIP_API_KEY?.trim();
   if (envValue) return { value: envValue, source: "env" };
