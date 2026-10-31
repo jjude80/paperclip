@@ -146,8 +146,14 @@ export const issues = pgTable(
     titleSearchIdx: index("issues_title_search_idx").using("gin", table.title.op("gin_trgm_ops")),
     identifierSearchIdx: index("issues_identifier_search_idx").using("gin", table.identifier.op("gin_trgm_ops")),
     descriptionSearchIdx: index("issues_description_search_idx").using("gin", table.description.op("gin_trgm_ops")),
+    // A routine execution can legitimately leave several issues open at once: one per
+    // firing, when the routine's content is static and each firing is still awaiting
+    // the board. The dispatch fingerprint is a *content* key (identical firings share
+    // it, which is what coalescing matches on), so it must not be part of this
+    // uniqueness key. The per-dispatch identity is origin_run_id: one routine run
+    // creates at most one open issue, and two different runs never collide.
     openRoutineExecutionIdx: uniqueIndex("issues_open_routine_execution_uq")
-      .on(table.companyId, table.originKind, table.originId, table.originFingerprint)
+      .on(table.companyId, table.originKind, table.originId, table.originRunId)
       .where(
         sql`${table.originKind} = 'routine_execution'
           and ${table.originId} is not null

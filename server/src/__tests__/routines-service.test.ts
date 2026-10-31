@@ -1484,6 +1484,56 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(routineIssues[0]?.id).toBe(previousIssue.id);
   });
 
+  it("lets a later firing open its own issue after the previous run finished with the issue still open", async () => {
+    const { agentId, companyId, routine, svc } = await seedFixture();
+    await db
+      .update(routines)
+      .set({ concurrencyPolicy: "skip_if_active" })
+      .where(eq(routines.id, routine.id));
+    const { trigger } = await svc.createTrigger(
+      routine.id,
+      { kind: "schedule", cronExpression: "0 7,12,17 * * *", timezone: "UTC" },
+      {},
+    );
+
+    // A static routine renders the same dispatch fingerprint for every firing. The
+    // first firing runs to completion but its issue is still open (in review) and
+    // still names that finished execution run.
+    const firstSlot = new Date("2026-10-31T07:00:00.000Z");
+    await db.update(routineTriggers).set({ nextRunAt: firstSlot }).where(eq(routineTriggers.id, trigger.id));
+    expect(await svc.tickScheduledTriggers(firstSlot)).toEqual({ triggered: 1 });
+
+    const [firstIssue] = await db.select().from(issues).where(eq(issues.originId, routine.id));
+    expect(firstIssue?.executionRunId).toBeTruthy();
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "failed", finishedAt: firstSlot })
+      .where(eq(heartbeatRuns.id, firstIssue!.executionRunId!));
+    await db.update(issues).set({ status: "in_review" }).where(eq(issues.id, firstIssue!.id));
+
+    // skip_if_active only skips a *live* run, so the next slot starts new work. That
+    // work must be bindable even though its content fingerprint matches the first.
+    const secondSlot = new Date("2026-10-31T12:00:00.000Z");
+    expect(await svc.tickScheduledTriggers(secondSlot)).toEqual({ triggered: 1 });
+
+    const fired = await db
+      .select({
+        id: issues.id,
+        fingerprint: issues.originFingerprint,
+        originRunId: issues.originRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.originId, routine.id))
+      .orderBy(issues.createdAt);
+    expect(fired).toHaveLength(2);
+    expect(fired[0]?.fingerprint).toBe(fired[1]?.fingerprint);
+    expect(fired[0]?.originRunId).not.toBe(fired[1]?.originRunId);
+    expect(fired[0]?.executionRunId).toBeTruthy();
+    expect(fired[1]?.executionRunId).toBeTruthy();
+    expect(fired[0]?.executionRunId).not.toBe(fired[1]?.executionRunId);
+  });
+
   it("preserves the archive and Mine membership when a manual run coalesces", async () => {
     const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
     const userId = randomUUID();

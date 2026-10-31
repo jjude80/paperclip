@@ -2591,6 +2591,13 @@
       "when": 1792597792969,
       "tag": "0371_furry_red_shift",
       "breakpoints": true
+    },
+    {
+      "idx": 372,
+      "version": "7",
+      "when": 1793478881944,
+      "tag": "0372_shallow_loa",
+      "breakpoints": true
     }
   ]
 }
