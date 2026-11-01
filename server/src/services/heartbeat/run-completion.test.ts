@@ -158,6 +158,46 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     expect(f.deps.finalizeAgentStatus).toHaveBeenCalledWith(f.agent.id, "succeeded", null, expect.any(Object));
   });
 
+  it("redacts the adapter's captured output before it reaches result_json", async () => {
+    const f = await fixture();
+    const secret = "s3cr3t-opaque-value-1234";
+    f.input.readFailureReportSecrets = () => [secret];
+    Object.assign(f.input.adapterResult, {
+      resultJson: {
+        stdout: `leaked ${secret}\nPAPERCLIP_AGENT_JWT_SECRET=abcdef0123456789abcdef\nnormal output\n`,
+        stderr: `Authorization: Bearer abcdefghijklmnopqrstuvwxyz012345\n`,
+      },
+    });
+
+    await f.completion.completeRun(f.input);
+
+    const persisted = await read(f.run.id);
+    const stdout = String((persisted.resultJson as Record<string, unknown>).stdout ?? "");
+    const stderr = String((persisted.resultJson as Record<string, unknown>).stderr ?? "");
+    expect(stdout).not.toContain(secret);
+    expect(stdout).not.toContain("abcdef0123456789abcdef");
+    expect(stdout).toContain("***REDACTED***");
+    expect(stdout).toContain("normal output");
+    expect(stderr).not.toContain("abcdefghijklmnopqrstuvwxyz012345");
+  });
+
+  it("redacts a stop snapshot the failure path inherits from a partial write", async () => {
+    const f = await fixture();
+    const secret = "s3cr3t-opaque-value-1234";
+    f.input.readFailureReportSecrets = () => [secret];
+    await db.update(heartbeatRuns)
+      .set({ resultJson: { stdout: `leaked ${secret}\n` } })
+      .where(eq(heartbeatRuns.id, f.run.id));
+
+    f.controller.abort();
+    await f.completion.failRun(f.failure(new Error("adapter stopped after the partial write")));
+
+    const persisted = await read(f.run.id);
+    const stdout = String((persisted.resultJson as Record<string, unknown>).stdout ?? "");
+    expect(stdout).not.toContain(secret);
+    expect(stdout).toContain("***REDACTED***");
+  });
+
   it.each([
     { timedOut: true, expected: "timed_out", errorCode: "timeout" },
     { signal: "SIGTERM", expected: "failed", errorCode: "adapter_failed" },

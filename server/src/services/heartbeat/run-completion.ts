@@ -33,6 +33,7 @@ import { readAcceptedTaskContinuationSummary } from "../heartbeat-run-summary.js
 import { SANDBOX_PROVIDER_PLUGIN_NOT_READY_REASON } from "../recovery/stranded-notice.js";
 import { MAX_TURN_CONTINUATION_RETRY_REASON } from "../../modules/run-dispatch/index.js";
 import { redactCurrentUserText } from "../../log-redaction.js";
+import { redactPersistedRunResultJson } from "./run-result-redaction.js";
 import type { createHeartbeatLifecycle } from "./run-lifecycle.js";
 import type { createHeartbeatRunPreparation } from "./run-preparation.js";
 import type { createHeartbeatRetries, HeartbeatRetryDependencies } from "./retries.js";
@@ -598,28 +599,36 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       ),
     };
 
-    const persistedResultJson = cancellationResultJson(latestRun ?? run, outcome, mergeHeartbeatRunResultJson(
-      mergeRunStopMetadataForAgent(agent, outcome, {
-        resultJson: mergeAdapterRecoveryMetadata({
-          resultJson: {
-            ...(adapterResult.nativeFinalization || outcome === "cancelled"
-              ? parseObject(latestRun?.resultJson)
-              : {}),
-            ...parseObject(adapterResult.resultJson),
-            ...(adapterResult.executionRecovery
-              ? { executionRecovery: adapterResult.executionRecovery }
-              : {}),
-            ...(outcome === "cancelled" ? controllerLeaseLossResultJson(signal) : {}),
-            configFreshness: configFreshnessResultMetadata,
-          },
-          errorFamily: adapterResult.errorFamily ?? null,
-          retryNotBefore: adapterResult.retryNotBefore ?? null,
+    // The adapter's own resultJson carries the tool output verbatim
+    // (`stdout`/`stderr` from the process adapter). The excerpts written beside
+    // it are redacted, so persisting this blob untouched left the same secret in
+    // the row by a second path — the defect NEXA-745 records. Redact at the one
+    // choke point every terminal write goes through, not at each adapter.
+    const persistedResultJson = redactPersistedRunResultJson(
+      cancellationResultJson(latestRun ?? run, outcome, mergeHeartbeatRunResultJson(
+        mergeRunStopMetadataForAgent(agent, outcome, {
+          resultJson: mergeAdapterRecoveryMetadata({
+            resultJson: {
+              ...(adapterResult.nativeFinalization || outcome === "cancelled"
+                ? parseObject(latestRun?.resultJson)
+                : {}),
+              ...parseObject(adapterResult.resultJson),
+              ...(adapterResult.executionRecovery
+                ? { executionRecovery: adapterResult.executionRecovery }
+                : {}),
+              ...(outcome === "cancelled" ? controllerLeaseLossResultJson(signal) : {}),
+              configFreshness: configFreshnessResultMetadata,
+            },
+            errorFamily: adapterResult.errorFamily ?? null,
+            retryNotBefore: adapterResult.retryNotBefore ?? null,
+          }),
+          errorCode: runErrorCode,
+          errorMessage: runErrorMessage,
         }),
-        errorCode: runErrorCode,
-        errorMessage: runErrorMessage,
-      }),
-      adapterResult.summary ?? null,
-    ), runErrorCode, runErrorMessage);
+        adapterResult.summary ?? null,
+      ), runErrorCode, runErrorMessage),
+      readFailureReportSecrets(),
+    );
 
     const ledgerScope = runLedgerScope;
     const finalRunPatch: Partial<typeof heartbeatRuns.$inferInsert> = {
@@ -1132,7 +1141,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       error: message,
       errorCode: stopSnapshot?.errorCode ?? failureErrorCode,
       finishedAt: new Date(),
-      resultJson: mergeRunStopMetadataForAgent(agent, failureOutcome, {
+      resultJson: redactPersistedRunResultJson(mergeRunStopMetadataForAgent(agent, failureOutcome, {
         errorCode: failureErrorCode,
         errorMessage: message,
         resultJson: {
@@ -1151,7 +1160,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
               }
             : {}),
         },
-      }),
+      }), readFailureReportSecrets()),
       stdoutExcerpt: output.stdoutExcerpt,
       stderrExcerpt: output.stderrExcerpt,
       logBytes: logSummary?.bytes,
