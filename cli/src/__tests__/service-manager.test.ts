@@ -41,6 +41,12 @@ describe("service definition generation", () => {
     // (NEXA-663). The generated unit must keep the raised value.
     expect(unit).toContain("TimeoutStartSec=420");
     expect(unit).not.toContain("API_KEY");
+    // The unit body is itself a template literal, so a backtick in one of its
+    // comments terminates the literal and the whole module stops parsing
+    // (NEXA-751: master was unbuildable for four days). Rendering the unit is
+    // only possible if the file parses, but assert the invariant anyway so a
+    // future edit fails here rather than at the next `import`.
+    expect(unit).not.toContain("`");
   });
 
   it("escapes systemd variable and specifier expansion in configured values", () => {

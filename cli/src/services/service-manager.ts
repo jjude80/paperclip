@@ -181,7 +181,7 @@ RestartSec=5
 # PostgreSQL) routinely outlives systemd's 90s default on a board with
 # accumulated history: on 2026-10-27 a boot served HTTP for >90s without
 # sending READY=1 and was killed, then crash-looped six times in nine minutes.
-# A hand-written drop-in with 420s stopped it. Drop-ins survive `install`
+# A hand-written drop-in with 420s stopped it. Drop-ins survive 'install'
 # (it only rewrites this fragment), but they are host-local: a fresh install
 # that never ran the host script gets the 90s default. Carry the measured
 # floor here as well, and let the server publish STATUS= per boot phase so a
