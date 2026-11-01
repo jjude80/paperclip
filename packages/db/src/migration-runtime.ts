@@ -3,6 +3,13 @@ import { createServer } from "node:net";
 import path from "node:path";
 import { ensurePostgresDatabase, getPostgresDataDirectory } from "./client.js";
 import { createEmbeddedPostgresLogBuffer, formatEmbeddedPostgresError } from "./embedded-postgres-error.js";
+import {
+  embeddedPostgresUrl,
+  persistEmbeddedPostgresPassword,
+  resolveEmbeddedPostgresCredentials,
+  resolveEmbeddedPostgresInitialisationPassword,
+  rotateEmbeddedPostgresPassword,
+} from "./embedded-postgres-credentials.js";
 import { prepareEmbeddedPostgresNativeRuntime } from "./embedded-postgres-native.js";
 import { resolveDatabaseTarget } from "./runtime-config.js";
 
@@ -18,6 +25,7 @@ type EmbeddedPostgresCtor = new (opts: {
   password: string;
   port: number;
   persistent: boolean;
+  authMethod?: "scram-sha-256" | "password" | "md5";
   initdbFlags?: string[];
   onLog?: (message: unknown) => void;
   onError?: (message: unknown) => void;
@@ -99,9 +107,14 @@ async function ensureEmbeddedPostgresConnection(
   const pgVersionFile = path.resolve(dataDir, "PG_VERSION");
   const runningPid = readRunningPostmasterPid(postmasterPidFile);
   const runningPort = readPidFilePort(postmasterPidFile);
-  const preferredAdminConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${preferredPort}/postgres`;
+  const preferredAdminConnectionString = embeddedPostgresUrl({
+    dataDir,
+    port: preferredPort,
+    database: "postgres",
+  });
   const logBuffer = createEmbeddedPostgresLogBuffer();
 
+  // Another process owns this cluster: use its credentials, never rotate them.
   if (!runningPid && existsSync(pgVersionFile)) {
     try {
       const actualDataDir = await getPostgresDataDirectory(preferredAdminConnectionString);
@@ -116,7 +129,7 @@ async function ensureEmbeddedPostgresConnection(
         `Adopting an existing PostgreSQL instance on port ${preferredPort} for embedded data dir ${dataDir} because postmaster.pid is missing.`,
       );
       return {
-        connectionString: `postgres://paperclip:paperclip@127.0.0.1:${preferredPort}/paperclip`,
+        connectionString: embeddedPostgresUrl({ dataDir, port: preferredPort, database: "paperclip" }),
         source: `embedded-postgres@${preferredPort}`,
         stop: async () => {},
       };
@@ -127,29 +140,40 @@ async function ensureEmbeddedPostgresConnection(
 
   if (runningPid) {
     const port = runningPort ?? preferredPort;
-    const adminConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${port}/postgres`;
+    const adminConnectionString = embeddedPostgresUrl({ dataDir, port, database: "postgres" });
     await ensurePostgresDatabase(adminConnectionString, "paperclip");
     return {
-      connectionString: `postgres://paperclip:paperclip@127.0.0.1:${port}/paperclip`,
+      connectionString: embeddedPostgresUrl({ dataDir, port, database: "paperclip" }),
       source: `embedded-postgres@${port}`,
       stop: async () => {},
     };
   }
 
+  const clusterAlreadyInitialised = existsSync(pgVersionFile);
+  // A brand new cluster gets a generated password before `initdb` runs, so the
+  // cluster never exists with the shipped literal (NEXA-749).
+  const initialPassword = clusterAlreadyInitialised
+    ? resolveEmbeddedPostgresCredentials(dataDir).password
+    : resolveEmbeddedPostgresInitialisationPassword(dataDir);
+
   const instance = new EmbeddedPostgres({
     databaseDir: dataDir,
     user: "paperclip",
-    password: "paperclip",
+    password: initialPassword,
     port: selectedPort,
     persistent: true,
+    ...(clusterAlreadyInitialised ? {} : { authMethod: "scram-sha-256" as const }),
     initdbFlags: ["--encoding=UTF8", "--locale=C", "--lc-messages=C"],
     onLog: logBuffer.append,
     onError: logBuffer.append,
   });
 
-  if (!existsSync(path.resolve(dataDir, "PG_VERSION"))) {
+  if (!clusterAlreadyInitialised) {
     try {
       await instance.initialise();
+      // initdb created the data directory; persist the credential now so the
+      // cluster is never left with a password nobody stored (NEXA-749).
+      persistEmbeddedPostgresPassword(dataDir, initialPassword);
     } catch (error) {
       throw formatEmbeddedPostgresError(error, {
         fallbackMessage:
@@ -170,11 +194,20 @@ async function ensureEmbeddedPostgresConnection(
     });
   }
 
-  const adminConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${selectedPort}/postgres`;
+  // This process started the cluster, so it is the owner and may rotate a
+  // pre-NEXA-749 cluster off the shipped literal. A cluster whose credential
+  // file already exists is left alone.
+  await rotateEmbeddedPostgresPassword({ dataDir, port: selectedPort });
+
+  const adminConnectionString = embeddedPostgresUrl({
+    dataDir,
+    port: selectedPort,
+    database: "postgres",
+  });
   await ensurePostgresDatabase(adminConnectionString, "paperclip");
 
   return {
-    connectionString: `postgres://paperclip:paperclip@127.0.0.1:${selectedPort}/paperclip`,
+    connectionString: embeddedPostgresUrl({ dataDir, port: selectedPort, database: "paperclip" }),
     source: `embedded-postgres@${selectedPort}`,
     stop: async () => {
       await instance.stop();

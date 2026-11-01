@@ -1,7 +1,12 @@
 import path from "node:path";
 import * as p from "@clack/prompts";
 import pc from "picocolors";
-import { formatDatabaseBackupResult, runDatabaseBackup } from "@paperclipai/db";
+import {
+  embeddedPostgresUrl,
+  formatDatabaseBackupResult,
+  resolveEmbeddedPostgresDataDir,
+  runDatabaseBackup,
+} from "@paperclipai/db";
 import {
   expandHomePrefix,
   resolveDefaultBackupDir,
@@ -28,8 +33,9 @@ function resolveConnectionString(configPath?: string): { value: string; source: 
   }
 
   const port = config?.database.embeddedPostgresPort ?? 54329;
+  const dataDir = resolveEmbeddedPostgresDataDir(config?.database.embeddedPostgresDataDir);
   return {
-    value: `postgres://paperclip:paperclip@127.0.0.1:${port}/paperclip`,
+    value: embeddedPostgresUrl({ dataDir, port, database: "paperclip" }),
     source: `embedded-postgres@${port}`,
   };
 }

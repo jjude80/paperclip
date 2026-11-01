@@ -3,6 +3,7 @@ import { readFileSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { and, eq, gt, isNull } from "drizzle-orm";
 import { createDb } from "../src/client.js";
+import { embeddedPostgresUrl } from "../src/embedded-postgres-credentials.js";
 import { invites } from "../src/schema/index.js";
 
 function hashToken(token: string) {
@@ -52,7 +53,11 @@ async function main() {
   const dbUrl =
     config.database?.mode === "postgres"
       ? config.database.connectionString
-      : `postgres://paperclip:paperclip@127.0.0.1:${embeddedPort}/paperclip`;
+      : embeddedPostgresUrl({
+        dataDir: config.database!.embeddedPostgresDataDir!,
+        port: embeddedPort!,
+        database: "paperclip",
+      });
   if (!dbUrl) {
     throw new Error(`Could not resolve database connection from ${configPath}`);
   }

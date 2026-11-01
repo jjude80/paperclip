@@ -28,6 +28,10 @@ import os from "node:os";
 import path from "node:path";
 import { and, eq, isNotNull, sql } from "drizzle-orm";
 import { createDb } from "../src/client.js";
+import {
+  embeddedPostgresUrl,
+  resolveEmbeddedPostgresDataDir,
+} from "../src/embedded-postgres-credentials.js";
 import { agentTaskSessions } from "../src/schema/index.js";
 
 const CLAUDE_ADAPTER_TYPE = "claude_local";
@@ -213,6 +217,7 @@ function readDatabaseUrlFromConfig(configPath: string): string {
     database?: {
       mode?: string;
       embeddedPostgresPort?: number;
+      embeddedPostgresDataDir?: string;
       connectionString?: string;
     };
   };
@@ -220,7 +225,11 @@ function readDatabaseUrlFromConfig(configPath: string): string {
     return parsed.database.connectionString;
   }
   const port = parsed.database?.embeddedPostgresPort ?? 54329;
-  return `postgres://paperclip:paperclip@127.0.0.1:${port}/paperclip`;
+  return embeddedPostgresUrl({
+    dataDir: resolveEmbeddedPostgresDataDir(parsed.database?.embeddedPostgresDataDir),
+    port,
+    database: "paperclip",
+  });
 }
 
 function defaultConfigPath(): string | null {
