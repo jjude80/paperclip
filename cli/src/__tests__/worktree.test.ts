@@ -17,6 +17,9 @@ import {
   createDb,
   closeRegisteredClients,
   ensurePostgresDatabase,
+  embeddedPostgresUrl,
+  resolveEmbeddedPostgresCredentials,
+  resolveEmbeddedPostgresDataDir,
   executionWorkspaces,
   inspectMigrations,
   issueComments,
@@ -1615,10 +1618,13 @@ describe("worktree helpers", () => {
         targetPgLogs = Buffer.alloc(tail.length);
         tail.copy(targetPgLogs);
       };
+      const targetDataDir = resolveEmbeddedPostgresDataDir(
+        targetConfig.database.embeddedPostgresDataDir,
+      );
       const targetPg = new EmbeddedPostgres({
         databaseDir: targetConfig.database.embeddedPostgresDataDir,
         user: "paperclip",
-        password: "paperclip",
+        password: resolveEmbeddedPostgresCredentials(targetDataDir).password,
         port: targetConfig.database.embeddedPostgresPort,
         persistent: true,
         initdbFlags: ["--encoding=UTF8", "--locale=C", "--lc-messages=C"],
@@ -1631,7 +1637,11 @@ describe("worktree helpers", () => {
         targetPgStartupResolved = true;
         onTestFinished(() => targetPg.stop());
         const targetDb = createDb(
-          `postgres://paperclip:paperclip@127.0.0.1:${targetConfig.database.embeddedPostgresPort}/paperclip`,
+          embeddedPostgresUrl({
+            dataDir: targetDataDir,
+            port: targetConfig.database.embeddedPostgresPort,
+            database: "paperclip",
+          }),
         );
         const [seededLocalBoard] = await targetDb
           .select({ id: authUsers.id })
@@ -1804,10 +1814,13 @@ describe("worktree helpers", () => {
       expect(manifestText).not.toContain("fixture-password-hash");
       expect(manifestText).not.toContain("source-master-key");
       const { default: EmbeddedPostgres } = await import("embedded-postgres");
+      const targetDataDir = resolveEmbeddedPostgresDataDir(
+        targetConfig.database.embeddedPostgresDataDir,
+      );
       const targetPg = new EmbeddedPostgres({
         databaseDir: targetConfig.database.embeddedPostgresDataDir,
         user: "paperclip",
-        password: "paperclip",
+        password: resolveEmbeddedPostgresCredentials(targetDataDir).password,
         port: targetConfig.database.embeddedPostgresPort,
         persistent: true,
         initdbFlags: ["--encoding=UTF8", "--locale=C", "--lc-messages=C"],
@@ -1818,7 +1831,11 @@ describe("worktree helpers", () => {
       await targetPg.start();
       onTestFinished(() => targetPg.stop());
       const targetDb = createDb(
-        `postgres://paperclip:paperclip@127.0.0.1:${targetConfig.database.embeddedPostgresPort}/paperclip`,
+        embeddedPostgresUrl({
+          dataDir: targetDataDir,
+          port: targetConfig.database.embeddedPostgresPort,
+          database: "paperclip",
+        }),
       );
       const seededUsers = await targetDb.select().from(authUsers);
       expect(seededUsers.some((row) => row.email === "existing@paperclip.ing")).toBe(true);

@@ -10,6 +10,11 @@ import {
   createEmbeddedPostgresLogBuffer,
   formatEmbeddedPostgresError,
 } from "./embedded-postgres-error.js";
+import {
+  embeddedPostgresUrl,
+  persistEmbeddedPostgresPassword,
+  resolveEmbeddedPostgresInitialisationPassword,
+} from "./embedded-postgres-credentials.js";
 import { prepareEmbeddedPostgresNativeRuntime } from "./embedded-postgres-native.js";
 
 // Time budget (ms) for a vitest test in the embedded-Postgres cost class: a
@@ -32,6 +37,7 @@ type EmbeddedPostgresCtor = new (opts: {
   password: string;
   port: number;
   persistent: boolean;
+  authMethod?: "scram-sha-256" | "password" | "md5";
   initdbFlags?: string[];
   onLog?: (message: unknown) => void;
   onError?: (message: unknown) => void;
@@ -117,8 +123,12 @@ async function getAvailablePort(): Promise<number> {
 }
 
 const EMBEDDED_POSTGRES_USER = "paperclip";
-const EMBEDDED_POSTGRES_PASSWORD = "paperclip";
 const EMBEDDED_POSTGRES_INITDB_FLAGS = ["--encoding=UTF8", "--locale=C", "--lc-messages=C"];
+// A template's key must name the credential scheme it was built with. A
+// template built before NEXA-749 has no password file and would be reused by
+// the generated-password path, which then starts it with a credential the
+// cluster never accepted. Bump this tag whenever the scheme changes.
+const EMBEDDED_POSTGRES_CREDENTIALS_TAG = "generated-v1";
 
 async function createEmbeddedPostgresTestInstance(tempDirPrefix: string) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), tempDirPrefix));
@@ -136,26 +146,30 @@ async function createEmbeddedPostgresTestInstanceAt(dataDir: string) {
   // The `start()` rejection carries an empty message, so we capture the output
   // in a bounded buffer and surface it in the thrown error.
   const logBuffer = createEmbeddedPostgresLogBuffer();
+  // Test clusters get the same generated password a real cluster gets, so the
+  // fixture cannot certify a credential path production does not use.
+  const password = resolveEmbeddedPostgresInitialisationPassword(dataDir);
   const instance = new EmbeddedPostgres({
     databaseDir: dataDir,
     user: EMBEDDED_POSTGRES_USER,
-    password: EMBEDDED_POSTGRES_PASSWORD,
+    password,
     port,
     persistent: true,
+    authMethod: "scram-sha-256",
     initdbFlags: EMBEDDED_POSTGRES_INITDB_FLAGS,
     onLog: (message) => logBuffer.append(message),
     onError: (message) => logBuffer.append(message),
   });
 
-  return { dataDir, port, instance, getRecentLogs: () => logBuffer.getRecentLogs() };
+  return { dataDir, port, password, instance, getRecentLogs: () => logBuffer.getRecentLogs() };
 }
 
-function adminConnectionStringFor(port: number): string {
-  return `postgres://${EMBEDDED_POSTGRES_USER}:${EMBEDDED_POSTGRES_PASSWORD}@127.0.0.1:${port}/postgres`;
+function adminConnectionStringFor(dataDir: string, port: number): string {
+  return embeddedPostgresUrl({ dataDir, port, database: "postgres" });
 }
 
-function databaseConnectionStringFor(port: number): string {
-  return `postgres://${EMBEDDED_POSTGRES_USER}:${EMBEDDED_POSTGRES_PASSWORD}@127.0.0.1:${port}/paperclip`;
+function databaseConnectionStringFor(dataDir: string, port: number): string {
+  return embeddedPostgresUrl({ dataDir, port, database: "paperclip" });
 }
 
 function cleanupEmbeddedPostgresTestDirs(dataDir: string) {
@@ -239,6 +253,7 @@ async function startEmbeddedPostgresWithRetry(tempDirPrefix: string): Promise<{
     const created = await createEmbeddedPostgresTestInstance(tempDirPrefix);
     try {
       await created.instance.initialise();
+      persistEmbeddedPostgresPassword(created.dataDir, created.password);
       await created.instance.start();
       return { port: created.port, dataDir: created.dataDir, instance: created.instance };
     } catch (error) {
@@ -341,6 +356,10 @@ export function computeEmbeddedPostgresTemplateKey(
   hash.update(`embedded-postgres=${input.packageVersion ?? embeddedPostgresPackageVersion()}\n`);
   hash.update(`initdb=${(input.initdbFlags ?? EMBEDDED_POSTGRES_INITDB_FLAGS).join(" ")}\n`);
   hash.update(`user=${input.user ?? EMBEDDED_POSTGRES_USER}\n`);
+  // The password file lives inside the data directory and is copied with the
+  // template, so the scheme is part of the template's identity, not just its
+  // contents. Old templates (no file) must not satisfy this key.
+  hash.update(`credentials=${EMBEDDED_POSTGRES_CREDENTIALS_TAG}\n`);
   const journalPath = path.join(migrationsDir, "meta", "_journal.json");
   if (fs.existsSync(journalPath)) {
     hash.update(`journal\n`);
@@ -507,8 +526,8 @@ async function buildEmbeddedPostgresTemplate(templateDir: string): Promise<boole
   );
   let published = false;
   try {
-    await ensurePostgresDatabase(adminConnectionStringFor(port), "paperclip");
-    await applyPendingMigrations(databaseConnectionStringFor(port));
+    await ensurePostgresDatabase(adminConnectionStringFor(dataDir, port), "paperclip");
+    await applyPendingMigrations(databaseConnectionStringFor(dataDir, port));
     const stopped = await stopForTemplatePublish(instance);
     if (!stopped || !isUsableTemplate(dataDir)) return false;
     try {
@@ -587,7 +606,12 @@ async function startEmbeddedPostgresFromTemplateWithRetry(
       throw new Error(`embedded Postgres template ${templateDir} is no longer usable`);
     }
     const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), tempDirPrefix));
-    const dataDir = path.join(rootDir, "data");
+    // Copy the cluster into the temp dir itself, not a `data` subdirectory:
+    // the password file lives beside the data directory's contents, and the
+    // caller resolves credentials from the returned `dataDir`. A separate
+    // subdirectory would hide the password file and silently fall back to the
+    // legacy literal, which the cluster rejects.
+    const dataDir = rootDir;
     let created: Awaited<ReturnType<typeof createEmbeddedPostgresTestInstanceAt>> | null = null;
     try {
       fs.cpSync(templateDir, dataDir, { recursive: true });
@@ -595,7 +619,7 @@ async function startEmbeddedPostgresFromTemplateWithRetry(
       fs.chmodSync(dataDir, 0o700);
       created = await createEmbeddedPostgresTestInstanceAt(dataDir);
       await created.instance.start();
-      return { port: created.port, dataDir: rootDir, instance: created.instance };
+      return { port: created.port, dataDir, instance: created.instance };
     } catch (error) {
       lastError = formatEmbeddedPostgresError(error, {
         fallbackMessage: "embedded Postgres startup from template failed",
@@ -711,8 +735,8 @@ export async function startEmbeddedPostgresTestDatabase(
   try {
     // Both calls are no-ops on a template copy and keep the returned database
     // identical to the fresh path even if the template were ever stale.
-    await ensurePostgresDatabase(adminConnectionStringFor(port), "paperclip");
-    const connectionString = databaseConnectionStringFor(port);
+    await ensurePostgresDatabase(adminConnectionStringFor(dataDir, port), "paperclip");
+    const connectionString = databaseConnectionStringFor(dataDir, port);
     await applyPendingMigrations(connectionString);
 
     return {

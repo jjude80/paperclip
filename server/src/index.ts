@@ -72,6 +72,11 @@ import {
   applyPendingMigrations,
   createEmbeddedPostgresLogBuffer,
   prepareEmbeddedPostgresNativeRuntime,
+  embeddedPostgresUrl,
+  persistEmbeddedPostgresPassword,
+  resolveEmbeddedPostgresCredentials,
+  resolveEmbeddedPostgresInitialisationPassword,
+  rotateEmbeddedPostgresPassword,
   reconcilePendingMigrationHistory,
   formatDatabaseBackupResult,
   runDatabaseBackup,
@@ -560,13 +565,19 @@ async function startServerWithDatabaseTeardown(
     const runningPid = getRunningPid();
     if (runningPid) {
       port = embeddedPostgresOwnerPort(readFileSync(postmasterPidFile, "utf8"), dataDir, runningPid);
-      const actualDataDir = await getPostgresDataDirectory(`postgres://paperclip:paperclip@127.0.0.1:${port}/postgres`);
+      const actualDataDir = await getPostgresDataDirectory(
+        embeddedPostgresUrl({ dataDir, port, database: "postgres" }),
+      );
       if (typeof actualDataDir !== "string" || resolve(actualDataDir) !== resolve(dataDir)) {
         throw new Error("Refusing to reuse PostgreSQL: its data directory belongs to another instance.");
       }
       logger.warn(`Embedded PostgreSQL already running; reusing existing process (pid=${runningPid}, port=${port})`);
     } else {
-      const configuredAdminConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${configuredPort}/postgres`;
+      const configuredAdminConnectionString = embeddedPostgresUrl({
+        dataDir,
+        port: configuredPort,
+        database: "postgres",
+      });
       try {
         const actualDataDir = await getPostgresDataDirectory(configuredAdminConnectionString);
         if (
@@ -586,21 +597,33 @@ async function startServerWithDatabaseTeardown(
         }
         port = detectedPort;
         logger.info(`Using embedded PostgreSQL because no DATABASE_URL set (dataDir=${dataDir}, port=${port})`);
-        const createEmbeddedPostgres = () => new EmbeddedPostgres({
-          databaseDir: dataDir,
-          user: "paperclip",
-          password: "paperclip",
-          port,
-          persistent: true,
-          initdbFlags: ["--encoding=UTF8", "--locale=C", "--lc-messages=C"],
-          onLog: appendEmbeddedPostgresLog,
-          onError: appendEmbeddedPostgresLog,
-        });
+        const initPassword = clusterAlreadyInitialized
+          ? resolveEmbeddedPostgresCredentials(dataDir).password
+          : resolveEmbeddedPostgresInitialisationPassword(dataDir);
+        const createEmbeddedPostgres = () => {
+          // Read at call time: the supervisor restarts the cluster after this
+          // process has rotated a legacy cluster onto a generated password.
+          const credentials = resolveEmbeddedPostgresCredentials(dataDir);
+          return new EmbeddedPostgres({
+            databaseDir: dataDir,
+            user: credentials.user,
+            password: clusterAlreadyInitialized ? credentials.password : initPassword,
+            port,
+            persistent: true,
+            ...(clusterAlreadyInitialized ? {} : { authMethod: "scram-sha-256" as const }),
+            initdbFlags: ["--encoding=UTF8", "--locale=C", "--lc-messages=C"],
+            onLog: appendEmbeddedPostgresLog,
+            onError: appendEmbeddedPostgresLog,
+          });
+        };
         embeddedPostgres = createEmbeddedPostgres();
 
         if (!clusterAlreadyInitialized) {
           try {
             await embeddedPostgres.initialise();
+            // Persist the generated credential the moment initdb created the
+            // data directory (NEXA-749).
+            persistEmbeddedPostgresPassword(dataDir, initPassword);
           } catch (err) {
             logEmbeddedPostgresFailure("initialise", err);
             throw formatEmbeddedPostgresError(err, {
@@ -626,6 +649,11 @@ async function startServerWithDatabaseTeardown(
           });
         }
         embeddedPostgresStartedByThisProcess = true;
+        // This process started the cluster, so it owns the credential: a
+        // pre-NEXA-749 cluster is rotated off the shipped literal here, before
+        // any pool or supervisor restart connects. A cluster that already has
+        // a credential file is left untouched.
+        await rotateEmbeddedPostgresPassword({ dataDir, port });
         embeddedPostgresSupervisor = createEmbeddedPostgresSupervisor({
           initialInstance: embeddedPostgres,
           createInstance: createEmbeddedPostgres,
@@ -659,13 +687,13 @@ async function startServerWithDatabaseTeardown(
       }
     }
   
-    const embeddedAdminConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${port}/postgres`;
+    const embeddedAdminConnectionString = embeddedPostgresUrl({ dataDir, port, database: "postgres" });
     const dbStatus = await ensurePostgresDatabase(embeddedAdminConnectionString, "paperclip");
     if (dbStatus === "created") {
       logger.info("Created embedded PostgreSQL database: paperclip");
     }
   
-    const embeddedConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${port}/paperclip`;
+    const embeddedConnectionString = embeddedPostgresUrl({ dataDir, port, database: "paperclip" });
     const shouldAutoApplyFirstRunMigrations = !clusterAlreadyInitialized || dbStatus === "created";
     if (shouldAutoApplyFirstRunMigrations) {
       logger.info("Detected first-run embedded PostgreSQL setup; applying pending migrations automatically");
