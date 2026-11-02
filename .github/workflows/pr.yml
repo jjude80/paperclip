@@ -15,5 +15,9 @@ jobs:
   ci:
     if: github.event.action != 'labeled' || github.event.label.name == 'profile-ci'
     # Master requires CODEOWNERS review for .github/**, including this workflow.
-    # The AWS runner group permits pr-trusted.yml@refs/heads/master.
-    uses: paperclipai/paperclip/.github/workflows/pr-trusted.yml@master
+    # Call this fork's own trusted workflow at an immutable SHA (see the
+    # rollout note at the top of pr-trusted.yml). Do NOT call upstream
+    # paperclipai/paperclip@master: the fork shares no git ancestor with it, so
+    # every upstream step that runs `node scripts/...` can break on a tree the
+    # fork does not have (NEXA-716). Bump this SHA when pr-trusted.yml changes.
+    uses: jjude80/paperclip/.github/workflows/pr-trusted.yml@e5005f310b9ff08a8c197ef2a9000f8aef4357c1
