@@ -14,6 +14,13 @@ permissions:
 
 jobs:
   review:
+    # Upstream-only. This job needs the repository's dependency graph and the
+    # COMMITPERCLIP_KEY app secret. A fork has neither, so on jjude80/paperclip
+    # it failed at the first step on every PR, before inspecting the diff, and
+    # the permanent red "review" check carried no signal (NEXA-756). Skip it on
+    # forks instead of gating merges on a check that cannot run; a fork that
+    # wants these gates must supply its own app and graph.
+    if: github.repository == 'paperclipai/paperclip'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
