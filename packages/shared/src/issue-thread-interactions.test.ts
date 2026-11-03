@@ -132,6 +132,44 @@ describe("issue thread interaction schemas", () => {
     });
   });
 
+  it("keeps request_confirmation payload.metadata through create and read (NEXA-772)", () => {
+    // A gate reads its marker back after a person answers, so a marker an agent
+    // set must not be dropped by the payload schema on the way in or out. This
+    // was silently stripped before metadata was an explicit field.
+    const created = createIssueThreadInteractionSchema.parse({
+      kind: "request_confirmation",
+      payload: {
+        version: 1,
+        prompt: "Run the approved rotation?",
+        metadata: { rotationOption: "rotate-idle" },
+      },
+    });
+
+    if (created.kind !== "request_confirmation") throw new Error("kind changed");
+    expect(created.payload.metadata).toEqual({ rotationOption: "rotate-idle" });
+
+    // The read path re-parses the stored payload with the same schema.
+    const readBack = requestConfirmationPayloadSchema.parse(created.payload);
+    expect(readBack.metadata).toEqual({ rotationOption: "rotate-idle" });
+  });
+
+  it("rejects request_confirmation metadata that is not a flat string map", () => {
+    expect(() =>
+      requestConfirmationPayloadSchema.parse({
+        version: 1,
+        prompt: "Run the approved rotation?",
+        metadata: { rotationOption: { nested: "rotate-idle" } },
+      }),
+    ).toThrow();
+    expect(() =>
+      requestConfirmationPayloadSchema.parse({
+        version: 1,
+        prompt: "Run the approved rotation?",
+        metadata: { "": "rotate-idle" },
+      }),
+    ).toThrow();
+  });
+
   it("round-trips versioned tool action payload and lifecycle metadata", () => {
     const payload = requestConfirmationPayloadSchema.parse({
       version: 1,

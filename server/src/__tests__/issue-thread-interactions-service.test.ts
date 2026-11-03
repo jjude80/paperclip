@@ -2328,6 +2328,55 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     })).rejects.toThrow("A decline reason is required for this confirmation");
   });
 
+  it("stores and returns request_confirmation payload.metadata (NEXA-772)", async () => {
+    // The gate that reads this marker runs after the person answers, so the key
+    // has to survive both the write and the hydrate-on-read path. Before this,
+    // an unknown payload key was dropped by the validator with no error.
+    const companyId = randomUUID();
+    const goalId = randomUUID();
+    const issueId = randomUUID();
+
+    await db.insert(companies).values(interactionCompanyRow(companyId));
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false });
+    await db.insert(goals).values({
+      id: goalId,
+      companyId,
+      title: "Confirm a gated action",
+      level: "task",
+      status: "active",
+    });
+    await db.insert(issues).values(parentIssueRow(issueId, companyId, goalId));
+
+    const created = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_confirmation",
+      payload: {
+        version: 1,
+        prompt: "Run the approved rotation?",
+        metadata: { rotationOption: "rotate-idle" },
+      },
+    }, {
+      userId: "local-board",
+    });
+
+    const [storedRow] = await db
+      .select()
+      .from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.id, created.id));
+    expect((storedRow!.payload as { metadata?: unknown }).metadata).toEqual({
+      rotationOption: "rotate-idle",
+    });
+
+    const listed = await interactionsSvc.listForIssue(issueId);
+    const readBack = listed.find((interaction) => interaction.id === created.id);
+    if (readBack?.kind !== "request_confirmation") {
+      throw new Error("expected the created request_confirmation back");
+    }
+    expect(readBack.payload.metadata).toEqual({ rotationOption: "rotate-idle" });
+  });
+
   it("reopens an in-review issue before waking the assignee after rejection", async () => {
     const { companyId, issueId } = await seedConfirmationIssue(
       "Continue after review rejection",

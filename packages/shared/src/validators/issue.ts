@@ -1613,6 +1613,15 @@ export const requestConfirmationSecretProposalPayloadSchema = z.object({
   expiresAt: z.string().datetime({ offset: true }),
 });
 
+// A small, bounded string map for values a gate must read back verbatim. It is
+// deliberately flat: a nested structure would drift back into "the schema does
+// not know this key, so it is dropped".
+export const requestConfirmationMetadataSchema = z
+  .record(z.string().trim().min(1).max(64), z.string().max(2000))
+  .refine((value) => Object.keys(value).length <= 32, {
+    message: "metadata may hold at most 32 keys",
+  });
+
 export const requestConfirmationPayloadSchema = z.object({
   version: z.literal(1),
   prompt: z.string().trim().min(1).max(1000),
@@ -1630,6 +1639,12 @@ export const requestConfirmationPayloadSchema = z.object({
     .optional(),
   detailsMarkdown: z.string().max(20000).nullable().optional(),
   supersedeOnUserComment: z.boolean().optional(),
+  // Machine-readable markers that a gate has to read back after a person
+  // answers. Kept as an explicit, typed field rather than relying on unknown
+  // keys: object schemas strip unknown keys silently, so a marker an agent put
+  // in the payload used to vanish on create and the accepted card authorised
+  // nothing (NEXA-772).
+  metadata: requestConfirmationMetadataSchema.nullable().optional(),
   target: requestConfirmationTargetSchema.nullable().optional(),
   toolAction: requestConfirmationToolActionPayloadSchema.optional(),
   secretProposal: requestConfirmationSecretProposalPayloadSchema.optional(),
