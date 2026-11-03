@@ -1958,7 +1958,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     expect(rows[0]?.idempotencyKey).toBe("run-1:questionnaire");
   });
 
-  it("supersedes older pending confirmations from the same agent without crossing agent or kind", async () => {
+  it("supersedes only a same-subject older confirmation without crossing agent or kind", async () => {
     const { companyId, issueId } = await seedConfirmationIssue("Newer confirmation supersedes older");
     const firstAgentId = randomUUID();
     const secondAgentId = randomUUID();
@@ -1970,7 +1970,12 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     const older = await interactionsSvc.create({ id: issueId, companyId }, {
       kind: "request_confirmation",
       idempotencyKey: "confirmation:first:older",
-      payload: { version: 1, prompt: "Approve the older draft?" },
+      payload: { version: 1, prompt: "Approve the draft?" },
+    }, { agentId: firstAgentId });
+    const unrelated = await interactionsSvc.create({ id: issueId, companyId }, {
+      kind: "request_confirmation",
+      idempotencyKey: "confirmation:first:unrelated",
+      payload: { version: 1, prompt: "Rotate the signing secret?" },
     }, { agentId: firstAgentId });
     const otherKind = await interactionsSvc.create({ id: issueId, companyId }, {
       kind: "request_checkbox_confirmation",
@@ -1984,12 +1989,12 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     const otherAgent = await interactionsSvc.create({ id: issueId, companyId }, {
       kind: "request_confirmation",
       idempotencyKey: "confirmation:second",
-      payload: { version: 1, prompt: "Approve the second agent's draft?" },
+      payload: { version: 1, prompt: "Approve the draft?" },
     }, { agentId: secondAgentId });
     const replacement = await interactionsSvc.create({ id: issueId, companyId }, {
       kind: "request_confirmation",
       idempotencyKey: "confirmation:first:newer",
-      payload: { version: 1, prompt: "Approve the newer draft?" },
+      payload: { version: 1, prompt: "Approve the draft?" },
     }, { agentId: firstAgentId });
 
     const interactions = await interactionsSvc.listForIssue(issueId);
@@ -2002,8 +2007,12 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       },
     });
     expect(interactions.find((interaction) => interaction.id === replacement.id)?.status).toBe("pending");
+    // A differently-worded request from the same agent is a different decision
+    // and must stay in the owner's queue (NEXA-773).
+    expect(interactions.find((interaction) => interaction.id === unrelated.id)?.status).toBe("pending");
     expect(interactions.find((interaction) => interaction.id === otherAgent.id)?.status).toBe("pending");
     expect(interactions.find((interaction) => interaction.id === otherKind.id)?.status).toBe("pending");
+    expect(replacement.supersededInteractionIds).toEqual([older.id]);
   });
 
   it("supersedes an agent's own older pending ask_user_questions without crossing agent, kind, or issue", async () => {
@@ -2166,6 +2175,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
 
     const firstAgentIds = [randomUUID(), randomUUID(), randomUUID()];
     const secondAgentIds = [randomUUID(), randomUUID()];
+    const unrelatedId = randomUUID();
     const checkboxId = randomUUID();
     await db.insert(issueThreadInteractions).values([
       ...firstAgentIds.map((id, index) => ({
@@ -2176,7 +2186,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         status: "pending",
         continuationPolicy: "wake_assignee",
         createdByAgentId: firstAgentId,
-        payload: { version: 1 as const, prompt: `First agent draft ${index + 1}` },
+        payload: { version: 1 as const, prompt: "Approve the draft?" },
         createdAt: new Date(`2026-07-01T12:0${index}:00.000Z`),
         updatedAt: new Date(`2026-07-01T12:0${index}:00.000Z`),
       })),
@@ -2188,10 +2198,22 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         status: "pending",
         continuationPolicy: "wake_assignee",
         createdByAgentId: secondAgentId,
-        payload: { version: 1 as const, prompt: `Second agent draft ${index + 1}` },
+        payload: { version: 1 as const, prompt: "Approve the second agent's draft?" },
         createdAt: new Date(`2026-07-01T13:0${index}:00.000Z`),
         updatedAt: new Date(`2026-07-01T13:0${index}:00.000Z`),
       })),
+      {
+        id: unrelatedId,
+        companyId,
+        issueId,
+        kind: "request_confirmation",
+        status: "pending",
+        continuationPolicy: "wake_assignee",
+        createdByAgentId: firstAgentId,
+        payload: { version: 1 as const, prompt: "Rotate the signing secret?" },
+        createdAt: new Date("2026-07-01T12:59:00.000Z"),
+        updatedAt: new Date("2026-07-01T12:59:00.000Z"),
+      },
       {
         id: checkboxId,
         companyId,
@@ -2230,6 +2252,9 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       },
     });
     expect(interactions.find((interaction) => interaction.id === secondAgentIds[1])?.status).toBe("pending");
+    // A different subject on the same issue is not a duplicate and survives the
+    // restart sweep (NEXA-773).
+    expect(interactions.find((interaction) => interaction.id === unrelatedId)?.status).toBe("pending");
     expect(interactions.find((interaction) => interaction.id === checkboxId)?.status).toBe("pending");
   });
 

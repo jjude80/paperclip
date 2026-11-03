@@ -958,6 +958,28 @@ function buildSupersededByNewerRequestResult(replacementInteractionId: string) {
   } as const;
 }
 
+// Two confirmations are siblings only when they ask about the same subject.
+// Superseding by kind alone silently expires unrelated decisions: raising a
+// signing-secret rotation card once voided a 21-hour-old merge approval on the
+// same issue (NEXA-773). A targeted confirmation is identified by its target;
+// a free-form one by its normalised prompt and detail text.
+function requestConfirmationSubjectKey(payload: unknown): string | null {
+  const parsed = requestConfirmationPayloadSchema.safeParse(payload);
+  if (!parsed.success) return null;
+  const data = parsed.data;
+  const target = data.target;
+  if (target) {
+    const identity =
+      target.type === "issue_document"
+        ? `${target.issueId ?? ""}:${target.documentId ?? target.key}`
+        : target.key;
+    return `target:${target.type}:${identity}`;
+  }
+  const prompt = data.prompt.trim().replace(/\s+/g, " ").toLowerCase();
+  const details = (data.detailsMarkdown ?? "").trim();
+  return `prompt:${prompt}\n${details}`;
+}
+
 // An agent that posts a fresh ask_user_questions while its own earlier ones on
 // the same issue are still pending has replaced them — the newer card carries
 // the real ask, so the stale siblings auto-expire (PAP-437). Mirrors the
@@ -3338,7 +3360,12 @@ export function issueThreadInteractionService(
       }> = [];
       for (const row of rows) {
         if (!row.createdByAgentId) continue;
-        const groupKey = `${row.companyId}:${row.issueId}:${row.kind}:${row.createdByAgentId}`;
+        // Only pile-ups of the same request subject are superseded. An
+        // unrelated confirmation on the same issue must survive a restart
+        // (NEXA-773); when the subject cannot be read, key on the row itself so
+        // it is never treated as a duplicate.
+        const subjectKey = requestConfirmationSubjectKey(row.payload);
+        const groupKey = `${row.companyId}:${row.issueId}:${row.kind}:${row.createdByAgentId}:${subjectKey ?? `row:${row.id}`}`;
         const newest = newestByGroup.get(groupKey);
         if (!newest) {
           newestByGroup.set(groupKey, row);
@@ -3530,7 +3557,7 @@ export function issueThreadInteractionService(
           }
           const interaction = hydrateInteraction(existing);
           await enqueueIssueInteractionChatPublications(db, interaction);
-          return interaction;
+          return Object.assign(interaction, { supersededInteractionIds: [] });
         }
       }
 
@@ -3772,16 +3799,11 @@ export function issueThreadInteractionService(
             data.kind === "ask_user_questions"
               ? buildSupersededByNewerInteractionResult(row.id)
               : buildSupersededByNewerRequestResult(row.id);
-          const supersededRows = await tx
-            .update(issueThreadInteractions)
-            .set({
-              status: "expired",
-              result: supersededResult,
-              resolvedByAgentId: actor.agentId,
-              resolvedByUserId: actor.userId ?? null,
-              resolvedAt: now,
-              updatedAt: now,
-            })
+          // The issue row is locked FOR UPDATE above, so this read-then-write
+          // cannot race another create on the same issue.
+          const pendingSiblings = await tx
+            .select()
+            .from(issueThreadInteractions)
             .where(
               and(
                 eq(issueThreadInteractions.companyId, issue.companyId),
@@ -3790,10 +3812,36 @@ export function issueThreadInteractionService(
                 eq(issueThreadInteractions.createdByAgentId, actor.agentId),
                 eq(issueThreadInteractions.status, "pending"),
                 ne(issueThreadInteractions.id, row.id),
-
               ),
+            );
+          const newConfirmationSubjectKey =
+            data.kind === "request_confirmation"
+              ? requestConfirmationSubjectKey(data.payload)
+              : null;
+          const supersededIds = pendingSiblings
+            .filter(
+              (candidate) =>
+                data.kind !== "request_confirmation" ||
+                (newConfirmationSubjectKey !== null &&
+                  requestConfirmationSubjectKey(candidate.payload) ===
+                    newConfirmationSubjectKey),
             )
-            .returning();
+            .map((candidate) => candidate.id);
+          const supersededRows =
+            supersededIds.length > 0
+              ? await tx
+                  .update(issueThreadInteractions)
+                  .set({
+                    status: "expired",
+                    result: supersededResult,
+                    resolvedByAgentId: actor.agentId,
+                    resolvedByUserId: actor.userId ?? null,
+                    resolvedAt: now,
+                    updatedAt: now,
+                  })
+                  .where(inArray(issueThreadInteractions.id, supersededIds))
+                  .returning()
+              : [];
           for (const supersededRow of supersededRows) {
             await resolveLinkedToolActionRequests(tx, supersededRow, {
               status: "expired",
@@ -3847,7 +3895,7 @@ export function issueThreadInteractionService(
         }
         const interaction = hydrateInteraction(existing);
         await enqueueIssueInteractionChatPublications(db, interaction);
-        return interaction;
+        return Object.assign(interaction, { supersededInteractionIds: [] });
       }
 
       await touchIssue(db, issue.id);
@@ -3862,7 +3910,11 @@ export function issueThreadInteractionService(
         interactionKind: interaction.kind,
         usedDeprecatedResolverPolicyAlias,
       });
-      return interaction;
+      // Tell the caller exactly which sibling cards this create expired instead
+      // of silently removing a decision from the owner's queue (NEXA-773).
+      return Object.assign(interaction, {
+        supersededInteractionIds: superseded.map((candidate) => candidate.id),
+      });
     },
 
     acceptInteraction: async (
