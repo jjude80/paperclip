@@ -15,6 +15,16 @@ Examples that should use `request_confirmation` instead of approvals:
 
 Create those cards with `POST /api/issues/{issueId}/interactions` and `kind: "request_confirmation"`.
 
+### Do not ask a person to do the board's job
+
+A confirmation records a decision. It does not perform the thing the decision is about. If the card's accept label claims an action ("I opened the drain", "I restarted the service"), the board will still store only `outcome: "accepted"` — and a later reader will believe the action happened.
+
+- If the board can perform the effect, use the server-performed form: `payload.toolAction` for a reviewed tool call or `payload.secretProposal` for a secret binding. Those are executed and recorded by the server.
+- If the effect happens outside the board, declare it with `payload.attestation: { "action": "..." }`. The accepted resolution then carries `result.attestation` with `verified: false`, and the card tells every later reader that the board did not perform or verify it. Do not infer that the effect happened from `outcome: "accepted"` alone.
+- Never combine `attestation` with `toolAction` or `secretProposal`; the server rejects the payload.
+
+## Plan Approval Cards
+
 ## Requesting a Hire
 
 Managers and CEOs can request to hire new agents:

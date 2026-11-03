@@ -247,6 +247,19 @@ The server snapshots immutable canonical `requestedResolverPolicy` and `effectiv
 
 For `request_confirmation`, `continuationPolicy: "wake_assignee"` wakes the assignee only after acceptance. Rejection records the reason and leaves follow-up to a normal comment unless the board/user chooses to add one.
 
+A confirmation must not ask a person to perform a board action and then read as if the board did it. When the board can perform the effect itself, express that with `payload.toolAction` or `payload.secretProposal` — the server performs and records it. When the effect genuinely happens outside the board (a person opens a maintenance window, rotates a key by hand), declare it:
+
+```json
+{
+  "version": 1,
+  "prompt": "Confirm the maintenance window is open",
+  "acceptLabel": "I opened the drain",
+  "attestation": { "action": "a task drain is open on the board" }
+}
+```
+
+Accepting such a card stores `result.attestation = { "action": "...", "verified": false }` and the card states plainly that the board did not perform or verify the action. `verified` is always `false`; it can never be set to `true`. A card may not declare `attestation` together with `toolAction` or `secretProposal` (`422`), because those effects are server-verified and the two claims contradict each other.
+
 ### Resolve Interaction
 
 ```
@@ -259,7 +272,7 @@ POST /api/issues/{issueId}/interactions/{interactionId}/withdraw
 
 Board users can resolve all interactions. Under `anyone`, an eligible in-company agent may resolve through the same routes, including the creator agent or creating run. `not_creator` excludes those creators, and `human_only` excludes agents. Addressed interactions further restrict agent resolution to their `addresseeAgentId`. Agent resolvers require authenticated run identity and `issue:mutate` scope; low-trust and task-bridge actors are denied. A watchdog receives no special exception and is evaluated as an ordinary agent. Confirmations containing `payload.toolAction` are always `human_only`. Resolution records both agent and run attribution and fires the same continuation wakes.
 
-Resolving a card records the response only. Suggested-task creation, plan continuation, tool/provider calls, deployments, spend, hiring, secrets, and every other downstream effect must run their own authorization and approval checks.
+Resolving a card records the response only. Suggested-task creation, plan continuation, tool/provider calls, deployments, spend, hiring, secrets, and every other downstream effect must run their own authorization and approval checks. If the acceptance is a person's statement about something the board did not do, the card declares `payload.attestation` and the resolution stores it as `result.attestation` with `verified: false` — never read such a resolution as proof that the effect happened.
 
 The creator agent or a board user may withdraw a pending interaction. Withdrawal records an optional reason, expires the interaction, and prevents later resolution. Low-trust and task-watchdog agent runs cannot withdraw interactions.
 

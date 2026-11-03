@@ -274,6 +274,17 @@ function requestConfirmationResumeFailure(interaction: IssueThreadInteraction) {
   return interaction.result?.resumeFailure ?? null;
 }
 
+/**
+ * An accepted confirmation whose effect happened outside the board records the
+ * responder's statement, not a verified action (NEXA-675). The board performed
+ * nothing here, so the card must say so instead of reading like a completed
+ * maintenance action.
+ */
+function requestConfirmationAttestation(interaction: IssueThreadInteraction) {
+  if (interaction.kind !== "request_confirmation") return null;
+  return interaction.result?.attestation ?? null;
+}
+
 function planStatusClasses(
   status: IssueThreadInteraction["status"],
   resumeFailure?: ReturnType<typeof requestConfirmationResumeFailure>,
@@ -3659,6 +3670,7 @@ export function IssueThreadInteractionCard({
     ? secretProposalStatusClasses(secretProposalState)
     : null;
   const resumeFailure = requestConfirmationResumeFailure(interaction);
+  const attestation = requestConfirmationAttestation(interaction);
   const planStyles = isPlan
     ? planStatusClasses(
         interaction.status,
@@ -3857,6 +3869,16 @@ export function IssueThreadInteractionCard({
             ) : null}
             {interaction.status === "pending" ? (
               <InteractionAudienceLine audience={audience} className="mt-3" />
+            ) : null}
+            {attestation ? (
+              <p
+                data-testid="interaction-attestation-note"
+                className="mt-3 max-w-3xl rounded-sm border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm leading-6 text-amber-900 dark:text-amber-100"
+              >
+                Accepted. This records the responder&apos;s statement that{" "}
+                <span className="font-semibold">{attestation.action}</span>. The board
+                did not perform or verify it.
+              </p>
             ) : null}
           </div>
 

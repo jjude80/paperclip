@@ -175,6 +175,69 @@ describe("issue thread interaction schemas", () => {
       .toBeUndefined();
   });
 
+  it("records a human attestation for an action performed outside the board", () => {
+    const payload = requestConfirmationPayloadSchema.parse({
+      version: 1,
+      prompt: "Confirm the maintenance window is open",
+      acceptLabel: "I opened the drain",
+      attestation: { action: "a drain is open on the board" },
+    });
+    expect(payload.attestation).toEqual({
+      action: "a drain is open on the board",
+    });
+
+    const result = requestConfirmationResultSchema.parse({
+      version: 1,
+      outcome: "accepted",
+      attestation: { action: "a drain is open on the board", verified: false },
+    });
+    expect(result.attestation).toEqual({
+      action: "a drain is open on the board",
+      verified: false,
+    });
+
+    // The stored marker can never claim verification.
+    expect(() =>
+      requestConfirmationResultSchema.parse({
+        version: 1,
+        outcome: "accepted",
+        attestation: { action: "a drain is open on the board", verified: true },
+      }),
+    ).toThrow();
+  });
+
+  it("rejects an attestation alongside a server-performed effect", () => {
+    const toolAction = {
+      version: 1 as const,
+      actionRequestId: "11111111-1111-4111-8111-111111111111",
+      invocationId: "22222222-2222-4222-8222-222222222222",
+      toolName: "send_email",
+      toolDisplayName: "Send email",
+      connectionId: "33333333-3333-4333-8333-333333333333",
+      applicationId: "44444444-4444-4444-8444-444444444444",
+      appDisplayName: "Gmail",
+      risk: "write" as const,
+      previewMarkdown: "Send an email.",
+      argumentsSummaryJson: "{}",
+      argumentsHash: "hash",
+      expiresAt: "2026-07-12T16:00:00.000Z",
+    };
+
+    const parsed = requestConfirmationPayloadSchema.safeParse({
+      version: 1,
+      prompt: "Approve send_email?",
+      toolAction,
+      attestation: { action: "I sent the email" },
+    });
+
+    expect(parsed.success).toBe(false);
+    expect(
+      parsed.success
+        ? []
+        : parsed.error.issues.map((issue) => [issue.path.join("."), issue.message]),
+    ).toEqual([["attestation", expect.stringContaining("cannot also declare")]]);
+  });
+
   it("parses superseded confirmation results with a replacement pointer", () => {
     const result = requestConfirmationResultSchema.parse({
       version: 1,
