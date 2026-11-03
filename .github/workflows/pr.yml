@@ -14,8 +14,11 @@ permissions:
 jobs:
   ci:
     if: github.event.action != 'labeled' || github.event.label.name == 'profile-ci'
-    # Upstream master requires CODEOWNERS review for .github/**, including this workflow.
-    # The fork's master does not require review; its active ruleset only blocks
-    # deletion and non-fast-forward pushes (see .github/CODEOWNERS).
-    # The AWS runner group permits pr-trusted.yml@refs/heads/master.
-    uses: paperclipai/paperclip/.github/workflows/pr-trusted.yml@master
+    # Upstream master requires CODEOWNERS review for .github/**, so the ref that
+    # judges this PR cannot be written by anyone who can push this fork. The
+    # fork's own master has no review requirement; its active ruleset only
+    # blocks deletion and non-fast-forward pushes (see .github/CODEOWNERS).
+    # Pin it to an immutable commit instead of the moving @master ref: upstream's
+    # newer revisions run `node scripts/...` checks against files this fork does
+    # not have (NEXA-716). Bump the SHA deliberately when adopting upstream CI.
+    uses: paperclipai/paperclip/.github/workflows/pr-trusted.yml@9b7d5b35ebe8ac1a7c6c98c7bd3cb57e3b698a00
