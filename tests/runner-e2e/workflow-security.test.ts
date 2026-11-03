@@ -3,8 +3,11 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 
 const repositoryRoot = path.resolve(import.meta.dirname, "../..");
-// PR #13470 uses the code-owner-reviewed default branch for this first-party workflow.
-const ordinaryPrTrustedWorkflowRevision = "master";
+// PR #13470 uses the code-owner-reviewed default branch for this first-party
+// workflow. An immutable 40-hex commit on that branch is equally unreachable
+// for a fork push, so it is allowed too; a fork path or a branch/tag ref stays
+// rejected (NEXA-716).
+const ordinaryPrTrustedWorkflowRevision = /^(?:master|[0-9a-f]{40})$/u;
 const fullStackTestNeeds =
   /needs:\s*\[\s*authorize,\s*target_lock,\s*catalog,\s*daytona_image,\s*build_runner_artifacts,\s*build_remote_provider_pack,?\s*\]/u;
 const buildRunnerNeeds =
@@ -57,7 +60,7 @@ describe("public repository paid workflow security", () => {
     expect(manual).toContain('docker logout ghcr.io');
   });
 
-  it("uses the reviewed master branch for the first-party trusted PR workflow", async () => {
+  it("uses a reviewed upstream ref for the first-party trusted PR workflow", async () => {
     const ordinaryPrWorkflow = await readFile(
       path.join(repositoryRoot, ".github/workflows/pr.yml"),
       "utf8",
@@ -72,7 +75,7 @@ describe("public repository paid workflow security", () => {
     expect(trustedWorkflowCalls[0]?.[1]).toBe(
       "paperclipai/paperclip/.github/workflows/pr-trusted.yml",
     );
-    expect(trustedWorkflowCalls[0]?.[2]).toBe(
+    expect(trustedWorkflowCalls[0]?.[2]).toMatch(
       ordinaryPrTrustedWorkflowRevision,
     );
   });
