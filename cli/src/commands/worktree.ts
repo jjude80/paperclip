@@ -71,6 +71,7 @@ import {
   resolveEmbeddedPostgresInitialisationPassword,
   resolveEmbeddedPostgresDataDir,
   rotateEmbeddedPostgresPassword,
+  ensureEmbeddedPostgresScramAuth,
 } from "@paperclipai/db";
 import type { Command } from "commander";
 import { ensureAgentJwtSecret, ensureToolActionSigningSecret, loadPaperclipEnvFile, mergePaperclipEnvEntries, readPaperclipEnvEntries, resolvePaperclipEnvFile } from "../config/env.js";
@@ -1187,6 +1188,9 @@ export async function ensureEmbeddedPostgres(
   // This process started the cluster, so it owns the credential and may
   // rotate a pre-NEXA-749 cluster off the shipped literal.
   await rotateEmbeddedPostgresPassword({ dataDir, port });
+  // Same ownership window: move a legacy cluster's pg_hba.conf off cleartext
+  // password auth once the credential is provably SCRAM (NEXA-755).
+  await ensureEmbeddedPostgresScramAuth({ dataDir, port });
 
   return {
     port,
