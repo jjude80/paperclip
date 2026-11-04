@@ -42,10 +42,18 @@ export {
 } from "./embedded-postgres-native.js";
 export {
   EMBEDDED_POSTGRES_USER,
+  EMBEDDED_POSTGRES_ADMIN_USER,
   LEGACY_EMBEDDED_POSTGRES_PASSWORD,
   EMBEDDED_POSTGRES_PASSWORD_FILENAME,
+  EMBEDDED_POSTGRES_ADMIN_PASSWORD_FILENAME,
   embeddedPostgresPasswordPath,
+  embeddedPostgresAdminPasswordPath,
   embeddedPostgresUrl,
+  embeddedPostgresAdminUrl,
+  resolveEmbeddedPostgresAdminCredentials,
+  hasEmbeddedPostgresAdminPassword,
+  ensureEmbeddedPostgresAdminRole,
+  restrictEmbeddedPostgresApplicationRole,
   resolveEmbeddedPostgresDataDir,
   resolveEmbeddedPostgresUrl,
   resolveEmbeddedPostgresCredentials,
@@ -60,12 +68,17 @@ export {
   ensureEmbeddedPostgresScramAuth,
   type EmbeddedPostgresCredentials,
   type EmbeddedPostgresCredentialSource,
+  type EmbeddedPostgresAdminCredentials,
   type EmbeddedPostgresUrlOptions,
   type ResolvedEmbeddedPostgresUrl,
   type RotateEmbeddedPostgresPasswordOptions,
   type CleartextAuthRewritePlan,
   type EnsureEmbeddedPostgresScramAuthOptions,
   type EmbeddedPostgresScramAuthOutcome,
+  type EnsureEmbeddedPostgresAdminRoleOptions,
+  type EmbeddedPostgresAdminRoleOutcome,
+  type RestrictEmbeddedPostgresApplicationRoleOptions,
+  type EmbeddedPostgresApplicationRoleOutcome,
 } from "./embedded-postgres-credentials.js";
 export { loadWithoutEmbeddedPostgresExitHooks } from "./embedded-postgres-lifecycle.js";
 export { issueRelations } from "./schema/issue_relations.js";

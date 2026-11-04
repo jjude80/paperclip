@@ -72,6 +72,8 @@ import {
   resolveEmbeddedPostgresDataDir,
   rotateEmbeddedPostgresPassword,
   ensureEmbeddedPostgresScramAuth,
+  ensureEmbeddedPostgresAdminRole,
+  restrictEmbeddedPostgresApplicationRole,
 } from "@paperclipai/db";
 import type { Command } from "commander";
 import { ensureAgentJwtSecret, ensureToolActionSigningSecret, loadPaperclipEnvFile, mergePaperclipEnvEntries, readPaperclipEnvEntries, resolvePaperclipEnvFile } from "../config/env.js";
@@ -1191,6 +1193,10 @@ export async function ensureEmbeddedPostgres(
   // Same ownership window: move a legacy cluster's pg_hba.conf off cleartext
   // password auth once the credential is provably SCRAM (NEXA-755).
   await ensureEmbeddedPostgresScramAuth({ dataDir, port });
+  // Control 2: a separate administrative login first, then drop
+  // SUPERUSER/CREATEROLE from the role the board uses (NEXA-755).
+  await ensureEmbeddedPostgresAdminRole({ dataDir, port });
+  await restrictEmbeddedPostgresApplicationRole({ dataDir, port });
 
   return {
     port,

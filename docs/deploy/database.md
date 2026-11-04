@@ -50,6 +50,32 @@ with the value from the password file (SCRAM) instead. Restoring a pre-upgrade
 `pg_hba.conf` reintroduces the cleartext rule; the next owner start rewrites it
 again.
 
+- On the same owner-only start the server creates a separate administrative
+  role, `paperclip_admin`, whose random password is stored at
+  `~/.paperclip/instances/default/db/embedded-postgres-admin.password` (mode
+  `0600`, same handling as the application credential), and only then removes
+  `CREATEROLE` from `paperclip`. It also attempts to remove `SUPERUSER`.
+  `CREATEDB` is kept because first-run database creation still uses it.
+- **PostgreSQL 18 limitation:** `paperclip` is normally the role `initdb`
+  created, which makes it the *bootstrap superuser*. PostgreSQL refuses to
+  remove that role's `SUPERUSER` attribute ("The bootstrap superuser must have
+  the SUPERUSER attribute", SQLSTATE `0A000`; the glossary states its superuser
+  status cannot be removed). On such a cluster the server keeps `SUPERUSER`,
+  logs a warning, and reports that only `CREATEROLE` was removed. Reaching true
+  least privilege for the application role requires a cluster initialised with
+  a different bootstrap superuser and a data migration, not an `ALTER ROLE`.
+- The demotion is verified with a fresh application connection, and the
+  administrative role is used to make the change. If verification fails, the
+  administrative role restores the previous attributes before the call throws.
+  The administrative credential keeps an administrative path available and is
+  what makes the change reversible; keep it with the data directory and never
+  commit it.
+- Operator-visible consequences: scripts that relied on `paperclip` having
+  `CREATEROLE` will fail. Use `paperclip_admin` for administrative work (role
+  management, untrusted extension installation, restoring a backup that creates
+  one). Trusted extensions such as `pg_trgm` and `fuzzystrmatch` still install
+  as the application role.
+
 ## 2. Local PostgreSQL (Docker)
 
 For a full PostgreSQL server locally:

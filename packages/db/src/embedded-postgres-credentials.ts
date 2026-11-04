@@ -40,6 +40,18 @@ import postgres from "postgres";
 export const EMBEDDED_POSTGRES_USER = "paperclip";
 
 /**
+ * Separate administrative role (NEXA-755, control 2).
+ *
+ * The application role is the bootstrap superuser `initdb` creates. PostgreSQL
+ * 18 forbids removing `SUPERUSER` from that role, so the application role keeps
+ * it on an existing cluster (see `restrictEmbeddedPostgresApplicationRole`).
+ * This role is still required: it is an independent privileged credential that
+ * survives losing the application credential, and it is the intended bootstrap
+ * superuser for clusters that are rebuilt with least privilege from the start.
+ */
+export const EMBEDDED_POSTGRES_ADMIN_USER = "paperclip_admin";
+
+/**
  * The literal shipped by every build before NEXA-749 was fixed. It is kept only
  * so a pre-existing cluster can be rotated onto a generated password; no
  * connection path may use it once a credential file exists.
@@ -47,6 +59,7 @@ export const EMBEDDED_POSTGRES_USER = "paperclip";
 export const LEGACY_EMBEDDED_POSTGRES_PASSWORD = "paperclip";
 
 export const EMBEDDED_POSTGRES_PASSWORD_FILENAME = "embedded-postgres.password";
+export const EMBEDDED_POSTGRES_ADMIN_PASSWORD_FILENAME = "embedded-postgres-admin.password";
 
 const ROTATION_LOCK_FILENAME = ".embedded-postgres-rotation.lock";
 const ROTATION_LOCK_STALE_MS = 60_000;
@@ -59,6 +72,11 @@ export type EmbeddedPostgresCredentials = {
   user: string;
   password: string;
   source: EmbeddedPostgresCredentialSource;
+};
+
+export type EmbeddedPostgresAdminCredentials = {
+  user: string;
+  password: string;
 };
 
 export type EmbeddedPostgresUrlOptions = {
@@ -88,6 +106,10 @@ export function embeddedPostgresPasswordPath(dataDir: string): string {
   return path.resolve(dataDir, EMBEDDED_POSTGRES_PASSWORD_FILENAME);
 }
 
+export function embeddedPostgresAdminPasswordPath(dataDir: string): string {
+  return path.resolve(dataDir, EMBEDDED_POSTGRES_ADMIN_PASSWORD_FILENAME);
+}
+
 function isCredentialFilePrivate(filePath: string): boolean {
   try {
     return (statSync(filePath).mode & 0o077) === 0;
@@ -105,8 +127,7 @@ function repairCredentialFileMode(filePath: string): void {
   );
 }
 
-function readPasswordFile(dataDir: string): string | null {
-  const filePath = embeddedPostgresPasswordPath(dataDir);
+function readPasswordFileAt(filePath: string): string | null {
   if (!existsSync(filePath)) return null;
 
   const password = readFileSync(filePath, "utf8").trim();
@@ -117,6 +138,10 @@ function readPasswordFile(dataDir: string): string | null {
   }
   repairCredentialFileMode(filePath);
   return password;
+}
+
+function readPasswordFile(dataDir: string): string | null {
+  return readPasswordFileAt(embeddedPostgresPasswordPath(dataDir));
 }
 
 /**
@@ -142,8 +167,7 @@ export function hasEmbeddedPostgresPassword(dataDir: string): boolean {
   return existsSync(embeddedPostgresPasswordPath(dataDir));
 }
 
-function writePasswordFile(dataDir: string, password: string): void {
-  const filePath = embeddedPostgresPasswordPath(dataDir);
+function writePasswordFileAt(filePath: string, password: string): void {
   const directory = path.dirname(filePath);
   if (!existsSync(directory)) mkdirSync(directory, { recursive: true, mode: 0o700 });
 
@@ -151,6 +175,10 @@ function writePasswordFile(dataDir: string, password: string): void {
   writeFileSync(temporaryPath, `${password}\n`, { mode: PASSWORD_FILE_MODE });
   chmodSync(temporaryPath, PASSWORD_FILE_MODE);
   renameSync(temporaryPath, filePath);
+}
+
+function writePasswordFile(dataDir: string, password: string): void {
+  writePasswordFileAt(embeddedPostgresPasswordPath(dataDir), password);
 }
 
 export function generateEmbeddedPostgresPassword(): string {
@@ -182,12 +210,32 @@ export function persistEmbeddedPostgresPassword(dataDir: string, password: strin
   writePasswordFile(dataDir, password);
 }
 
+/**
+ * Credentials for the administrative role, or `null` while the cluster has no
+ * admin credential yet. A cluster that predates control 2 has no admin path, so
+ * callers must create one before removing the application role's superuser.
+ */
+export function resolveEmbeddedPostgresAdminCredentials(
+  dataDir: string,
+): EmbeddedPostgresAdminCredentials | null {
+  const password = readPasswordFileAt(embeddedPostgresAdminPasswordPath(dataDir));
+  if (!password) return null;
+  return { user: EMBEDDED_POSTGRES_ADMIN_USER, password };
+}
+
+/** True when the cluster has a stored administrative credential. */
+export function hasEmbeddedPostgresAdminPassword(dataDir: string): boolean {
+  return existsSync(embeddedPostgresAdminPasswordPath(dataDir));
+}
+
 function encodeUrlComponent(value: string): string {
   return encodeURIComponent(value);
 }
 
+type UrlCredentials = { user: string; password: string };
+
 function buildUrl(
-  credentials: EmbeddedPostgresCredentials,
+  credentials: UrlCredentials,
   port: number,
   database: string,
 ): string {
@@ -213,6 +261,21 @@ export function resolveEmbeddedPostgresUrl(
 ): ResolvedEmbeddedPostgresUrl {
   const credentials = resolveEmbeddedPostgresCredentials(options.dataDir);
   return { url: buildUrl(credentials, options.port, options.database), credentials };
+}
+
+/**
+ * Connection URL for the administrative role. Throws when the cluster has no
+ * stored admin credential: an empty password would be a silent misconfiguration
+ * in exactly the path an operator reaches for when something is already wrong.
+ */
+export function embeddedPostgresAdminUrl(options: EmbeddedPostgresUrlOptions): string {
+  const credentials = resolveEmbeddedPostgresAdminCredentials(options.dataDir);
+  if (!credentials) {
+    throw new Error(
+      `No embedded PostgreSQL administrative credential exists at ${embeddedPostgresAdminPasswordPath(options.dataDir)}.`,
+    );
+  }
+  return buildUrl(credentials, options.port, options.database);
 }
 
 async function acquireRotationLock(lockPath: string): Promise<() => void> {
@@ -285,11 +348,7 @@ export async function rotateEmbeddedPostgresPassword(
     }
 
     const legacyUrl = buildUrl(
-      {
-        user: EMBEDDED_POSTGRES_USER,
-        password: LEGACY_EMBEDDED_POSTGRES_PASSWORD,
-        source: "legacy",
-      },
+      { user: EMBEDDED_POSTGRES_USER, password: LEGACY_EMBEDDED_POSTGRES_PASSWORD },
       options.port,
       "postgres",
     );
@@ -313,7 +372,7 @@ export async function rotateEmbeddedPostgresPassword(
       // "succeeded" but left an unusable file must fail here, not on the next
       // board start.
       const verificationUrl = buildUrl(
-        { user: EMBEDDED_POSTGRES_USER, password, source: "file" },
+        { user: EMBEDDED_POSTGRES_USER, password },
         options.port,
         "postgres",
       );
@@ -437,14 +496,19 @@ function writeHbaFileAtomically(filePath: string, contents: string): void {
 }
 
 async function readStoredPasswordVerifier(dataDir: string, port: number): Promise<string | null> {
-  const credentials = resolveEmbeddedPostgresCredentials(dataDir);
+  // Prefer the administrative role (NEXA-755, control 2): once the application
+  // role is no longer a superuser it cannot read `pg_authid`. Falling back to
+  // the application credentials keeps a cluster without an admin path working
+  // exactly as it did before control 2 existed.
+  const admin = resolveEmbeddedPostgresAdminCredentials(dataDir);
+  const credentials: UrlCredentials = admin ?? resolveEmbeddedPostgresCredentials(dataDir);
   const sql = postgres(buildUrl(credentials, port, "postgres"), { max: 1, onnotice: () => {} });
   try {
     // `pg_authid` is superuser-only. A caller that cannot read it gets a clear
     // "unknown" rather than a guess: rewriting the method for a verifier we
     // cannot see is how a cluster gets locked out of itself.
     const rows = await sql<{ rolpassword: string | null }[]>`
-      select rolpassword from pg_authid where rolname = current_user
+      select rolpassword from pg_authid where rolname = ${EMBEDDED_POSTGRES_USER}
     `;
     return rows[0]?.rolpassword ?? null;
   } finally {
@@ -556,4 +620,288 @@ export async function ensureEmbeddedPostgresScramAuth(
   }
 
   return { status: "rewritten", rewrittenLines: plan.rewrittenLines };
+}
+
+export type EnsureEmbeddedPostgresAdminRoleOptions = {
+  dataDir: string;
+  port: number;
+};
+
+export type EmbeddedPostgresAdminRoleOutcome =
+  | { status: "skipped"; reason: "legacy-credential" }
+  | { status: "created" }
+  | { status: "existing" };
+
+function openConnection(credentials: UrlCredentials, port: number, database = "postgres") {
+  return postgres(buildUrl(credentials, port, database), { max: 1, onnotice: () => {} });
+}
+
+async function assertAdminRoleUsable(
+  admin: EmbeddedPostgresAdminCredentials,
+  port: number,
+): Promise<void> {
+  const sql = openConnection(admin, port);
+  try {
+    const rows = await sql<{ rolsuper: boolean; rolcanlogin: boolean }[]>`
+      select rolsuper, rolcanlogin from pg_roles where rolname = current_user
+    `;
+    const role = rows[0];
+    if (!role?.rolcanlogin || !role.rolsuper) {
+      throw new Error(
+        `Embedded PostgreSQL administrative role ${EMBEDDED_POSTGRES_ADMIN_USER} is not a usable superuser login.`,
+      );
+    }
+  } finally {
+    await sql.end({ timeout: 5 }).catch(() => undefined);
+  }
+}
+
+/**
+ * Creates (or repairs) the separate administrative role `paperclip_admin`
+ * (NEXA-755, control 2).
+ *
+ * The caller must be the process that started the cluster, exactly like
+ * `rotateEmbeddedPostgresPassword`. A cluster that still uses the shipped
+ * literal is skipped: the administrative credential must never be created from
+ * a value that ships with the bundle.
+ *
+ * Safety properties:
+ *  - the role is a `LOGIN SUPERUSER` with a generated password, never the
+ *    application role's value;
+ *  - the credential is only written after a fresh connection proves the role is
+ *    a usable superuser, so the file never vouches for an unusable path;
+ *  - a crash between role creation and file write is recoverable on the next
+ *    start while the application role can still manage roles;
+ *  - when the application role can no longer manage roles and the stored admin
+ *    credential is unusable, the call throws instead of guessing: the cluster
+ *    has no verifiable administrative path.
+ */
+export async function ensureEmbeddedPostgresAdminRole(
+  options: EnsureEmbeddedPostgresAdminRoleOptions,
+): Promise<EmbeddedPostgresAdminRoleOutcome> {
+  const application = resolveEmbeddedPostgresCredentials(options.dataDir);
+  if (application.source === "legacy") {
+    return { status: "skipped", reason: "legacy-credential" };
+  }
+
+  const stored = resolveEmbeddedPostgresAdminCredentials(options.dataDir);
+  if (stored) {
+    try {
+      await assertAdminRoleUsable(stored, options.port);
+      return { status: "existing" };
+    } catch {
+      // Fall through and reset the password while the application role still can.
+    }
+  }
+
+  let password: string;
+  const sql = openConnection(application, options.port);
+  try {
+    const roles = await sql<{ manageable: boolean }[]>`
+      select (rolsuper or rolcreaterole) as manageable
+      from pg_roles where rolname = current_user
+    `;
+    if (!roles[0]?.manageable) {
+      throw new Error(
+        `Embedded PostgreSQL administrative role ${EMBEDDED_POSTGRES_ADMIN_USER} is unusable and application role ${EMBEDDED_POSTGRES_USER} can no longer manage roles. ` +
+          `The cluster has no verified administrative path: restore ${embeddedPostgresAdminPasswordPath(options.dataDir)} or use single-user mode.`,
+      );
+    }
+
+    password = generateEmbeddedPostgresPassword();
+    const known = await sql<{ exists: boolean }[]>`
+      select exists(select 1 from pg_roles where rolname = ${EMBEDDED_POSTGRES_ADMIN_USER}) as exists
+    `;
+    const [{ statement }] = known[0]?.exists
+      ? await sql<{ statement: string }[]>`
+          select format(
+            'ALTER ROLE %I WITH LOGIN SUPERUSER PASSWORD %L',
+            ${EMBEDDED_POSTGRES_ADMIN_USER}::text,
+            ${password}::text
+          ) as statement
+        `
+      : await sql<{ statement: string }[]>`
+          select format(
+            'CREATE ROLE %I WITH LOGIN SUPERUSER PASSWORD %L',
+            ${EMBEDDED_POSTGRES_ADMIN_USER}::text,
+            ${password}::text
+          ) as statement
+        `;
+    // Rendered server-side, so the password is a bind parameter and never
+    // appears in query text, a log line, or a statement timeout dump.
+    await sql.unsafe(statement);
+  } finally {
+    await sql.end({ timeout: 5 }).catch(() => undefined);
+  }
+
+  const created: EmbeddedPostgresAdminCredentials = {
+    user: EMBEDDED_POSTGRES_ADMIN_USER,
+    password,
+  };
+  await assertAdminRoleUsable(created, options.port);
+  writePasswordFileAt(embeddedPostgresAdminPasswordPath(options.dataDir), password);
+  return { status: "created" };
+}
+
+export type RestrictEmbeddedPostgresApplicationRoleOptions = {
+  dataDir: string;
+  port: number;
+};
+
+export type EmbeddedPostgresApplicationRoleOutcome =
+  | { status: "restricted" }
+  | { status: "createrole-restricted"; retained: "bootstrap-superuser" }
+  | {
+      status: "skipped";
+      reason: "legacy-credential" | "no-admin-credential" | "application-role-missing";
+    };
+
+/**
+ * The role `initdb` created with `-U` is PostgreSQL's *bootstrap superuser*.
+ * PostgreSQL 18 refuses to remove its `SUPERUSER` attribute ("The bootstrap
+ * superuser must have the SUPERUSER attribute", SQLSTATE 0A000), and the
+ * glossary states that its superuser status cannot be removed. The first role
+ * in a cluster always has OID 10.
+ */
+const BOOTSTRAP_SUPERUSER_OID = 10;
+
+/**
+ * Removes `CREATEROLE` from the application role and removes `SUPERUSER` when
+ * the engine allows it, while keeping `CREATEDB` (first-run
+ * `ensurePostgresDatabase` still creates the board database). This is control 2
+ * of NEXA-755.
+ *
+ * The change is only made after the administrative role is proven usable, and
+ * the administrative role is used to make it, so the role being demoted never
+ * demotes itself. After the change a fresh application connection must connect
+ * and report the demoted attributes; on any failure the administrative role
+ * restores the previous attributes.
+ *
+ * On PostgreSQL 18 the application role is normally the bootstrap superuser, so
+ * `SUPERUSER` cannot be removed. The call then keeps `SUPERUSER` (the engine
+ * forbids it), still removes `CREATEROLE`, and reports
+ * `createrole-restricted` instead of claiming a least-privilege state the
+ * cluster cannot reach.
+ */
+export async function restrictEmbeddedPostgresApplicationRole(
+  options: RestrictEmbeddedPostgresApplicationRoleOptions,
+): Promise<EmbeddedPostgresApplicationRoleOutcome> {
+  const application = resolveEmbeddedPostgresCredentials(options.dataDir);
+  if (application.source === "legacy") {
+    return { status: "skipped", reason: "legacy-credential" };
+  }
+
+  const admin = resolveEmbeddedPostgresAdminCredentials(options.dataDir);
+  if (!admin) {
+    return { status: "skipped", reason: "no-admin-credential" };
+  }
+
+  // Prove the path back before giving anything up. If this throws, nothing has
+  // changed yet and the application role is still the bootstrap superuser.
+  await assertAdminRoleUsable(admin, options.port);
+
+  const applicationSql = openConnection(application, options.port);
+  let current: { rolsuper: boolean; rolcreaterole: boolean; isBootstrap: boolean } | undefined;
+  try {
+    const rows = await applicationSql<{
+      rolsuper: boolean;
+      rolcreaterole: boolean;
+      isBootstrap: boolean;
+    }[]>`
+      select rolsuper, rolcreaterole, oid = ${BOOTSTRAP_SUPERUSER_OID} as "isBootstrap"
+      from pg_roles where rolname = ${EMBEDDED_POSTGRES_USER}
+    `;
+    current = rows[0];
+  } finally {
+    await applicationSql.end({ timeout: 5 }).catch(() => undefined);
+  }
+  if (!current) return { status: "skipped", reason: "application-role-missing" };
+
+  // `SUPERUSER` is untouchable for the bootstrap superuser. Detect it up front
+  // so the steady state is a no-op instead of an error-driven retry on every
+  // start.
+  const superuserRetained = current.rolsuper && current.isBootstrap;
+  if (!current.rolcreaterole && (!current.rolsuper || superuserRetained)) {
+    return superuserRetained
+      ? { status: "createrole-restricted", retained: "bootstrap-superuser" }
+      : { status: "restricted" };
+  }
+
+  const adminSql = openConnection(admin, options.port);
+  let changed = false;
+  try {
+    // CREATEROLE first: it is the attribute that actually narrows what the
+    // application role can grant.
+    if (current.rolcreaterole) {
+      const [{ statement }] = await adminSql<{ statement: string }[]>`
+        select format('ALTER ROLE %I NOCREATEROLE', ${EMBEDDED_POSTGRES_USER}::text) as statement
+      `;
+      await adminSql.unsafe(statement);
+      changed = true;
+    }
+    if (current.rolsuper && !superuserRetained) {
+      const [{ statement }] = await adminSql<{ statement: string }[]>`
+        select format('ALTER ROLE %I NOSUPERUSER', ${EMBEDDED_POSTGRES_USER}::text) as statement
+      `;
+      await adminSql.unsafe(statement);
+      changed = true;
+    }
+
+    // A fresh application connection is the only proof that the board can still
+    // reach its database and that the attributes actually changed.
+    const verification = openConnection(application, options.port);
+    try {
+      const rows = await verification<{ rolsuper: boolean; rolcreaterole: boolean }[]>`
+        select rolsuper, rolcreaterole from pg_roles where rolname = current_user
+      `;
+      const role = rows[0];
+      if (
+        !role ||
+        role.rolcreaterole ||
+        (role.rolsuper && !superuserRetained)
+      ) {
+        throw new Error(
+          `Application role ${EMBEDDED_POSTGRES_USER} still reports SUPERUSER/CREATEROLE after ALTER ROLE.`,
+        );
+      }
+    } finally {
+      await verification.end({ timeout: 5 }).catch(() => undefined);
+    }
+
+    // The administrative path is what makes this reversible; it must still work
+    // after the application role lost its privileges.
+    await assertAdminRoleUsable(admin, options.port);
+  } catch (error) {
+    const cause = error instanceof Error ? error.message : String(error);
+    if (changed) {
+      try {
+        const [{ statement }] = await adminSql<{ statement: string }[]>`
+          select format(
+            'ALTER ROLE %I SUPERUSER CREATEROLE',
+            ${EMBEDDED_POSTGRES_USER}::text
+          ) as statement
+        `;
+        await adminSql.unsafe(statement);
+      } catch (rollbackError) {
+        throw new Error(
+          `Restricting embedded PostgreSQL application role ${EMBEDDED_POSTGRES_USER} failed and the automatic rollback also failed. ` +
+            `Use the administrative credential at ${embeddedPostgresAdminPasswordPath(options.dataDir)} to run ` +
+            `ALTER ROLE ${EMBEDDED_POSTGRES_USER} SUPERUSER CREATEROLE by hand. Cause: ${cause}; rollback error: ${
+              rollbackError instanceof Error ? rollbackError.message : String(rollbackError)
+            }`,
+        );
+      }
+    }
+    throw new Error(
+      `Refused to leave embedded PostgreSQL application role ${EMBEDDED_POSTGRES_USER} restricted: ${
+        changed ? "the change was rolled back via the administrative role. " : ""
+      }Cause: ${cause}`,
+    );
+  } finally {
+    await adminSql.end({ timeout: 5 }).catch(() => undefined);
+  }
+
+  return superuserRetained
+    ? { status: "createrole-restricted", retained: "bootstrap-superuser" }
+    : { status: "restricted" };
 }
