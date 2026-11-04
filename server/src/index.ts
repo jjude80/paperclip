@@ -77,6 +77,7 @@ import {
   resolveEmbeddedPostgresCredentials,
   resolveEmbeddedPostgresInitialisationPassword,
   rotateEmbeddedPostgresPassword,
+  ensureEmbeddedPostgresScramAuth,
   reconcilePendingMigrationHistory,
   formatDatabaseBackupResult,
   runDatabaseBackup,
@@ -654,6 +655,23 @@ async function startServerWithDatabaseTeardown(
         // any pool or supervisor restart connects. A cluster that already has
         // a credential file is left untouched.
         await rotateEmbeddedPostgresPassword({ dataDir, port });
+        // Same owner-only window: a cluster created before NEXA-755 still tells
+        // clients to send a cleartext password. The stored verifier is already
+        // SCRAM (the rotation above guarantees it), so switching the method and
+        // reloading is safe; the helper restores the file if a fresh connection
+        // stops working (NEXA-755, control 1).
+        const scramAuthOutcome = await ensureEmbeddedPostgresScramAuth({ dataDir, port });
+        if (scramAuthOutcome.status === "rewritten") {
+          logger.info(
+            { rewrittenLines: scramAuthOutcome.rewrittenLines },
+            "Rewrote embedded PostgreSQL pg_hba.conf from cleartext password auth to scram-sha-256",
+          );
+        } else if (scramAuthOutcome.status === "skipped") {
+          logger.warn(
+            { reason: scramAuthOutcome.reason, detail: scramAuthOutcome.detail },
+            "Left embedded PostgreSQL pg_hba.conf on cleartext password auth; the stored credential could not be proven SCRAM-compatible",
+          );
+        }
         embeddedPostgresSupervisor = createEmbeddedPostgresSupervisor({
           initialInstance: embeddedPostgres,
           createInstance: createEmbeddedPostgres,

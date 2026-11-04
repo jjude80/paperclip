@@ -54,11 +54,18 @@ export {
   resolveEmbeddedPostgresInitialisationPassword,
   persistEmbeddedPostgresPassword,
   rotateEmbeddedPostgresPassword,
+  EMBEDDED_POSTGRES_HBA_FILENAME,
+  embeddedPostgresHbaPath,
+  planCleartextAuthRewrite,
+  ensureEmbeddedPostgresScramAuth,
   type EmbeddedPostgresCredentials,
   type EmbeddedPostgresCredentialSource,
   type EmbeddedPostgresUrlOptions,
   type ResolvedEmbeddedPostgresUrl,
   type RotateEmbeddedPostgresPasswordOptions,
+  type CleartextAuthRewritePlan,
+  type EnsureEmbeddedPostgresScramAuthOptions,
+  type EmbeddedPostgresScramAuthOutcome,
 } from "./embedded-postgres-credentials.js";
 export { loadWithoutEmbeddedPostgresExitHooks } from "./embedded-postgres-lifecycle.js";
 export { issueRelations } from "./schema/issue_relations.js";

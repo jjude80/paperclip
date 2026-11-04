@@ -17020,6 +17020,7 @@ export function issueRoutes(
           resolverPolicyProvenance: interaction.resolverPolicyProvenance,
           effectiveResolverPolicySource:
             interaction.effectiveResolverPolicySource,
+          supersededInteractionIds: interaction.supersededInteractionIds ?? [],
         },
       });
 
