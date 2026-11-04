@@ -14,6 +14,8 @@ permissions:
 jobs:
   ci:
     if: github.event.action != 'labeled' || github.event.label.name == 'profile-ci'
-    # Master requires CODEOWNERS review for .github/**, including this workflow.
+    # Upstream master requires CODEOWNERS review for .github/**, including this workflow.
+    # The fork's master does not require review; its active ruleset only blocks
+    # deletion and non-fast-forward pushes (see .github/CODEOWNERS).
     # The AWS runner group permits pr-trusted.yml@refs/heads/master.
     uses: paperclipai/paperclip/.github/workflows/pr-trusted.yml@master
