@@ -177,6 +177,17 @@ type HeartbeatRun = typeof heartbeatRuns.$inferSelect;
 type HeartbeatRunState = ReturnType<typeof createHeartbeatRunState>;
 type RunPreparation = ReturnType<typeof createHeartbeatRunPreparation>;
 
+/**
+ * A hand-off assignment wake held as a durable deferred wake because the
+ * interrupted execution still owned its process or environment lease. Nothing
+ * re-issues the assignment, so resumeQueuedRuns() retries this row instead of
+ * treating it as a terminal skipped receipt.
+ */
+function isDeferredHandoffWake(payload: Record<string, unknown> | null | undefined): boolean {
+  const wait = payload?.executionWait;
+  return typeof wait === "object" && wait !== null && (wait as Record<string, unknown>).deferredHandoff === true;
+}
+
 /** Queue policy uses the service's lifecycle effects and process-wide ownership sets. */
 export interface HeartbeatQueueDependencies extends Pick<HeartbeatRetryDependencies,
   "setWakeupStatus" | "appendRunEvent" | "finalizeAgentStatus" |
@@ -224,6 +235,7 @@ const HEARTBEAT_MAX_CONCURRENT_RUNS_MIN = 1;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 50;
 
 export const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
+const CONTENTLESS_UNBOUND_WAKE_KEY = "contentlessUnboundWake";
 
 export const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = [
   "queued",
@@ -577,6 +589,17 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     });
 
     return cancelled;
+  }
+
+  function hasWakePayloadContent(payload: Record<string, unknown> | null) {
+    if (!payload) return false;
+    return Object.entries(payload).some(([key, value]) => {
+      if (key === DEFERRED_WAKE_CONTEXT_KEY || key === "manualUserWake") return false;
+      if (value === null || value === undefined || value === "") return false;
+      if (Array.isArray(value)) return value.length > 0;
+      if (typeof value === "object") return Object.keys(value as object).length > 0;
+      return true;
+    });
   }
 
   async function hasActionableTimerWork(agent: typeof agents.$inferSelect) {
@@ -1815,6 +1838,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     // A server restart or a message/cleanup race can leave a deferred wake
     // after its owner has released the issue lock. Revisit it through the same
     // release admission, so recovery holds and operator Stops still apply.
+    // A hand-off assignment wake kept durable while the interrupted run still
+    // owned its lease is retried here too: `releaseIssueExecutionAndPromote`
+    // reads the current execution gate again and promotes nothing until the
+    // lease is actually released.
     const strandedQueues = await db.select({ wake: agentWakeupRequests })
       .from(agentWakeupRequests)
       .innerJoin(issues, and(eq(issues.companyId, agentWakeupRequests.companyId),
@@ -1827,7 +1854,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         or(and(
           sql`jsonb_typeof(${agentWakeupRequests.payload} #> '{_paperclipWakeContext,wakeCommentIds}') = 'array'`,
           sql`${agentWakeupRequests.payload} #> '{_paperclipWakeContext,wakeCommentIds}' <> '[]'::jsonb`,
-        ), sql`${agentWakeupRequests.payload}->>'mutation' = 'interaction'`),
+        ), sql`${agentWakeupRequests.payload}->>'mutation' = 'interaction'`,
+        sql`${agentWakeupRequests.payload}->'executionWait'->>'deferredHandoff' = 'true'`),
         sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is null`,
         sql`NOT EXISTS (SELECT 1 FROM heartbeat_runs live_issue_run
           WHERE live_issue_run.company_id = ${issues.companyId}
@@ -1839,6 +1867,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     const releasedNativeSources = new Set<string>();
     for (const { wake } of strandedQueues) {
       if (!queuedCommentIdsFromWakePayload(wake.payload).length &&
+          !isDeferredHandoffWake(wake.payload) &&
           !await readQueuedInteractionResponse(db, wake.companyId, String(wake.payload?.issueId), wake.payload)) continue;
       const [latest] = await db.select({
         id: heartbeatRuns.id,
@@ -2757,6 +2786,71 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       return null;
     }
 
+    const wakeRequesterType = readNonEmptyString(opts.requestedByActorType);
+    const wakeRequesterId = readNonEmptyString(opts.requestedByActorId);
+    const contentlessUnboundWake =
+      Boolean(wakeRequesterType && wakeRequesterId) &&
+      !caseRequest &&
+      enrichedContextSnapshot.forceFreshSession !== true &&
+      source !== "timer" &&
+      !issueId &&
+      !wakeCommentId &&
+      !readNonEmptyString(enrichedContextSnapshot.taskId) &&
+      !readNonEmptyString(enrichedContextSnapshot.taskKey) &&
+      !readNonEmptyString(reason) &&
+      !readNonEmptyString(enrichedContextSnapshot.wakeReason) &&
+      !hasWakePayloadContent(payload);
+    if (contentlessUnboundWake) {
+      enrichedContextSnapshot[CONTENTLESS_UNBOUND_WAKE_KEY] = true;
+      payload = {
+        ...payload,
+        [DEFERRED_WAKE_CONTEXT_KEY]: {
+          ...parseObject(payload?.[DEFERRED_WAKE_CONTEXT_KEY]),
+          [CONTENTLESS_UNBOUND_WAKE_KEY]: true,
+        },
+      };
+      const previous = await db
+        .select({
+          payload: agentWakeupRequests.payload,
+          requestedAt: agentWakeupRequests.requestedAt,
+          requestedByActorType: agentWakeupRequests.requestedByActorType,
+          requestedByActorId: agentWakeupRequests.requestedByActorId,
+        })
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.companyId, agent.companyId),
+            eq(agentWakeupRequests.agentId, agentId),
+          ),
+        )
+        .orderBy(desc(agentWakeupRequests.requestedAt))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      const previousWasContentless =
+        parseObject(
+          parseObject(previous?.payload)?.[DEFERRED_WAKE_CONTEXT_KEY],
+        )[CONTENTLESS_UNBOUND_WAKE_KEY] === true;
+      const previousWasSameRequester =
+        previous?.requestedByActorType === wakeRequesterType &&
+        previous?.requestedByActorId === wakeRequesterId;
+      const repeatWindowMs = 60 * 60 * 1000;
+      const previousIsRecent =
+        previous?.requestedAt instanceof Date &&
+        Date.now() - previous.requestedAt.getTime() < repeatWindowMs;
+      if (
+        previousWasContentless &&
+        previousWasSameRequester &&
+        previousIsRecent &&
+        !(await hasActionableTimerWork(agent))
+      ) {
+        await writeSkippedHeartbeatRequest("heartbeat.wakeup.no_actionable_work", {
+          reason:
+            "Repeated a contentless wake from the same requester: no issue, comment, task, reason or payload, and no assigned todo or in_progress issue since the previous one.",
+        });
+        return null;
+      }
+    }
+
     if (issueId) {
       const activePauseHold = await treeControlSvc.getActivePauseHoldGate(
         agent.companyId,
@@ -3318,7 +3412,26 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           ) => {
             if (caseRequest) waitForCaseAdmission("execution_reconciliation_required", executionBlocker.nextAction);
             opts.issueStateGuard?.onExecutionDeferred?.(executionBlocker.cause);
-            const condition = { recoveryActionId: executionBlocker.recoveryActionId, ...continuationWait };
+            // A different-agent hand-off is admitted while the interrupted run
+            // may still own the issue's process or environment lease. That hold
+            // clears on its own, but nothing re-issues the assignment wake, so a
+            // terminal skipped receipt would lose the hand-off until an
+            // unrelated wake arrived. Keep it durable and let resumeQueuedRuns()
+            // re-admit it once the lease is released.
+            const durableHandoffWake = !caseRequest && source === "assignment" &&
+              reason === "issue_assigned" && issue.assigneeAgentId === agentId &&
+              executionBlocker.cause === "execution_owner_active";
+            if (durableHandoffWake) {
+              continuationWait = {
+                reason: "execution_reconciliation_required",
+                message: executionBlocker.nextAction,
+              };
+            }
+            const condition = {
+              recoveryActionId: executionBlocker.recoveryActionId,
+              ...continuationWait,
+              ...(durableHandoffWake ? { deferredHandoff: true } : {}),
+            };
             if (executionWaitRequestId) {
               await tx.update(agentWakeupRequests).set({
                 payload: sql`jsonb_set(coalesce(${agentWakeupRequests.payload}, '{}'::jsonb), '{executionWait}', ${JSON.stringify(condition)}::jsonb)`,
@@ -3326,9 +3439,31 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               }).where(eq(agentWakeupRequests.id, executionWaitRequestId));
               return { kind: "deferred" as const, admitted: true };
             }
+            if (durableHandoffWake) {
+              // A repeated hand-off admits the same assignment again. Keep one
+              // deferred receipt so a later promotion cannot start a second run
+              // for the same hand-off.
+              const [existingHandoff] = await tx.select({ id: agentWakeupRequests.id })
+                .from(agentWakeupRequests)
+                .where(and(
+                  eq(agentWakeupRequests.companyId, agent.companyId),
+                  eq(agentWakeupRequests.agentId, agentId),
+                  eq(agentWakeupRequests.status, "deferred_issue_execution"),
+                  sql`${agentWakeupRequests.payload}->>'issueId' = ${issue.id}`,
+                  sql`${agentWakeupRequests.payload}->'executionWait'->>'deferredHandoff' = 'true'`,
+                )).limit(1);
+              if (existingHandoff) {
+                await tx.update(agentWakeupRequests).set({
+                  coalescedCount: sql`${agentWakeupRequests.coalescedCount} + 1`,
+                  updatedAt: new Date(),
+                }).where(eq(agentWakeupRequests.id, existingHandoff.id));
+                return { kind: "deferred" as const };
+              }
+            }
             if (durableRequest || wakeCommentId ||
                 hasInteractionContinuationWakeContext(enrichedContextSnapshot) ||
-                readNonEmptyString(enrichedContextSnapshot.nativeStatusWakeIntentId)) {
+                readNonEmptyString(enrichedContextSnapshot.nativeStatusWakeIntentId) ||
+                durableHandoffWake) {
               await tx.insert(agentWakeupRequests).values({
                 ...durableReceiptFields,
                 companyId: agent.companyId, agentId, source, triggerDetail, reason,

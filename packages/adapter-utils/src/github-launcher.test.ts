@@ -111,6 +111,40 @@ describe("managed GitHub launchers", () => {
     expect(result.stderr).not.toContain("broker_transport_unavailable");
     expect(result.stderr).not.toMatch(/host-token|run-capability/);
   });
+  it("reads the broker capability from its 0600 file and keeps the path from the child", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-token-file-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const bin = path.join(root, "managed"), realBin = path.join(root, "real");
+    await mkdir(bin); await mkdir(realBin);
+    await writeFile(path.join(bin, "gh"), githubLauncherSource(), { mode: 0o700 });
+    await writeFile(path.join(realBin, "gh"), `#!/usr/bin/env node
+process.stdout.write(JSON.stringify({ token: process.env.GH_TOKEN ?? null, leakedPath: process.env.PAPERCLIP_GITHUB_BROKER_TOKEN_FILE ?? null, leakedValue: process.env.PAPERCLIP_GITHUB_BROKER_TOKEN ?? null }));
+`, { mode: 0o700 });
+    const tokenFile = path.join(root, "broker-token");
+    await writeFile(tokenFile, "file-capability\n", { mode: 0o600 });
+    let authorization: string | undefined;
+    const server = createServer((req, res) => {
+      authorization = req.headers.authorization;
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ status: "available", env: { GH_TOKEN: "managed-token" } }));
+    });
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    cleanups.push(() => new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())));
+    const { port } = server.address() as { port: number };
+    const env = githubBrokerEnvironment({}, { url: `http://127.0.0.1:${port}`, token: "" });
+    delete env.PAPERCLIP_GITHUB_BROKER_TOKEN;
+    const result = await exec(path.join(bin, "gh"), [], { env: {
+      ...process.env, ...env,
+      PAPERCLIP_GITHUB_BROKER_TOKEN_FILE: tokenFile,
+      PAPERCLIP_API_TOKEN_FILE: tokenFile,
+      PATH: `${bin}:${realBin}:${process.env.PATH}`,
+    } });
+    // The file value reached the broker as the capability, not the empty env var.
+    expect(authorization).toBe("Bearer file-capability");
+    expect(JSON.parse(result.stdout)).toEqual({ token: "managed-token", leakedPath: null, leakedValue: null });
+    expect(result.stderr).not.toContain("capability_missing");
+  });
+
   it("captures each command's identity and clears host credentials when the next person has none", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-launcher-test-"));
     cleanups.push(() => rm(root, { recursive: true, force: true }));

@@ -14,6 +14,13 @@ export type { InvokableAgentSnapshot, IssueSnapshot, ReleaseRecoveryBlockedNotic
 export type LockedIssueExecution = {
   /** Plan bounded recovery without draining messages while the finishing owner cleans up. */
   recoveryOnly?: boolean;
+  /**
+   * Set by the stranded-queue adapter when the release is retried for a
+   * durable hand-off wake. The drain reads this exact receipt first so an
+   * older deferred wake for the previous assignee cannot be replayed in its
+   * place.
+   */
+  preferredWakeId?: string;
   primaryIssue: IssueSnapshot;
   run: RunSnapshot;
 };
@@ -110,7 +117,7 @@ export type PromoteDeferredWakeInput = {
  */
 export interface WakeQueueTransaction {
   findInvokableAgent(input: { companyId: string; agentId: string }): Promise<InvokableAgentSnapshot | null>;
-  findNextDeferredWake(input: { companyId: string; issueId: string; excludedWakeIds?: string[] }): Promise<DeferredWakeCandidate | null>;
+  findNextDeferredWake(input: { companyId: string; issueId: string; excludedWakeIds?: string[]; wakeId?: string }): Promise<DeferredWakeCandidate | null>;
   getQueuedCommentLiveness(input: {
     companyId: string;
     issueId: string;

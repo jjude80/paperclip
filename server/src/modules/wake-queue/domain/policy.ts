@@ -74,6 +74,13 @@ export type PreDrainFacts = {
   legacyExecutionNeedsReconciliation: boolean;
   /** True when the finishing run is cancelled and its stored result carries an acknowledged execution cancellation. */
   executionCancellationAcknowledged: boolean;
+  /**
+   * True when the stranded-queue retry found a durable hand-off wake that
+   * belongs to the issue's current assignee. That wake exists precisely
+   * because the cancelled run was replaced, so the acknowledgement must not
+   * hide it from the drain.
+   */
+  durableHandoffWakePending: boolean;
 };
 
 export type PreDrainDecision =
@@ -90,6 +97,10 @@ export type PreDrainDecision =
  * later one when both hold at the same time. "proceed" means none of the
  * four checks applied; the caller then runs its own write-carrying check
  * and, if that also clears, calls its lock function.
+ *
+ * The acknowledged-cancellation check yields to a durable hand-off wake: the
+ * cancellation retires the interrupted run, but that wake is addressed to the
+ * issue's new assignee and is the only thing that will ever re-issue it.
  */
 export function decidePreDrain(facts: PreDrainFacts): PreDrainDecision {
   if (!facts.issueRowPresent || !facts.executionRunIdMatchesRun) {
@@ -112,7 +123,7 @@ export function decidePreDrain(facts: PreDrainFacts): PreDrainDecision {
     return { kind: "released" };
   }
 
-  if (facts.executionCancellationAcknowledged) {
+  if (facts.executionCancellationAcknowledged && !facts.durableHandoffWakePending) {
     return { kind: "released" };
   }
 

@@ -280,6 +280,49 @@ describeEmbeddedPostgres("issue wake diagnostics route", () => {
     expect(JSON.stringify(res.body)).not.toContain("PRIVATE_DELIVERY_ID");
   });
 
+  it("shows the gate that skipped a hand-off instead of reporting it as an unexplained failure", async () => {
+    const company = await seedCompany(db);
+    const agent = await seedAgent(db, company.id);
+    const issue = await seedIssue(db, {
+      companyId: company.id,
+      title: "Hand-off target",
+      status: "in_review",
+      assigneeAgentId: agent.id,
+    });
+    const nextAction =
+      "The previous execution has not released its environment lease. Wait for cleanup before continuing this task.";
+    await db.insert(agentWakeupRequests).values({
+      companyId: company.id,
+      agentId: agent.id,
+      source: "assignment",
+      reason: "execution_reconciliation_required",
+      status: "skipped",
+      coalescedCount: 0,
+      payload: { issueId: issue.id, mutation: "update", interruptedRunId: randomUUID() },
+      error: nextAction,
+      requestedAt: new Date(Date.now() - 60_000),
+      finishedAt: new Date(Date.now() - 59_000),
+    });
+
+    const res = await request(createApp(db, boardActor(company)))
+      .get(`/api/issues/${issue.id}/diagnostics/wakes`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.events).toMatchObject([
+      {
+        kind: "wake_request",
+        source: "assignment",
+        reason: "execution_reconciliation_required",
+        status: "skipped",
+        failureClass: "skipped",
+      },
+    ]);
+    expect(res.body.diagnosis).toContain("skipped for execution_reconciliation_required");
+    const serialized = JSON.stringify(res.body);
+    expect(serialized).not.toContain(nextAction);
+    expect(serialized).not.toContain("\"error\"");
+  });
+
   it("returns null diagnosis for an unblocked issue with no wake history", async () => {
     const company = await seedCompany(db);
     const project = await seedProject(db, company.id, "Core");

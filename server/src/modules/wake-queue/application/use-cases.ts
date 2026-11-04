@@ -151,12 +151,20 @@ async function runReleaseDrain(
   // return that same row again. That invariant is what ends this loop.
   // The `processedWakeIds` guard below makes a break of the invariant
   // fail loudly, instead of holding this transaction open forever.
+  // A stranded hand-off retry names its receipt (`preferredWakeId`), so the
+  // drain reads that row instead of the oldest receipt on the issue, and
+  // stops if it does not promote.
   const processedWakeIds = new Set<string>();
   const preservedWakeIds: string[] = [];
 
   while (true) {
+    // A hand-off retry pins exactly one receipt. If that receipt did not
+    // promote, stop here: older deferred work for the previous assignee must
+    // not be replayed merely because the receiver could not be woken.
+    if (locked.preferredWakeId && processedWakeIds.has(locked.preferredWakeId)) break;
     const candidate = await ports.transaction.findNextDeferredWake({
       companyId: run.companyId, issueId: issue.id,
+      ...(processedWakeIds.size === 0 && locked.preferredWakeId ? { wakeId: locked.preferredWakeId } : {}),
       ...(preservedWakeIds.length ? { excludedWakeIds: preservedWakeIds } : {}),
     });
     if (!candidate) break;

@@ -100,6 +100,57 @@ describe("issue thread interaction schemas", () => {
     },
   );
 
+  it.each([
+    ["suggest_tasks", { version: 1, tasks: [{ clientKey: "task-1", title: "Do the thing" }] }],
+    ["ask_user_questions", { version: 1, questions: [{ id: "scope", prompt: "Scope?", selectionMode: "single", options: [{ id: "all", label: "All" }] }] }],
+    ["request_confirmation", { version: 1, prompt: "Proceed?" }],
+    ["request_checkbox_confirmation", { version: 1, prompt: "Pick one", options: [{ id: "one", label: "One" }] }],
+    ["request_item_verdicts", { version: 1, prompt: "Review these", items: [{ id: "api", label: "API" }] }],
+  ] as const)(
+    "reads requestedResolverPolicy as resolverPolicy for %s",
+    (kind, payload) => {
+      const parsed = createIssueThreadInteractionSchema.parse({
+        kind,
+        requestedResolverPolicy: "human_only",
+        payload,
+      });
+      expect(parsed.resolverPolicy).toBe("human_only");
+    },
+  );
+
+  it("accepts agreeing requestedResolverPolicy and resolverPolicy", () => {
+    const parsed = createIssueThreadInteractionSchema.parse({
+      kind: "request_confirmation",
+      resolverPolicy: "not_creator",
+      requestedResolverPolicy: "not_creator",
+      payload: { version: 1, prompt: "Proceed?" },
+    });
+    expect(parsed.resolverPolicy).toBe("not_creator");
+  });
+
+  it("rejects conflicting requestedResolverPolicy and resolverPolicy", () => {
+    const parsed = createIssueThreadInteractionSchema.safeParse({
+      kind: "request_confirmation",
+      resolverPolicy: "anyone",
+      requestedResolverPolicy: "human_only",
+      payload: { version: 1, prompt: "Proceed?" },
+    });
+    expect(parsed.success).toBe(false);
+    if (parsed.success) throw new Error("expected a validation failure");
+    const conflict = parsed.error.issues.find((issue) =>
+      issue.path.includes("requestedResolverPolicy"),
+    );
+    expect(conflict?.message).toContain("requestedResolverPolicy");
+  });
+
+  it("leaves resolverPolicy unset when neither spelling is supplied", () => {
+    const parsed = createIssueThreadInteractionSchema.parse({
+      kind: "request_confirmation",
+      payload: { version: 1, prompt: "Proceed?" },
+    });
+    expect(parsed.resolverPolicy).toBeUndefined();
+  });
+
   it("parses request_confirmation payloads with default no-wake continuation", () => {
     const parsed = createIssueThreadInteractionSchema.parse({
       kind: "request_confirmation",
