@@ -1487,6 +1487,11 @@ export interface ConnectionIntentResult {
   supersededByInteractionId?: string | null;
 }
 
+export interface RequestConfirmationAttestation {
+  /** What the accepting person is asserting they did, outside the board. */
+  action: string;
+}
+
 export interface RequestConfirmationPayload {
   version: 1;
   prompt: string;
@@ -1502,6 +1507,7 @@ export interface RequestConfirmationPayload {
   toolAction?: RequestConfirmationToolActionPayload;
   secretProposal?: RequestConfirmationSecretProposalPayload;
   connectionAuthorization?: RequestConfirmationConnectionAuthorizationPayload;
+  attestation?: RequestConfirmationAttestation;
 }
 
 export interface RequestCheckboxConfirmationOption {
@@ -1580,6 +1586,10 @@ export interface RequestConfirmationResult {
   } | null;
   toolAction?: RequestConfirmationToolActionResult;
   secretProposal?: RequestConfirmationSecretProposalResult;
+  /** Present only for an accepted card whose effect was performed outside the
+   * board. `verified` is always false — the server performed nothing and cannot
+   * confirm the claim (NEXA-675). */
+  attestation?: RequestConfirmationAttestation & { verified: false };
 }
 
 export interface RequestCheckboxConfirmationResult extends RequestConfirmationResult {

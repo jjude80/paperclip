@@ -769,6 +769,7 @@ export type {
   RequestConfirmationIssueDocumentTarget,
   RequestConfirmationCustomTarget,
   RequestConfirmationTarget,
+  RequestConfirmationAttestation,
   RequestConfirmationPayload,
   RequestConfirmationResult,
   RequestConfirmationToolActionPayload,
