@@ -1,3 +1,9 @@
+# CODEOWNERS only enforces review when the target branch has a
+# `require_code_owner_review` rule. Upstream `paperclipai/paperclip:master` does.
+# The fork `jjude80/paperclip:master` does not, so on the fork this file is
+# advisory: its only active ruleset (`master-durability`) blocks deletion and
+# non-fast-forward pushes, not merges.
+#
 # Replace @cryppadotta if a different maintainer or team should own release infrastructure.
 
 .github/** @cryppadotta @devinfoley @nickyleach @forgottendev

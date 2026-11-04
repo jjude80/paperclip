@@ -968,6 +968,24 @@ describe("IssueThreadInteractionCard", () => {
     );
   });
 
+  it("renders an accepted confirmation with a human attestation as unverified", () => {
+    const host = renderCard({
+      interaction: {
+        ...pendingRequestConfirmationInteraction,
+        status: "accepted",
+        result: {
+          version: 1,
+          outcome: "accepted",
+          attestation: { action: "a task drain is open on the board", verified: false },
+        },
+      },
+    });
+
+    const note = host.querySelector('[data-testid="interaction-attestation-note"]');
+    expect(note?.textContent).toContain("a task drain is open on the board");
+    expect(note?.textContent).toContain("did not perform or verify");
+  });
+
   it("renders explicit copy for failed request confirmations", () => {
     const host = renderCard({
       interaction: failedRequestConfirmationInteraction,

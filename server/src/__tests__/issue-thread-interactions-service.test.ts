@@ -2377,6 +2377,79 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     expect(readBack.payload.metadata).toEqual({ rotationOption: "rotate-idle" });
   });
 
+  it("stores a declared human attestation on accept, and nothing when undeclared", async () => {
+    const companyId = randomUUID();
+    const goalId = randomUUID();
+    const issueId = randomUUID();
+
+    await db.insert(companies).values(interactionCompanyRow(companyId));
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false });
+    await db.insert(goals).values({
+      id: goalId,
+      companyId,
+      title: "Confirm an external action",
+      level: "task",
+      status: "active",
+    });
+    await db.insert(issues).values(parentIssueRow(issueId, companyId, goalId));
+
+    const created = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_confirmation",
+      continuationPolicy: "wake_assignee",
+      payload: {
+        version: 1,
+        prompt: "Confirm the maintenance window is open",
+        acceptLabel: "I opened the drain",
+        attestation: { action: "a task drain is open on the board" },
+      },
+    }, {
+      userId: "local-board",
+    });
+
+    const accepted = await interactionsSvc.acceptInteraction(
+      acceptIssueScope(issueId, companyId, goalId),
+      created.id,
+      {},
+      { userId: "local-board" },
+    );
+
+    expect(accepted.interaction).toMatchObject({
+      kind: "request_confirmation",
+      status: "accepted",
+      result: {
+        version: 1,
+        outcome: "accepted",
+        attestation: {
+          action: "a task drain is open on the board",
+          verified: false,
+        },
+      },
+    });
+
+    const plain = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_confirmation",
+      payload: {
+        version: 1,
+        prompt: "Apply this plan?",
+      },
+    }, {
+      userId: "local-board",
+    });
+    const plainAccepted = await interactionsSvc.acceptInteraction(
+      acceptIssueScope(issueId, companyId, goalId),
+      plain.id,
+      {},
+      { userId: "local-board" },
+    );
+    expect(plainAccepted.interaction.result).not.toHaveProperty("attestation");
+  });
+
   it("reopens an in-review issue before waking the assignee after rejection", async () => {
     const { companyId, issueId } = await seedConfirmationIssue(
       "Continue after review rejection",

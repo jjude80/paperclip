@@ -482,6 +482,7 @@ export {
   requestConfirmationIssueDocumentTargetSchema,
   requestConfirmationCustomTargetSchema,
   requestConfirmationTargetSchema,
+  requestConfirmationAttestationSchema,
   requestConfirmationMetadataSchema,
   requestConfirmationPayloadSchema,
   requestConfirmationResumeFailureSchema,

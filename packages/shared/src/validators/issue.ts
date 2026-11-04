@@ -1622,6 +1622,20 @@ export const requestConfirmationMetadataSchema = z
     message: "metadata may hold at most 32 keys",
   });
 
+/**
+ * A statement the accepting person is making about something the board did not
+ * do and cannot check (for example "I opened the maintenance window"). A card
+ * that asks a person to act outside the board must declare this, so the stored
+ * resolution records an attestation instead of an effect the board performed.
+ *
+ * A confirmation that asks the board to perform the action instead (tool
+ * review, secret binding) carries `toolAction` / `secretProposal` and must not
+ * carry this block: those are verified by the server on resolve.
+ */
+export const requestConfirmationAttestationSchema = z.object({
+  action: z.string().trim().min(1).max(500),
+});
+
 export const requestConfirmationPayloadSchema = z.object({
   version: z.literal(1),
   prompt: z.string().trim().min(1).max(1000),
@@ -1648,6 +1662,17 @@ export const requestConfirmationPayloadSchema = z.object({
   target: requestConfirmationTargetSchema.nullable().optional(),
   toolAction: requestConfirmationToolActionPayloadSchema.optional(),
   secretProposal: requestConfirmationSecretProposalPayloadSchema.optional(),
+  attestation: requestConfirmationAttestationSchema.optional(),
+}).superRefine((value, ctx) => {
+  if (!value.attestation) return;
+  if (value.toolAction || value.secretProposal) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["attestation"],
+      message:
+        "A confirmation with a server-performed effect (toolAction or secretProposal) cannot also declare a human attestation",
+    });
+  }
 });
 
 export const requestCheckboxConfirmationOptionSchema = z.object({
@@ -1813,6 +1838,12 @@ export const requestConfirmationResultSchema = z.object({
   resumeFailure: requestConfirmationResumeFailureSchema.nullable().optional(),
   toolAction: requestConfirmationToolActionResultSchema.optional(),
   secretProposal: requestConfirmationSecretProposalResultSchema.optional(),
+  // Present only when the accepted card is the responder's own statement about
+  // an action performed outside the board. `verified` is always false: the
+  // server performed nothing and has no way to confirm the claim (NEXA-675).
+  attestation: requestConfirmationAttestationSchema
+    .extend({ verified: z.literal(false) })
+    .optional(),
 });
 
 export const requestCheckboxConfirmationResultSchema =
