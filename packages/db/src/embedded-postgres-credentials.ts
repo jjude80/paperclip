@@ -338,3 +338,222 @@ export async function rotateEmbeddedPostgresPassword(
     releaseLock();
   }
 }
+
+export const EMBEDDED_POSTGRES_HBA_FILENAME = "pg_hba.conf";
+
+const CLEARTEXT_AUTH_METHOD = "password";
+const SCRAM_AUTH_METHOD = "scram-sha-256";
+
+export function embeddedPostgresHbaPath(dataDir: string): string {
+  return path.resolve(dataDir, EMBEDDED_POSTGRES_HBA_FILENAME);
+}
+
+export type CleartextAuthRewritePlan = {
+  /** The rewritten file body. Identical to the input when nothing matched. */
+  contents: string;
+  /** Number of host/local lines whose method was changed. */
+  rewrittenLines: number;
+};
+
+type HbaField = { text: string; start: number; end: number };
+
+function splitFields(line: string): HbaField[] {
+  const fields: HbaField[] = [];
+  const pattern = /\S+/g;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(line)) !== null) {
+    fields.push({ text: match[0], start: match.index, end: match.index + match[0].length });
+  }
+  return fields;
+}
+
+function rewriteCleartextAuthLine(line: string): { line: string; changed: boolean } {
+  // Comments may follow the rule on the same line; keep them byte-for-byte.
+  const commentIndex = line.indexOf("#");
+  const code = commentIndex === -1 ? line : line.slice(0, commentIndex);
+  const comment = commentIndex === -1 ? "" : line.slice(commentIndex);
+
+  const fields = splitFields(code);
+  if (fields.length === 0) return { line, changed: false };
+
+  const recordType = fields[0].text.toLowerCase();
+  // pg_hba.conf field order: `local DATABASE USER METHOD`, and
+  // `host TYPE DATABASE USER ADDRESS METHOD`. Any other record type is left
+  // alone rather than guessed at.
+  const methodIndex = recordType === "local" ? 3 : recordType.startsWith("host") ? 4 : -1;
+  if (methodIndex < 0 || fields.length <= methodIndex) return { line, changed: false };
+
+  const method = fields[methodIndex];
+  if (method.text.toLowerCase() !== CLEARTEXT_AUTH_METHOD) return { line, changed: false };
+
+  const rewritten = `${code.slice(0, method.start)}${SCRAM_AUTH_METHOD}${code.slice(method.end)}`;
+  return { line: `${rewritten}${comment}`, changed: true };
+}
+
+/**
+ * Rewrites every cleartext `password` auth method in a `pg_hba.conf` body to
+ * `scram-sha-256` (NEXA-755).
+ *
+ * Only the auth method changes. Comments, whitespace, ordering and every other
+ * method (`trust`, `peer`, `md5`, `cert`, ...) are preserved verbatim, so the
+ * result is reviewable as a diff against the file the cluster wrote.
+ *
+ * This is a pure transformation: it does not read or write anything, which is
+ * what makes it cheap to test against real cluster files.
+ */
+export function planCleartextAuthRewrite(contents: string): CleartextAuthRewritePlan {
+  const eol = contents.includes("\r\n") ? "\r\n" : "\n";
+  const lines = contents.split(/\r?\n/);
+  let rewrittenLines = 0;
+  const rewritten = lines.map((line) => {
+    const result = rewriteCleartextAuthLine(line);
+    if (result.changed) rewrittenLines += 1;
+    return result.line;
+  });
+  return { contents: rewritten.join(eol), rewrittenLines };
+}
+
+export type EnsureEmbeddedPostgresScramAuthOptions = {
+  dataDir: string;
+  port: number;
+};
+
+export type EmbeddedPostgresScramAuthOutcome =
+  | { status: "rewritten"; rewrittenLines: number }
+  | { status: "unchanged"; rewrittenLines: 0 }
+  | { status: "no-hba-file"; rewrittenLines: 0 }
+  | {
+      status: "skipped";
+      rewrittenLines: 0;
+      reason: "legacy-credential" | "verifier-not-scram" | "verifier-unreadable";
+      detail?: string;
+    };
+
+function writeHbaFileAtomically(filePath: string, contents: string): void {
+  const temporaryPath = `${filePath}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
+  writeFileSync(temporaryPath, contents, { mode: 0o600 });
+  chmodSync(temporaryPath, 0o600);
+  renameSync(temporaryPath, filePath);
+}
+
+async function readStoredPasswordVerifier(dataDir: string, port: number): Promise<string | null> {
+  const credentials = resolveEmbeddedPostgresCredentials(dataDir);
+  const sql = postgres(buildUrl(credentials, port, "postgres"), { max: 1, onnotice: () => {} });
+  try {
+    // `pg_authid` is superuser-only. A caller that cannot read it gets a clear
+    // "unknown" rather than a guess: rewriting the method for a verifier we
+    // cannot see is how a cluster gets locked out of itself.
+    const rows = await sql<{ rolpassword: string | null }[]>`
+      select rolpassword from pg_authid where rolname = current_user
+    `;
+    return rows[0]?.rolpassword ?? null;
+  } finally {
+    await sql.end({ timeout: 5 }).catch(() => undefined);
+  }
+}
+
+/**
+ * Rewrites a cluster's `pg_hba.conf` from cleartext `password` auth to
+ * `scram-sha-256`, then reloads it (NEXA-755, control 1).
+ *
+ * Only call this from the process that started the cluster: it is the owner of
+ * the data directory and the credential, exactly like
+ * `rotateEmbeddedPostgresPassword`. A cluster another process owns must not have
+ * its auth rewritten underneath it.
+ *
+ * Safety properties, in the order they are checked:
+ *  - no rewrite when the credential is still the shipped legacy literal, or
+ *    when the stored verifier is not SCRAM. Either case means switching the
+ *    method would break the next connection;
+ *  - no rewrite when the verifier cannot be read (no superuser), because
+ *    "cannot see" is not "is SCRAM";
+ *  - the file is replaced atomically and kept at 0600;
+ *  - after `pg_reload_conf()` a *fresh* connection is opened with the stored
+ *    credential. If it fails, the original file contents are restored, the
+ *    cluster is reloaded again, and the call throws. A rewrite that breaks
+ *    authentication never outlives the call that made it.
+ */
+export async function ensureEmbeddedPostgresScramAuth(
+  options: EnsureEmbeddedPostgresScramAuthOptions,
+): Promise<EmbeddedPostgresScramAuthOutcome> {
+  const hbaPath = embeddedPostgresHbaPath(options.dataDir);
+  if (!existsSync(hbaPath)) return { status: "no-hba-file", rewrittenLines: 0 };
+
+  const original = readFileSync(hbaPath, "utf8");
+  const plan = planCleartextAuthRewrite(original);
+  if (plan.rewrittenLines === 0) return { status: "unchanged", rewrittenLines: 0 };
+
+  const credentials = resolveEmbeddedPostgresCredentials(options.dataDir);
+  if (credentials.source === "legacy") {
+    // The rotation step has not run (or was not allowed to). Do not change the
+    // method while the only known credential is the shipped literal.
+    return { status: "skipped", rewrittenLines: 0, reason: "legacy-credential" };
+  }
+
+  let verifier: string | null;
+  try {
+    verifier = await readStoredPasswordVerifier(options.dataDir, options.port);
+  } catch (error) {
+    return {
+      status: "skipped",
+      rewrittenLines: 0,
+      reason: "verifier-unreadable",
+      detail: error instanceof Error ? error.message : String(error),
+    };
+  }
+  if (verifier === null || !verifier.startsWith("SCRAM-SHA-256$")) {
+    return { status: "skipped", rewrittenLines: 0, reason: "verifier-not-scram" };
+  }
+
+  writeHbaFileAtomically(hbaPath, plan.contents);
+
+  const reloadAndVerify = async (): Promise<void> => {
+    const sql = postgres(
+      buildUrl(credentials, options.port, "postgres"),
+      { max: 1, onnotice: () => {} },
+    );
+    try {
+      await sql`select pg_reload_conf()`;
+    } finally {
+      await sql.end({ timeout: 5 }).catch(() => undefined);
+    }
+
+    // Reload is asynchronous: the postmaster processes SIGHUP between
+    // connections. A fresh connection is the only proof that the new rules are
+    // in force and that we can still authenticate under them.
+    const verification = postgres(
+      buildUrl(credentials, options.port, "postgres"),
+      { max: 1, onnotice: () => {} },
+    );
+    try {
+      await verification`select 1 as ok`;
+    } finally {
+      await verification.end({ timeout: 5 }).catch(() => undefined);
+    }
+  };
+
+  try {
+    await reloadAndVerify();
+  } catch (error) {
+    writeHbaFileAtomically(hbaPath, original);
+    const rollbackSql = postgres(
+      buildUrl(credentials, options.port, "postgres"),
+      { max: 1, onnotice: () => {} },
+    );
+    try {
+      await rollbackSql`select pg_reload_conf()`;
+    } catch {
+      // Best effort: the error below already names the restored file, which is
+      // what a human needs to finish the rollback by hand.
+    } finally {
+      await rollbackSql.end({ timeout: 5 }).catch(() => undefined);
+    }
+    throw new Error(
+      `Rewrote ${hbaPath} to SCRAM authentication and reloaded it, but a fresh connection with the stored credential failed: ${
+        error instanceof Error ? error.message : String(error)
+      }. The original file contents were restored; the cluster was not left on rules it cannot satisfy.`,
+    );
+  }
+
+  return { status: "rewritten", rewrittenLines: plan.rewrittenLines };
+}

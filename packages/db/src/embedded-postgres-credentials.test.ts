@@ -13,6 +13,9 @@ import {
   resolveEmbeddedPostgresCredentials,
   resolveEmbeddedPostgresInitialisationPassword,
   rotateEmbeddedPostgresPassword,
+  embeddedPostgresHbaPath,
+  ensureEmbeddedPostgresScramAuth,
+  planCleartextAuthRewrite,
 } from "./embedded-postgres-credentials.js";
 import { prepareEmbeddedPostgresNativeRuntime } from "./embedded-postgres-native.js";
 import {
@@ -167,6 +170,77 @@ async function startLegacyCluster(): Promise<LegacyCluster> {
   return { dataDir, port, stop };
 }
 
+
+const LEGACY_HBA = `# PostgreSQL Client Authentication Configuration File
+# TYPE  DATABASE        USER            ADDRESS                 METHOD
+
+local   all             all                                     password
+host    all             all             127.0.0.1/32            password
+host    all             all             ::1/128                 password
+local   replication     all                                     password
+host    replication     all             127.0.0.1/32            password
+host    replication     all             ::1/128                 password
+
+# Other methods are not ours to change.
+local   all             postgres                                peer
+host    all             all             10.0.0.0/8              trust
+host    all             all             192.168.0.0/16          md5
+`;
+
+describe("cleartext pg_hba.conf rewrite", () => {
+  it("moves every cleartext password rule to scram-sha-256 and nothing else", () => {
+    const plan = planCleartextAuthRewrite(LEGACY_HBA);
+
+    expect(plan.rewrittenLines).toBe(6);
+    expect(plan.contents).not.toMatch(/\bpassword\b\s*$/m);
+    expect(plan.contents).not.toContain("password");
+    // Untouched methods stay exactly as they were.
+    expect(plan.contents).toContain("local   all             postgres                                peer");
+    expect(plan.contents).toContain("host    all             all             10.0.0.0/8              trust");
+    expect(plan.contents).toContain("host    all             all             192.168.0.0/16          md5");
+    // Spacing and comments are preserved, so the change reads as a one-token diff.
+    expect(plan.contents).toContain(
+      "local   all             all                                     scram-sha-256",
+    );
+    expect(plan.contents).toContain("# Other methods are not ours to change.");
+  });
+
+  it("is idempotent: a SCRAM file is left byte-identical", () => {
+    const once = planCleartextAuthRewrite(LEGACY_HBA);
+    const twice = planCleartextAuthRewrite(once.contents);
+
+    expect(twice.rewrittenLines).toBe(0);
+    expect(twice.contents).toBe(once.contents);
+  });
+
+  it("keeps a trailing comment on the same line", () => {
+    const plan = planCleartextAuthRewrite("host all all 127.0.0.1/32 password # legacy cleartext\n");
+
+    expect(plan.rewrittenLines).toBe(1);
+    expect(plan.contents).toBe("host all all 127.0.0.1/32 scram-sha-256 # legacy cleartext\n");
+  });
+
+  it("preserves CRLF line endings", () => {
+    const plan = planCleartextAuthRewrite("host all all 127.0.0.1/32 password\r\nhost all all ::1/128 scram-sha-256\r\n");
+
+    expect(plan.contents).toBe(
+      "host all all 127.0.0.1/32 scram-sha-256\r\nhost all all ::1/128 scram-sha-256\r\n",
+    );
+  });
+
+  it("leaves a body with no rules and no trailing newline unchanged", () => {
+    expect(planCleartextAuthRewrite("").contents).toBe("");
+    expect(planCleartextAuthRewrite("# nothing here").rewrittenLines).toBe(0);
+    expect(planCleartextAuthRewrite("# nothing here").contents).toBe("# nothing here");
+  });
+
+  it("does not guess at an unknown record type", () => {
+    const plan = planCleartextAuthRewrite("magic all all 127.0.0.1/32 password\n");
+
+    expect(plan.rewrittenLines).toBe(0);
+  });
+});
+
 describeEmbeddedPostgres("embedded postgres credential rotation", () => {
   it(
     "rotates a legacy cluster onto a generated password and the legacy literal stops working",
@@ -250,6 +324,65 @@ describeEmbeddedPostgres("embedded postgres credential rotation", () => {
         rotateEmbeddedPostgresPassword({ dataDir, port }),
       ).rejects.toMatchObject({ code: "28P01" });
       expect(fs.existsSync(embeddedPostgresPasswordPath(dataDir))).toBe(false);
+    },
+    EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "rewrites a legacy cluster's pg_hba.conf to scram and keeps the stored credential working",
+    async () => {
+      const cluster = await startLegacyCluster();
+      await rotateEmbeddedPostgresPassword({ dataDir: cluster.dataDir, port: cluster.port });
+
+      const hbaPath = embeddedPostgresHbaPath(cluster.dataDir);
+      const before = fs.readFileSync(hbaPath, "utf8");
+      expect(before).toMatch(/password/);
+
+      const outcome = await ensureEmbeddedPostgresScramAuth({
+        dataDir: cluster.dataDir,
+        port: cluster.port,
+      });
+
+      expect(outcome.status).toBe("rewritten");
+      const after = fs.readFileSync(hbaPath, "utf8");
+      expect(after).not.toMatch(/\spassword\b/);
+      expect(after).toContain("scram-sha-256");
+      expect(fs.statSync(hbaPath).mode & 0o777).toBe(0o600);
+
+      // The reloaded rules still accept the stored credential on a fresh
+      // connection: the rewrite did not lock the cluster out of itself.
+      const sql = postgres(
+        embeddedPostgresUrl({ dataDir: cluster.dataDir, port: cluster.port, database: "postgres" }),
+        { max: 1, onnotice: () => {} },
+      );
+      try {
+        await expect(sql`select 1 as ok`).resolves.toBeDefined();
+      } finally {
+        await sql.end({ timeout: 5 });
+      }
+
+      // A second start is a no-op, not a rewrite loop.
+      const again = await ensureEmbeddedPostgresScramAuth({
+        dataDir: cluster.dataDir,
+        port: cluster.port,
+      });
+      expect(again.status).toBe("unchanged");
+    },
+    EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "refuses to rewrite while the cluster still uses the shipped literal",
+    async () => {
+      const cluster = await startLegacyCluster();
+
+      const outcome = await ensureEmbeddedPostgresScramAuth({
+        dataDir: cluster.dataDir,
+        port: cluster.port,
+      });
+
+      expect(outcome).toMatchObject({ status: "skipped", reason: "legacy-credential" });
+      expect(fs.readFileSync(embeddedPostgresHbaPath(cluster.dataDir), "utf8")).toContain("password");
     },
     EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
   );
