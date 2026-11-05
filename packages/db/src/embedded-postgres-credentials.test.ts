@@ -5,16 +5,22 @@ import { afterEach, describe, expect, it } from "vitest";
 import postgres from "postgres";
 import {
   EMBEDDED_POSTGRES_PASSWORD_FILENAME,
+  EMBEDDED_POSTGRES_ADMIN_PASSWORD_FILENAME,
   LEGACY_EMBEDDED_POSTGRES_PASSWORD,
   embeddedPostgresPasswordPath,
+  embeddedPostgresAdminPasswordPath,
   embeddedPostgresUrl,
+  embeddedPostgresAdminUrl,
   generateEmbeddedPostgresPassword,
   persistEmbeddedPostgresPassword,
   resolveEmbeddedPostgresCredentials,
+  resolveEmbeddedPostgresAdminCredentials,
   resolveEmbeddedPostgresInitialisationPassword,
   rotateEmbeddedPostgresPassword,
   embeddedPostgresHbaPath,
   ensureEmbeddedPostgresScramAuth,
+  ensureEmbeddedPostgresAdminRole,
+  restrictEmbeddedPostgresApplicationRole,
   planCleartextAuthRewrite,
 } from "./embedded-postgres-credentials.js";
 import { prepareEmbeddedPostgresNativeRuntime } from "./embedded-postgres-native.js";
@@ -133,6 +139,23 @@ describe("embedded postgres credentials", () => {
     const password = generateEmbeddedPostgresPassword();
     expect(password).not.toBe(generateEmbeddedPostgresPassword());
     expect(password).not.toBe(LEGACY_EMBEDDED_POSTGRES_PASSWORD);
+  });
+});
+
+describe("embedded postgres admin credentials", () => {
+  it("keeps the admin credential inside the cluster data directory", () => {
+    const dataDir = createTempDataDir();
+    expect(embeddedPostgresAdminPasswordPath(dataDir)).toBe(
+      path.join(dataDir, EMBEDDED_POSTGRES_ADMIN_PASSWORD_FILENAME),
+    );
+  });
+
+  it("reports no admin credential until control 2 has created one", () => {
+    const dataDir = createTempDataDir();
+    expect(resolveEmbeddedPostgresAdminCredentials(dataDir)).toBeNull();
+    expect(() => embeddedPostgresAdminUrl({ dataDir, port: 54329, database: "postgres" })).toThrow(
+      /No embedded PostgreSQL administrative credential/,
+    );
   });
 });
 
@@ -383,6 +406,207 @@ describeEmbeddedPostgres("embedded postgres credential rotation", () => {
 
       expect(outcome).toMatchObject({ status: "skipped", reason: "legacy-credential" });
       expect(fs.readFileSync(embeddedPostgresHbaPath(cluster.dataDir), "utf8")).toContain("password");
+    },
+    EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
+  );
+});
+
+describeEmbeddedPostgres("embedded postgres least privilege (NEXA-755 control 2)", () => {
+  async function readApplicationRole(url: string) {
+    const sql = postgres(url, { max: 1, onnotice: () => {} });
+    try {
+      const rows = await sql<{
+        rolsuper: boolean;
+        rolcreaterole: boolean;
+        rolcreatedb: boolean;
+      }[]>`
+        select rolsuper, rolcreaterole, rolcreatedb
+        from pg_roles where rolname = current_user
+      `;
+      return rows[0];
+    } finally {
+      await sql.end({ timeout: 5 }).catch(() => undefined);
+    }
+  }
+
+  async function prepareCluster() {
+    const cluster = await startLegacyCluster();
+    const rotated = await rotateEmbeddedPostgresPassword({
+      dataDir: cluster.dataDir,
+      port: cluster.port,
+    });
+    await ensureEmbeddedPostgresScramAuth({ dataDir: cluster.dataDir, port: cluster.port });
+    return { cluster, rotated };
+  }
+
+  it(
+    "creates a separate admin superuser and removes CREATEROLE from the bootstrap application role",
+    async () => {
+      const { cluster, rotated } = await prepareCluster();
+      const applicationUrl = embeddedPostgresUrl({
+        dataDir: cluster.dataDir,
+        port: cluster.port,
+        database: "postgres",
+      });
+      expect((await readApplicationRole(applicationUrl))?.rolsuper).toBe(true);
+
+      const adminOutcome = await ensureEmbeddedPostgresAdminRole({
+        dataDir: cluster.dataDir,
+        port: cluster.port,
+      });
+      expect(adminOutcome.status).toBe("created");
+
+      const adminPath = embeddedPostgresAdminPasswordPath(cluster.dataDir);
+      expect(fs.statSync(adminPath).mode & 0o777).toBe(0o600);
+      const admin = resolveEmbeddedPostgresAdminCredentials(cluster.dataDir);
+      expect(admin).not.toBeNull();
+      expect(admin?.password).not.toBe(rotated.password);
+
+      // The administrative role is a working superuser login.
+      const adminSql = postgres(
+        embeddedPostgresAdminUrl({ dataDir: cluster.dataDir, port: cluster.port, database: "postgres" }),
+        { max: 1, onnotice: () => {} },
+      );
+      try {
+        const [{ rolsuper }] = await adminSql<{ rolsuper: boolean }[]>`
+          select rolsuper from pg_roles where rolname = current_user
+        `;
+        expect(rolsuper).toBe(true);
+
+        const restricted = await restrictEmbeddedPostgresApplicationRole({
+          dataDir: cluster.dataDir,
+          port: cluster.port,
+        });
+        // PostgreSQL 18 refuses to remove SUPERUSER from the bootstrap
+        // superuser (`paperclip` is OID 10 here), so the reachable state is
+        // CREATEROLE removed and SUPERUSER retained.
+        expect(restricted).toEqual({
+          status: "createrole-restricted",
+          retained: "bootstrap-superuser",
+        });
+
+        // A fresh application connection still works, keeps CREATEDB for
+        // first-run database creation, and keeps the engine-mandated SUPERUSER.
+        const attributes = await readApplicationRole(applicationUrl);
+        expect(attributes).toMatchObject({
+          rolsuper: true,
+          rolcreaterole: false,
+          rolcreatedb: true,
+        });
+
+        // The admin path survived, and it is the documented rollback: it can
+        // hand CREATEROLE back to the application role.
+        await adminSql.unsafe("ALTER ROLE paperclip CREATEROLE");
+        expect((await readApplicationRole(applicationUrl))?.rolcreaterole).toBe(true);
+      } finally {
+        await adminSql.end({ timeout: 5 }).catch(() => undefined);
+      }
+    },
+    EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "is idempotent and keeps the same admin credential on the next start",
+    async () => {
+      const { cluster } = await prepareCluster();
+      expect(
+        (await ensureEmbeddedPostgresAdminRole({ dataDir: cluster.dataDir, port: cluster.port })).status,
+      ).toBe("created");
+      const first = resolveEmbeddedPostgresAdminCredentials(cluster.dataDir)?.password;
+      expect(
+        (await ensureEmbeddedPostgresAdminRole({ dataDir: cluster.dataDir, port: cluster.port })).status,
+      ).toBe("existing");
+      expect(resolveEmbeddedPostgresAdminCredentials(cluster.dataDir)?.password).toBe(first);
+
+      expect(
+        await restrictEmbeddedPostgresApplicationRole({ dataDir: cluster.dataDir, port: cluster.port }),
+      ).toEqual({ status: "createrole-restricted", retained: "bootstrap-superuser" });
+      expect(
+        await restrictEmbeddedPostgresApplicationRole({ dataDir: cluster.dataDir, port: cluster.port }),
+      ).toEqual({ status: "createrole-restricted", retained: "bootstrap-superuser" });
+    },
+    EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "does not create an admin role while the cluster still uses the shipped literal",
+    async () => {
+      const cluster = await startLegacyCluster();
+
+      const outcome = await ensureEmbeddedPostgresAdminRole({
+        dataDir: cluster.dataDir,
+        port: cluster.port,
+      });
+
+      expect(outcome).toEqual({ status: "skipped", reason: "legacy-credential" });
+      expect(fs.existsSync(embeddedPostgresAdminPasswordPath(cluster.dataDir))).toBe(false);
+      const sql = postgres(
+        `postgres://paperclip:${LEGACY_EMBEDDED_POSTGRES_PASSWORD}@127.0.0.1:${cluster.port}/postgres`,
+        { max: 1, onnotice: () => {} },
+      );
+      try {
+        const [{ count }] = await sql<{ count: number }[]>`
+          select count(*)::int as count from pg_roles where rolname = 'paperclip_admin'
+        `;
+        expect(count).toBe(0);
+      } finally {
+        await sql.end({ timeout: 5 }).catch(() => undefined);
+      }
+    },
+    EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "skips the demotion when no admin credential exists",
+    async () => {
+      const { cluster } = await prepareCluster();
+      const applicationUrl = embeddedPostgresUrl({
+        dataDir: cluster.dataDir,
+        port: cluster.port,
+        database: "postgres",
+      });
+
+      const outcome = await restrictEmbeddedPostgresApplicationRole({
+        dataDir: cluster.dataDir,
+        port: cluster.port,
+      });
+
+      expect(outcome).toEqual({ status: "skipped", reason: "no-admin-credential" });
+      expect((await readApplicationRole(applicationUrl))?.rolsuper).toBe(true);
+    },
+    EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "keeps control 1 working after the application role is demoted",
+    async () => {
+      const { cluster } = await prepareCluster();
+      await ensureEmbeddedPostgresAdminRole({ dataDir: cluster.dataDir, port: cluster.port });
+      expect(
+        (await restrictEmbeddedPostgresApplicationRole({ dataDir: cluster.dataDir, port: cluster.port })).status,
+      ).toBe("createrole-restricted");
+
+      // Simulate an operator restoring a pre-upgrade pg_hba.conf.
+      const hbaPath = embeddedPostgresHbaPath(cluster.dataDir);
+      const demotedHba = fs.readFileSync(hbaPath, "utf8").replace(/scram-sha-256/g, "password");
+      expect(demotedHba).toMatch(/\spassword\b/);
+      fs.writeFileSync(hbaPath, demotedHba);
+
+      // The rewrite reads the verifier through the administrative role, which
+      // is the only superuser left.
+      const outcome = await ensureEmbeddedPostgresScramAuth({
+        dataDir: cluster.dataDir,
+        port: cluster.port,
+      });
+      expect(outcome.status).toBe("rewritten");
+      expect(fs.readFileSync(hbaPath, "utf8")).not.toMatch(/\spassword\b/);
+
+      const attributes = await readApplicationRole(
+        embeddedPostgresUrl({ dataDir: cluster.dataDir, port: cluster.port, database: "postgres" }),
+      );
+      // SUPERUSER is retained because the engine forbids removing it from the
+      // bootstrap superuser; CREATEROLE is gone, which is the reachable limit.
+      expect(attributes).toMatchObject({ rolsuper: true, rolcreaterole: false });
     },
     EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
   );

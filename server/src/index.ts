@@ -78,6 +78,8 @@ import {
   resolveEmbeddedPostgresInitialisationPassword,
   rotateEmbeddedPostgresPassword,
   ensureEmbeddedPostgresScramAuth,
+  ensureEmbeddedPostgresAdminRole,
+  restrictEmbeddedPostgresApplicationRole,
   reconcilePendingMigrationHistory,
   formatDatabaseBackupResult,
   runDatabaseBackup,
@@ -670,6 +672,35 @@ async function startServerWithDatabaseTeardown(
           logger.warn(
             { reason: scramAuthOutcome.reason, detail: scramAuthOutcome.detail },
             "Left embedded PostgreSQL pg_hba.conf on cleartext password auth; the stored credential could not be proven SCRAM-compatible",
+          );
+        }
+        // NEXA-755, control 2. Create the separate administrative path first
+        // and only then remove SUPERUSER/CREATEROLE from the role the board
+        // uses, so the cluster never ends up with zero usable superusers.
+        const adminRoleOutcome = await ensureEmbeddedPostgresAdminRole({ dataDir, port });
+        if (adminRoleOutcome.status === "created") {
+          logger.info(
+            "Created the embedded PostgreSQL administrative role paperclip_admin",
+          );
+        } else if (adminRoleOutcome.status === "skipped") {
+          logger.warn(
+            { reason: adminRoleOutcome.reason },
+            "Skipped creating the embedded PostgreSQL administrative role",
+          );
+        }
+        const applicationRoleOutcome = await restrictEmbeddedPostgresApplicationRole({ dataDir, port });
+        if (applicationRoleOutcome.status === "restricted") {
+          logger.info(
+            "Removed SUPERUSER/CREATEROLE from the embedded PostgreSQL application role paperclip",
+          );
+        } else if (applicationRoleOutcome.status === "createrole-restricted") {
+          logger.warn(
+            "Removed CREATEROLE from the embedded PostgreSQL application role paperclip, but kept SUPERUSER: PostgreSQL refuses to remove it from the bootstrap superuser (OID 10)",
+          );
+        } else if (applicationRoleOutcome.status === "skipped") {
+          logger.warn(
+            { reason: applicationRoleOutcome.reason },
+            "Left the embedded PostgreSQL application role unchanged; no verified administrative path is available",
           );
         }
         embeddedPostgresSupervisor = createEmbeddedPostgresSupervisor({
