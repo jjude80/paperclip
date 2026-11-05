@@ -1958,7 +1958,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     expect(rows[0]?.idempotencyKey).toBe("run-1:questionnaire");
   });
 
-  it("supersedes older pending confirmations from the same agent without crossing agent or kind", async () => {
+  it("supersedes only a same-subject older confirmation without crossing agent or kind", async () => {
     const { companyId, issueId } = await seedConfirmationIssue("Newer confirmation supersedes older");
     const firstAgentId = randomUUID();
     const secondAgentId = randomUUID();
@@ -1970,7 +1970,12 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     const older = await interactionsSvc.create({ id: issueId, companyId }, {
       kind: "request_confirmation",
       idempotencyKey: "confirmation:first:older",
-      payload: { version: 1, prompt: "Approve the older draft?" },
+      payload: { version: 1, prompt: "Approve the draft?" },
+    }, { agentId: firstAgentId });
+    const unrelated = await interactionsSvc.create({ id: issueId, companyId }, {
+      kind: "request_confirmation",
+      idempotencyKey: "confirmation:first:unrelated",
+      payload: { version: 1, prompt: "Rotate the signing secret?" },
     }, { agentId: firstAgentId });
     const otherKind = await interactionsSvc.create({ id: issueId, companyId }, {
       kind: "request_checkbox_confirmation",
@@ -1984,12 +1989,12 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     const otherAgent = await interactionsSvc.create({ id: issueId, companyId }, {
       kind: "request_confirmation",
       idempotencyKey: "confirmation:second",
-      payload: { version: 1, prompt: "Approve the second agent's draft?" },
+      payload: { version: 1, prompt: "Approve the draft?" },
     }, { agentId: secondAgentId });
     const replacement = await interactionsSvc.create({ id: issueId, companyId }, {
       kind: "request_confirmation",
       idempotencyKey: "confirmation:first:newer",
-      payload: { version: 1, prompt: "Approve the newer draft?" },
+      payload: { version: 1, prompt: "Approve the draft?" },
     }, { agentId: firstAgentId });
 
     const interactions = await interactionsSvc.listForIssue(issueId);
@@ -2002,8 +2007,12 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       },
     });
     expect(interactions.find((interaction) => interaction.id === replacement.id)?.status).toBe("pending");
+    // A differently-worded request from the same agent is a different decision
+    // and must stay in the owner's queue (NEXA-773).
+    expect(interactions.find((interaction) => interaction.id === unrelated.id)?.status).toBe("pending");
     expect(interactions.find((interaction) => interaction.id === otherAgent.id)?.status).toBe("pending");
     expect(interactions.find((interaction) => interaction.id === otherKind.id)?.status).toBe("pending");
+    expect(replacement.supersededInteractionIds).toEqual([older.id]);
   });
 
   it("supersedes an agent's own older pending ask_user_questions without crossing agent, kind, or issue", async () => {
@@ -2166,6 +2175,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
 
     const firstAgentIds = [randomUUID(), randomUUID(), randomUUID()];
     const secondAgentIds = [randomUUID(), randomUUID()];
+    const unrelatedId = randomUUID();
     const checkboxId = randomUUID();
     await db.insert(issueThreadInteractions).values([
       ...firstAgentIds.map((id, index) => ({
@@ -2176,7 +2186,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         status: "pending",
         continuationPolicy: "wake_assignee",
         createdByAgentId: firstAgentId,
-        payload: { version: 1 as const, prompt: `First agent draft ${index + 1}` },
+        payload: { version: 1 as const, prompt: "Approve the draft?" },
         createdAt: new Date(`2026-07-01T12:0${index}:00.000Z`),
         updatedAt: new Date(`2026-07-01T12:0${index}:00.000Z`),
       })),
@@ -2188,10 +2198,22 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         status: "pending",
         continuationPolicy: "wake_assignee",
         createdByAgentId: secondAgentId,
-        payload: { version: 1 as const, prompt: `Second agent draft ${index + 1}` },
+        payload: { version: 1 as const, prompt: "Approve the second agent's draft?" },
         createdAt: new Date(`2026-07-01T13:0${index}:00.000Z`),
         updatedAt: new Date(`2026-07-01T13:0${index}:00.000Z`),
       })),
+      {
+        id: unrelatedId,
+        companyId,
+        issueId,
+        kind: "request_confirmation",
+        status: "pending",
+        continuationPolicy: "wake_assignee",
+        createdByAgentId: firstAgentId,
+        payload: { version: 1 as const, prompt: "Rotate the signing secret?" },
+        createdAt: new Date("2026-07-01T12:59:00.000Z"),
+        updatedAt: new Date("2026-07-01T12:59:00.000Z"),
+      },
       {
         id: checkboxId,
         companyId,
@@ -2230,6 +2252,9 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       },
     });
     expect(interactions.find((interaction) => interaction.id === secondAgentIds[1])?.status).toBe("pending");
+    // A different subject on the same issue is not a duplicate and survives the
+    // restart sweep (NEXA-773).
+    expect(interactions.find((interaction) => interaction.id === unrelatedId)?.status).toBe("pending");
     expect(interactions.find((interaction) => interaction.id === checkboxId)?.status).toBe("pending");
   });
 
@@ -2326,6 +2351,55 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     }, requiresReason.id, {}, {
       userId: "local-board",
     })).rejects.toThrow("A decline reason is required for this confirmation");
+  });
+
+  it("stores and returns request_confirmation payload.metadata (NEXA-772)", async () => {
+    // The gate that reads this marker runs after the person answers, so the key
+    // has to survive both the write and the hydrate-on-read path. Before this,
+    // an unknown payload key was dropped by the validator with no error.
+    const companyId = randomUUID();
+    const goalId = randomUUID();
+    const issueId = randomUUID();
+
+    await db.insert(companies).values(interactionCompanyRow(companyId));
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false });
+    await db.insert(goals).values({
+      id: goalId,
+      companyId,
+      title: "Confirm a gated action",
+      level: "task",
+      status: "active",
+    });
+    await db.insert(issues).values(parentIssueRow(issueId, companyId, goalId));
+
+    const created = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_confirmation",
+      payload: {
+        version: 1,
+        prompt: "Run the approved rotation?",
+        metadata: { rotationOption: "rotate-idle" },
+      },
+    }, {
+      userId: "local-board",
+    });
+
+    const [storedRow] = await db
+      .select()
+      .from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.id, created.id));
+    expect((storedRow!.payload as { metadata?: unknown }).metadata).toEqual({
+      rotationOption: "rotate-idle",
+    });
+
+    const listed = await interactionsSvc.listForIssue(issueId);
+    const readBack = listed.find((interaction) => interaction.id === created.id);
+    if (readBack?.kind !== "request_confirmation") {
+      throw new Error("expected the created request_confirmation back");
+    }
+    expect(readBack.payload.metadata).toEqual({ rotationOption: "rotate-idle" });
   });
 
   it("stores a declared human attestation on accept, and nothing when undeclared", async () => {

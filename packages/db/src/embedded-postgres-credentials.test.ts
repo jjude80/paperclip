@@ -5,14 +5,23 @@ import { afterEach, describe, expect, it } from "vitest";
 import postgres from "postgres";
 import {
   EMBEDDED_POSTGRES_PASSWORD_FILENAME,
+  EMBEDDED_POSTGRES_ADMIN_PASSWORD_FILENAME,
   LEGACY_EMBEDDED_POSTGRES_PASSWORD,
   embeddedPostgresPasswordPath,
+  embeddedPostgresAdminPasswordPath,
   embeddedPostgresUrl,
+  embeddedPostgresAdminUrl,
   generateEmbeddedPostgresPassword,
   persistEmbeddedPostgresPassword,
   resolveEmbeddedPostgresCredentials,
+  resolveEmbeddedPostgresAdminCredentials,
   resolveEmbeddedPostgresInitialisationPassword,
   rotateEmbeddedPostgresPassword,
+  embeddedPostgresHbaPath,
+  ensureEmbeddedPostgresScramAuth,
+  ensureEmbeddedPostgresAdminRole,
+  restrictEmbeddedPostgresApplicationRole,
+  planCleartextAuthRewrite,
 } from "./embedded-postgres-credentials.js";
 import { prepareEmbeddedPostgresNativeRuntime } from "./embedded-postgres-native.js";
 import {
@@ -133,6 +142,23 @@ describe("embedded postgres credentials", () => {
   });
 });
 
+describe("embedded postgres admin credentials", () => {
+  it("keeps the admin credential inside the cluster data directory", () => {
+    const dataDir = createTempDataDir();
+    expect(embeddedPostgresAdminPasswordPath(dataDir)).toBe(
+      path.join(dataDir, EMBEDDED_POSTGRES_ADMIN_PASSWORD_FILENAME),
+    );
+  });
+
+  it("reports no admin credential until control 2 has created one", () => {
+    const dataDir = createTempDataDir();
+    expect(resolveEmbeddedPostgresAdminCredentials(dataDir)).toBeNull();
+    expect(() => embeddedPostgresAdminUrl({ dataDir, port: 54329, database: "postgres" })).toThrow(
+      /No embedded PostgreSQL administrative credential/,
+    );
+  });
+});
+
 type LegacyCluster = {
   dataDir: string;
   port: number;
@@ -166,6 +192,77 @@ async function startLegacyCluster(): Promise<LegacyCluster> {
   cleanups.push(stop);
   return { dataDir, port, stop };
 }
+
+
+const LEGACY_HBA = `# PostgreSQL Client Authentication Configuration File
+# TYPE  DATABASE        USER            ADDRESS                 METHOD
+
+local   all             all                                     password
+host    all             all             127.0.0.1/32            password
+host    all             all             ::1/128                 password
+local   replication     all                                     password
+host    replication     all             127.0.0.1/32            password
+host    replication     all             ::1/128                 password
+
+# Other methods are not ours to change.
+local   all             postgres                                peer
+host    all             all             10.0.0.0/8              trust
+host    all             all             192.168.0.0/16          md5
+`;
+
+describe("cleartext pg_hba.conf rewrite", () => {
+  it("moves every cleartext password rule to scram-sha-256 and nothing else", () => {
+    const plan = planCleartextAuthRewrite(LEGACY_HBA);
+
+    expect(plan.rewrittenLines).toBe(6);
+    expect(plan.contents).not.toMatch(/\bpassword\b\s*$/m);
+    expect(plan.contents).not.toContain("password");
+    // Untouched methods stay exactly as they were.
+    expect(plan.contents).toContain("local   all             postgres                                peer");
+    expect(plan.contents).toContain("host    all             all             10.0.0.0/8              trust");
+    expect(plan.contents).toContain("host    all             all             192.168.0.0/16          md5");
+    // Spacing and comments are preserved, so the change reads as a one-token diff.
+    expect(plan.contents).toContain(
+      "local   all             all                                     scram-sha-256",
+    );
+    expect(plan.contents).toContain("# Other methods are not ours to change.");
+  });
+
+  it("is idempotent: a SCRAM file is left byte-identical", () => {
+    const once = planCleartextAuthRewrite(LEGACY_HBA);
+    const twice = planCleartextAuthRewrite(once.contents);
+
+    expect(twice.rewrittenLines).toBe(0);
+    expect(twice.contents).toBe(once.contents);
+  });
+
+  it("keeps a trailing comment on the same line", () => {
+    const plan = planCleartextAuthRewrite("host all all 127.0.0.1/32 password # legacy cleartext\n");
+
+    expect(plan.rewrittenLines).toBe(1);
+    expect(plan.contents).toBe("host all all 127.0.0.1/32 scram-sha-256 # legacy cleartext\n");
+  });
+
+  it("preserves CRLF line endings", () => {
+    const plan = planCleartextAuthRewrite("host all all 127.0.0.1/32 password\r\nhost all all ::1/128 scram-sha-256\r\n");
+
+    expect(plan.contents).toBe(
+      "host all all 127.0.0.1/32 scram-sha-256\r\nhost all all ::1/128 scram-sha-256\r\n",
+    );
+  });
+
+  it("leaves a body with no rules and no trailing newline unchanged", () => {
+    expect(planCleartextAuthRewrite("").contents).toBe("");
+    expect(planCleartextAuthRewrite("# nothing here").rewrittenLines).toBe(0);
+    expect(planCleartextAuthRewrite("# nothing here").contents).toBe("# nothing here");
+  });
+
+  it("does not guess at an unknown record type", () => {
+    const plan = planCleartextAuthRewrite("magic all all 127.0.0.1/32 password\n");
+
+    expect(plan.rewrittenLines).toBe(0);
+  });
+});
 
 describeEmbeddedPostgres("embedded postgres credential rotation", () => {
   it(
@@ -250,6 +347,266 @@ describeEmbeddedPostgres("embedded postgres credential rotation", () => {
         rotateEmbeddedPostgresPassword({ dataDir, port }),
       ).rejects.toMatchObject({ code: "28P01" });
       expect(fs.existsSync(embeddedPostgresPasswordPath(dataDir))).toBe(false);
+    },
+    EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "rewrites a legacy cluster's pg_hba.conf to scram and keeps the stored credential working",
+    async () => {
+      const cluster = await startLegacyCluster();
+      await rotateEmbeddedPostgresPassword({ dataDir: cluster.dataDir, port: cluster.port });
+
+      const hbaPath = embeddedPostgresHbaPath(cluster.dataDir);
+      const before = fs.readFileSync(hbaPath, "utf8");
+      expect(before).toMatch(/password/);
+
+      const outcome = await ensureEmbeddedPostgresScramAuth({
+        dataDir: cluster.dataDir,
+        port: cluster.port,
+      });
+
+      expect(outcome.status).toBe("rewritten");
+      const after = fs.readFileSync(hbaPath, "utf8");
+      expect(after).not.toMatch(/\spassword\b/);
+      expect(after).toContain("scram-sha-256");
+      expect(fs.statSync(hbaPath).mode & 0o777).toBe(0o600);
+
+      // The reloaded rules still accept the stored credential on a fresh
+      // connection: the rewrite did not lock the cluster out of itself.
+      const sql = postgres(
+        embeddedPostgresUrl({ dataDir: cluster.dataDir, port: cluster.port, database: "postgres" }),
+        { max: 1, onnotice: () => {} },
+      );
+      try {
+        await expect(sql`select 1 as ok`).resolves.toBeDefined();
+      } finally {
+        await sql.end({ timeout: 5 });
+      }
+
+      // A second start is a no-op, not a rewrite loop.
+      const again = await ensureEmbeddedPostgresScramAuth({
+        dataDir: cluster.dataDir,
+        port: cluster.port,
+      });
+      expect(again.status).toBe("unchanged");
+    },
+    EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "refuses to rewrite while the cluster still uses the shipped literal",
+    async () => {
+      const cluster = await startLegacyCluster();
+
+      const outcome = await ensureEmbeddedPostgresScramAuth({
+        dataDir: cluster.dataDir,
+        port: cluster.port,
+      });
+
+      expect(outcome).toMatchObject({ status: "skipped", reason: "legacy-credential" });
+      expect(fs.readFileSync(embeddedPostgresHbaPath(cluster.dataDir), "utf8")).toContain("password");
+    },
+    EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
+  );
+});
+
+describeEmbeddedPostgres("embedded postgres least privilege (NEXA-755 control 2)", () => {
+  async function readApplicationRole(url: string) {
+    const sql = postgres(url, { max: 1, onnotice: () => {} });
+    try {
+      const rows = await sql<{
+        rolsuper: boolean;
+        rolcreaterole: boolean;
+        rolcreatedb: boolean;
+      }[]>`
+        select rolsuper, rolcreaterole, rolcreatedb
+        from pg_roles where rolname = current_user
+      `;
+      return rows[0];
+    } finally {
+      await sql.end({ timeout: 5 }).catch(() => undefined);
+    }
+  }
+
+  async function prepareCluster() {
+    const cluster = await startLegacyCluster();
+    const rotated = await rotateEmbeddedPostgresPassword({
+      dataDir: cluster.dataDir,
+      port: cluster.port,
+    });
+    await ensureEmbeddedPostgresScramAuth({ dataDir: cluster.dataDir, port: cluster.port });
+    return { cluster, rotated };
+  }
+
+  it(
+    "creates a separate admin superuser and removes CREATEROLE from the bootstrap application role",
+    async () => {
+      const { cluster, rotated } = await prepareCluster();
+      const applicationUrl = embeddedPostgresUrl({
+        dataDir: cluster.dataDir,
+        port: cluster.port,
+        database: "postgres",
+      });
+      expect((await readApplicationRole(applicationUrl))?.rolsuper).toBe(true);
+
+      const adminOutcome = await ensureEmbeddedPostgresAdminRole({
+        dataDir: cluster.dataDir,
+        port: cluster.port,
+      });
+      expect(adminOutcome.status).toBe("created");
+
+      const adminPath = embeddedPostgresAdminPasswordPath(cluster.dataDir);
+      expect(fs.statSync(adminPath).mode & 0o777).toBe(0o600);
+      const admin = resolveEmbeddedPostgresAdminCredentials(cluster.dataDir);
+      expect(admin).not.toBeNull();
+      expect(admin?.password).not.toBe(rotated.password);
+
+      // The administrative role is a working superuser login.
+      const adminSql = postgres(
+        embeddedPostgresAdminUrl({ dataDir: cluster.dataDir, port: cluster.port, database: "postgres" }),
+        { max: 1, onnotice: () => {} },
+      );
+      try {
+        const [{ rolsuper }] = await adminSql<{ rolsuper: boolean }[]>`
+          select rolsuper from pg_roles where rolname = current_user
+        `;
+        expect(rolsuper).toBe(true);
+
+        const restricted = await restrictEmbeddedPostgresApplicationRole({
+          dataDir: cluster.dataDir,
+          port: cluster.port,
+        });
+        // PostgreSQL 18 refuses to remove SUPERUSER from the bootstrap
+        // superuser (`paperclip` is OID 10 here), so the reachable state is
+        // CREATEROLE removed and SUPERUSER retained.
+        expect(restricted).toEqual({
+          status: "createrole-restricted",
+          retained: "bootstrap-superuser",
+        });
+
+        // A fresh application connection still works, keeps CREATEDB for
+        // first-run database creation, and keeps the engine-mandated SUPERUSER.
+        const attributes = await readApplicationRole(applicationUrl);
+        expect(attributes).toMatchObject({
+          rolsuper: true,
+          rolcreaterole: false,
+          rolcreatedb: true,
+        });
+
+        // The admin path survived, and it is the documented rollback: it can
+        // hand CREATEROLE back to the application role.
+        await adminSql.unsafe("ALTER ROLE paperclip CREATEROLE");
+        expect((await readApplicationRole(applicationUrl))?.rolcreaterole).toBe(true);
+      } finally {
+        await adminSql.end({ timeout: 5 }).catch(() => undefined);
+      }
+    },
+    EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "is idempotent and keeps the same admin credential on the next start",
+    async () => {
+      const { cluster } = await prepareCluster();
+      expect(
+        (await ensureEmbeddedPostgresAdminRole({ dataDir: cluster.dataDir, port: cluster.port })).status,
+      ).toBe("created");
+      const first = resolveEmbeddedPostgresAdminCredentials(cluster.dataDir)?.password;
+      expect(
+        (await ensureEmbeddedPostgresAdminRole({ dataDir: cluster.dataDir, port: cluster.port })).status,
+      ).toBe("existing");
+      expect(resolveEmbeddedPostgresAdminCredentials(cluster.dataDir)?.password).toBe(first);
+
+      expect(
+        await restrictEmbeddedPostgresApplicationRole({ dataDir: cluster.dataDir, port: cluster.port }),
+      ).toEqual({ status: "createrole-restricted", retained: "bootstrap-superuser" });
+      expect(
+        await restrictEmbeddedPostgresApplicationRole({ dataDir: cluster.dataDir, port: cluster.port }),
+      ).toEqual({ status: "createrole-restricted", retained: "bootstrap-superuser" });
+    },
+    EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "does not create an admin role while the cluster still uses the shipped literal",
+    async () => {
+      const cluster = await startLegacyCluster();
+
+      const outcome = await ensureEmbeddedPostgresAdminRole({
+        dataDir: cluster.dataDir,
+        port: cluster.port,
+      });
+
+      expect(outcome).toEqual({ status: "skipped", reason: "legacy-credential" });
+      expect(fs.existsSync(embeddedPostgresAdminPasswordPath(cluster.dataDir))).toBe(false);
+      const sql = postgres(
+        `postgres://paperclip:${LEGACY_EMBEDDED_POSTGRES_PASSWORD}@127.0.0.1:${cluster.port}/postgres`,
+        { max: 1, onnotice: () => {} },
+      );
+      try {
+        const [{ count }] = await sql<{ count: number }[]>`
+          select count(*)::int as count from pg_roles where rolname = 'paperclip_admin'
+        `;
+        expect(count).toBe(0);
+      } finally {
+        await sql.end({ timeout: 5 }).catch(() => undefined);
+      }
+    },
+    EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "skips the demotion when no admin credential exists",
+    async () => {
+      const { cluster } = await prepareCluster();
+      const applicationUrl = embeddedPostgresUrl({
+        dataDir: cluster.dataDir,
+        port: cluster.port,
+        database: "postgres",
+      });
+
+      const outcome = await restrictEmbeddedPostgresApplicationRole({
+        dataDir: cluster.dataDir,
+        port: cluster.port,
+      });
+
+      expect(outcome).toEqual({ status: "skipped", reason: "no-admin-credential" });
+      expect((await readApplicationRole(applicationUrl))?.rolsuper).toBe(true);
+    },
+    EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "keeps control 1 working after the application role is demoted",
+    async () => {
+      const { cluster } = await prepareCluster();
+      await ensureEmbeddedPostgresAdminRole({ dataDir: cluster.dataDir, port: cluster.port });
+      expect(
+        (await restrictEmbeddedPostgresApplicationRole({ dataDir: cluster.dataDir, port: cluster.port })).status,
+      ).toBe("createrole-restricted");
+
+      // Simulate an operator restoring a pre-upgrade pg_hba.conf.
+      const hbaPath = embeddedPostgresHbaPath(cluster.dataDir);
+      const demotedHba = fs.readFileSync(hbaPath, "utf8").replace(/scram-sha-256/g, "password");
+      expect(demotedHba).toMatch(/\spassword\b/);
+      fs.writeFileSync(hbaPath, demotedHba);
+
+      // The rewrite reads the verifier through the administrative role, which
+      // is the only superuser left.
+      const outcome = await ensureEmbeddedPostgresScramAuth({
+        dataDir: cluster.dataDir,
+        port: cluster.port,
+      });
+      expect(outcome.status).toBe("rewritten");
+      expect(fs.readFileSync(hbaPath, "utf8")).not.toMatch(/\spassword\b/);
+
+      const attributes = await readApplicationRole(
+        embeddedPostgresUrl({ dataDir: cluster.dataDir, port: cluster.port, database: "postgres" }),
+      );
+      // SUPERUSER is retained because the engine forbids removing it from the
+      // bootstrap superuser; CREATEROLE is gone, which is the reachable limit.
+      expect(attributes).toMatchObject({ rolsuper: true, rolcreaterole: false });
     },
     EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
   );

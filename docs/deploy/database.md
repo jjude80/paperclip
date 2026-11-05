@@ -24,6 +24,58 @@ Data persists across restarts. To reset: `rm -rf ~/.paperclip/instances/default/
 
 The Docker quickstart also uses embedded PostgreSQL by default.
 
+### Embedded cluster credentials and auth
+
+The embedded cluster listens on loopback only, but loopback is a network
+boundary, not an identity boundary: every local account can reach the port. So
+the cluster password is the access control for the board database.
+
+- Each cluster gets a random password stored at
+  `~/.paperclip/instances/default/db/embedded-postgres.password` (mode `0600`).
+  It travels with the data directory; back it up and restore it with the
+  cluster, and never commit it.
+- A cluster created before this behaviour existed (no password file) is rotated
+  onto a generated password **once**, by the process that starts the cluster.
+  A process that only adopts a running cluster never rotates it.
+- On that same owner-only start, `pg_hba.conf` host and local rules that still
+  ask for cleartext `password` auth are rewritten to `scram-sha-256` and
+  reloaded. This only happens when the stored verifier is provably SCRAM; if the
+  rules cannot be proven safe the file is left alone and a warning is logged.
+  If a fresh connection with the stored credential fails after the reload, the
+  original file is restored and the reload repeated.
+
+**Operator-visible change:** a local script or GUI that connects to the embedded
+port with cleartext password auth will be refused after the rewrite. Connect
+with the value from the password file (SCRAM) instead. Restoring a pre-upgrade
+`pg_hba.conf` reintroduces the cleartext rule; the next owner start rewrites it
+again.
+
+- On the same owner-only start the server creates a separate administrative
+  role, `paperclip_admin`, whose random password is stored at
+  `~/.paperclip/instances/default/db/embedded-postgres-admin.password` (mode
+  `0600`, same handling as the application credential), and only then removes
+  `CREATEROLE` from `paperclip`. It also attempts to remove `SUPERUSER`.
+  `CREATEDB` is kept because first-run database creation still uses it.
+- **PostgreSQL 18 limitation:** `paperclip` is normally the role `initdb`
+  created, which makes it the *bootstrap superuser*. PostgreSQL refuses to
+  remove that role's `SUPERUSER` attribute ("The bootstrap superuser must have
+  the SUPERUSER attribute", SQLSTATE `0A000`; the glossary states its superuser
+  status cannot be removed). On such a cluster the server keeps `SUPERUSER`,
+  logs a warning, and reports that only `CREATEROLE` was removed. Reaching true
+  least privilege for the application role requires a cluster initialised with
+  a different bootstrap superuser and a data migration, not an `ALTER ROLE`.
+- The demotion is verified with a fresh application connection, and the
+  administrative role is used to make the change. If verification fails, the
+  administrative role restores the previous attributes before the call throws.
+  The administrative credential keeps an administrative path available and is
+  what makes the change reversible; keep it with the data directory and never
+  commit it.
+- Operator-visible consequences: scripts that relied on `paperclip` having
+  `CREATEROLE` will fail. Use `paperclip_admin` for administrative work (role
+  management, untrusted extension installation, restoring a backup that creates
+  one). Trusted extensions such as `pg_trgm` and `fuzzystrmatch` still install
+  as the application role.
+
 ## 2. Local PostgreSQL (Docker)
 
 For a full PostgreSQL server locally:

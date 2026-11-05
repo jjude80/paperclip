@@ -26,14 +26,26 @@ function runShard(args) {
   return result.stdout.trim().split(/\s+/).filter(Boolean);
 }
 
+/**
+ * The caller may use `@master` or an immutable 40-hex commit SHA, but it must
+ * always point at the upstream repository: upstream master requires CODEOWNERS
+ * review and two required checks, so neither ref can be written by anyone who
+ * can push this fork. A branch ref, a tag, or this fork's own path would let a
+ * PR point its judge at a definition it controls, so those stay rejected.
+ */
+const TRUSTED_PR_WORKFLOW_REF =
+  /^\s+uses: paperclipai\/paperclip\/\.github\/workflows\/pr-trusted\.yml@(?:master|[0-9a-f]{40})\s*$/m;
+
 function readTrustedPrWorkflow() {
   const caller = readFileSync(prCallerWorkflow, "utf8");
   assert.match(
     caller,
-    /^\s+uses: paperclipai\/paperclip\/\.github\/workflows\/pr-trusted\.yml@master\s*$/m,
-    "pr.yml must call the trusted workflow from upstream's CODEOWNERS-protected master",
+    TRUSTED_PR_WORKFLOW_REF,
+    "pr.yml must call the trusted workflow from upstream's CODEOWNERS-protected master, at @master or an immutable commit SHA",
   );
-  // Validate proposed workflow changes locally; CI executes the merged master version.
+  // Validate the workflow definition locally so a PR that edits it still runs
+  // these shard and aggregate assertions. CI executes the pinned upstream
+  // revision, so bump this local mirror to the same commit as the caller SHA.
   return readFileSync(trustedPrWorkflow, "utf8");
 }
 
@@ -158,7 +170,7 @@ test("shard arguments are validated", () => {
   }
 });
 
-test("pr.yml calls the trusted PR workflow from master", () => {
+test("pr.yml calls the trusted PR workflow from a protected upstream ref", () => {
   assert.ok(readTrustedPrWorkflow().length > 0);
 });
 

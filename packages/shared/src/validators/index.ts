@@ -483,6 +483,7 @@ export {
   requestConfirmationCustomTargetSchema,
   requestConfirmationTargetSchema,
   requestConfirmationAttestationSchema,
+  requestConfirmationMetadataSchema,
   requestConfirmationPayloadSchema,
   requestConfirmationResumeFailureSchema,
   requestConfirmationResultSchema,

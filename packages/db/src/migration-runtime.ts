@@ -9,6 +9,9 @@ import {
   resolveEmbeddedPostgresCredentials,
   resolveEmbeddedPostgresInitialisationPassword,
   rotateEmbeddedPostgresPassword,
+  ensureEmbeddedPostgresScramAuth,
+  ensureEmbeddedPostgresAdminRole,
+  restrictEmbeddedPostgresApplicationRole,
 } from "./embedded-postgres-credentials.js";
 import { prepareEmbeddedPostgresNativeRuntime } from "./embedded-postgres-native.js";
 import { resolveDatabaseTarget } from "./runtime-config.js";
@@ -198,6 +201,13 @@ async function ensureEmbeddedPostgresConnection(
   // pre-NEXA-749 cluster off the shipped literal. A cluster whose credential
   // file already exists is left alone.
   await rotateEmbeddedPostgresPassword({ dataDir, port: selectedPort });
+  // Same ownership window: move a legacy cluster's pg_hba.conf off cleartext
+  // password auth once the credential is provably SCRAM (NEXA-755).
+  await ensureEmbeddedPostgresScramAuth({ dataDir, port: selectedPort });
+  // Control 2: a separate administrative login first, then drop
+  // SUPERUSER/CREATEROLE from the role the board uses (NEXA-755).
+  await ensureEmbeddedPostgresAdminRole({ dataDir, port: selectedPort });
+  await restrictEmbeddedPostgresApplicationRole({ dataDir, port: selectedPort });
 
   const adminConnectionString = embeddedPostgresUrl({
     dataDir,
