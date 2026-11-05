@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import * as p from "@clack/prompts";
 import pc from "picocolors";
 import type { PaperclipConfig } from "../config/schema.js";
@@ -15,13 +16,117 @@ import {
 
 type EnvSource = "env" | "config" | "file" | "default" | "missing";
 
-type EnvVarRow = {
+export type EnvVarRow = {
   key: string;
   value: string;
   source: EnvSource;
   required: boolean;
   note: string;
 };
+
+/**
+ * Key suffixes whose values are credentials rather than configuration.
+ *
+ * `paperclipai env` is the command an operator reaches for when a deployment
+ * looks broken, and its output is pasted into issues, agent transcripts and
+ * run logs. Printing the value of any of these keys turns a diagnostic into a
+ * disclosure, so they are rendered as a fingerprint instead.
+ *
+ * Matching is on the whole suffix rather than a substring, so
+ * `PAPERCLIP_SECRETS_PROVIDER` and `PAPERCLIP_SECRETS_MASTER_KEY_FILE` (a path)
+ * stay readable. `DATABASE_URL` is handled separately because the credential
+ * is embedded in a connection string.
+ */
+const SENSITIVE_KEY_SUFFIXES = [
+  "_SECRET",
+  "_PASSWORD",
+  "_PASSPHRASE",
+  "_TOKEN",
+  "_PRIVATE_KEY",
+  "_API_KEY",
+  "_ACCESS_KEY",
+  "_CREDENTIALS",
+];
+
+export function isSensitiveEnvKey(key: string): boolean {
+  const normalized = key.toUpperCase();
+  if (normalized === "DATABASE_URL" || normalized === "DATABASE_CONNECTION_STRING") return true;
+  return SENSITIVE_KEY_SUFFIXES.some((suffix) => normalized.endsWith(suffix));
+}
+
+function fingerprint(value: string): string {
+  return createHash("sha256").update(value).digest("hex").slice(0, 12);
+}
+
+/**
+ * A redaction that still lets an operator match the value they are looking at
+ * against the value in a file or a record, without reproducing it.
+ */
+export function formatRedactedValue(value: string): string {
+  if (value === "") return "<empty>";
+  return `<redacted sha256:${fingerprint(value)} len=${value.length}>`;
+}
+
+/** Keeps scheme, user, host, port and database; drops the password. */
+export function redactDatabaseUrl(value: string): string {
+  if (value === "") return "<empty>";
+  try {
+    const url = new URL(value);
+    if (url.password) url.password = "redacted";
+    return url.toString();
+  } catch {
+    return formatRedactedValue(value);
+  }
+}
+
+export function displayValueForRow(row: EnvVarRow): string {
+  if (row.source === "missing") return "";
+  if (!isSensitiveEnvKey(row.key)) return quoteShellValue(row.value);
+  if (row.key.toUpperCase().startsWith("DATABASE_")) return redactDatabaseUrl(row.value);
+  return formatRedactedValue(row.value);
+}
+
+const SOURCE_LABELS: Record<EnvSource, string> = {
+  env: "environment",
+  config: "config",
+  file: "file",
+  default: "default",
+  missing: "missing",
+};
+
+/** One line per variable, in the `KEY set [source] note => value` shape. */
+export function formatEnvRowLines(rows: EnvVarRow[]): string[] {
+  return rows.map((row) => {
+    const status =
+      row.source === "missing"
+        ? pc.red("missing")
+        : row.source === "default"
+          ? pc.yellow("default")
+          : pc.green("set");
+    const value = row.source === "missing" ? "" : ` ${pc.dim("=>")} ${pc.white(displayValueForRow(row))}`;
+    return `${pc.cyan(row.key)} ${status.padEnd(7)} ${pc.dim(`[${SOURCE_LABELS[row.source]}] ${row.note}`)}${value}`;
+  });
+}
+
+/**
+ * The copy-paste export block. A sensitive row emits a comment naming the
+ * fingerprint and where the value lives; it never emits the value.
+ */
+export function buildExportBlock(rows: EnvVarRow[]): string {
+  const exportRows = rows.map((row) => (row.source === "missing" ? { ...row, value: "<set-this-value>" } : row));
+  return uniqueByKey(exportRows)
+    .map((row) => {
+      if (row.source !== "missing" && isSensitiveEnvKey(row.key)) {
+        const described = row.key.toUpperCase().startsWith("DATABASE_")
+          ? redactDatabaseUrl(row.value)
+          : formatRedactedValue(row.value);
+        return `# ${row.key} redacted (${described}) - source: ${SOURCE_LABELS[row.source]}`;
+      }
+      return `export ${row.key}=${quoteShellValue(row.value)}`;
+    })
+    .join("\n");
+}
+
 
 const DEFAULT_AGENT_JWT_TTL_SECONDS = "172800";
 const DEFAULT_AGENT_JWT_ISSUER = "paperclip";
@@ -66,27 +171,16 @@ export async function envCommand(opts: { config?: string }): Promise<void> {
     if (entries.length === 0) return;
 
     p.log.message(pc.bold(title));
-    for (const entry of entries) {
-      const status = entry.source === "missing" ? pc.red("missing") : entry.source === "default" ? pc.yellow("default") : pc.green("set");
-      const sourceNote = {
-        env: "environment",
-        config: "config",
-        file: "file",
-        default: "default",
-        missing: "missing",
-      }[entry.source];
-      p.log.message(
-        `${pc.cyan(entry.key)} ${status.padEnd(7)} ${pc.dim(`[${sourceNote}] ${entry.note}`)}${entry.source === "missing" ? "" : ` ${pc.dim("=>")} ${pc.white(quoteShellValue(entry.value))}`}`,
-      );
-    }
+    for (const line of formatEnvRowLines(entries)) p.log.message(line);
   };
 
   formatSection("Required environment variables", requiredRows);
   formatSection("Optional environment variables", optionalRows);
 
-  const exportRows = rows.map((row) => (row.source === "missing" ? { ...row, value: "<set-this-value>" } : row));
-  const uniqueRows = uniqueByKey(exportRows);
-  const exportBlock = uniqueRows.map((row) => `export ${row.key}=${quoteShellValue(row.value)}`).join("\n");
+  const exportBlock = buildExportBlock(rows);
+  const redactedKeys = uniqueByKey(rows)
+    .filter((row) => row.source !== "missing" && isSensitiveEnvKey(row.key))
+    .map((row) => row.key);
 
   if (configReadError) {
     p.log.error(`Could not load config cleanly: ${configReadError}`);
@@ -96,6 +190,14 @@ export async function envCommand(opts: { config?: string }): Promise<void> {
     exportBlock || "No values detected. Set required variables manually.",
     "Deployment export block",
   );
+
+  if (redactedKeys.length > 0) {
+    p.log.message(
+      pc.dim(
+        `Redacted in this report: ${redactedKeys.join(", ")}. Values are shown as a sha256 fingerprint so you can match them without printing them; read the value from its source above (the signing secret lives in the 0600 env file).`,
+      ),
+    );
+  }
 
   if (missingRequired.length > 0) {
     p.log.message(

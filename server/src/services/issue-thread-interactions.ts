@@ -2236,6 +2236,17 @@ export function issueThreadInteractionService(
               selectedOptionIds: args.input.selectedOptionIds,
             })
           : undefined;
+      // A card that declares the human is asserting an action performed outside
+      // the board stores that assertion as an attestation, never as an effect
+      // the server performed (NEXA-675). `verified` is false by construction.
+      const attestation =
+        interaction.kind === "request_confirmation" &&
+        interaction.payload.attestation
+          ? {
+              action: interaction.payload.attestation.action,
+              verified: false as const,
+            }
+          : undefined;
 
       const [updated] = await tx
         .update(issueThreadInteractions)
@@ -2245,6 +2256,7 @@ export function issueThreadInteractionService(
             version: 1,
             outcome: "accepted",
             ...(selectedOptionIds ? { selectedOptionIds } : {}),
+            ...(attestation ? { attestation } : {}),
           },
           resolvedByAgentId: args.actor.agentId ?? null,
           resolvedByRunId: args.actor.runId ?? null,

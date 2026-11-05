@@ -109,6 +109,17 @@ pnpm paperclipai env
 
 This now includes bind-oriented deployment settings such as `PAPERCLIP_BIND` and `PAPERCLIP_BIND_HOST` when configured.
 
+Credential-shaped keys are never printed: the signing secret, any
+`*_SECRET` / `*_TOKEN` / `*_PASSWORD` / `*_PRIVATE_KEY` key, and the password
+embedded in `DATABASE_URL`. They render as `<redacted sha256:<fingerprint>
+len=<n>>`, which is enough to tell whether the running instance and a file
+agree on the same value without reproducing it. The copy-paste export block
+names the fingerprint and the variable's source in a comment instead of the
+value, so it is not a drop-in export block for secret-bearing deployments —
+read those values from the `0600` env file named in the row's note. There is
+deliberately no `--reveal` flag: this command's output is pasted into issues,
+transcripts and run logs, so it must stay safe to run.
+
 ## `paperclipai allowed-hostname`
 
 Allow a private hostname for authenticated/private mode:
