@@ -105,6 +105,48 @@ describe("managed install store", () => {
     expect(payloads.slice(1).every((payload) => fs.existsSync(payload))).toBe(true);
   });
 
+  it("keeps a git payload staged ahead of a deploy window", () => {
+    const current = payloadPathFor(paths, "npm", "2026.1012.0");
+    const staged = payloadPathFor(paths, "git", "7d4d66769006");
+    fs.mkdirSync(current, { recursive: true });
+    fs.mkdirSync(staged, { recursive: true });
+    const previousManifest = buildNextManifest(record(current, "2026.1012.0"), null);
+
+    const next = buildNextManifest(record(current, "2026.1012.0"), previousManifest);
+
+    expect(pruneInstallPayloads(next, paths)).toEqual([]);
+    expect(fs.existsSync(staged)).toBe(true);
+  });
+
+  it("removes nothing when the manifest predates the activation list", () => {
+    const payloads = ["1", "2"].map((version) => payloadPathFor(paths, "npm", version));
+    for (const payload of payloads) fs.mkdirSync(payload, { recursive: true });
+    const legacyManifest = {
+      schemaVersion: INSTALL_MANIFEST_VERSION,
+      ...record(payloads[1], "2"),
+      previous: [],
+    } as InstallManifest;
+
+    expect(pruneInstallPayloads(legacyManifest, paths)).toEqual([]);
+    expect(payloads.every((payload) => fs.existsSync(payload))).toBe(true);
+  });
+
+  it("carries activation history forward and rejects a malformed list", () => {
+    const first = payloadPathFor(paths, "npm", "1");
+    const second = payloadPathFor(paths, "npm", "2");
+    const legacyManifest = {
+      schemaVersion: INSTALL_MANIFEST_VERSION,
+      ...record(first, "1"),
+      previous: [],
+    } as InstallManifest;
+    const next = buildNextManifest(record(second, "2"), legacyManifest);
+
+    expect(next.activatedPayloads).toEqual([path.resolve(first), path.resolve(second)]);
+
+    writeInstallManifestAtomic({ ...next, activatedPayloads: "not-a-list" } as unknown as InstallManifest, paths);
+    expect(() => readInstallManifest(paths)).toThrow("unsupported manifest shape");
+  });
+
   it("writes a stable shim with the validated runtime and custom store path", () => {
     // open(2) masks the requested modes with the ambient umask, so the modes this
     // test reads depend on the shell that started it (the board runs with 077).

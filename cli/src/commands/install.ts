@@ -14,6 +14,7 @@ import {
   payloadPathFor,
   pruneInstallPayloads,
   readInstallManifest,
+  reportPrunedPayloads,
   resolveInstallStorePaths,
   withInstallStoreLock,
   writeInstallManifestAtomic,
@@ -377,7 +378,7 @@ export async function installCommand(
       const oldTarget = fs.existsSync(paths.currentPath) ? fs.readlinkSync(paths.currentPath) : null;
       flipCurrentAtomic(payload.payloadPath, paths);
       try { writeInstallManifestAtomic(nextManifest, paths); } catch (error) { if (oldTarget) flipCurrentAtomic(path.resolve(paths.cliRoot, oldTarget), paths); else fs.rmSync(paths.currentPath, { force: true }); throw error; }
-      writeManagedShim(paths); pruneInstallPayloads(nextManifest, paths); return payload;
+      writeManagedShim(paths); reportPrunedPayloads(pruneInstallPayloads(nextManifest, paths)); return payload;
     }, paths);
     await ensureShimOnPath(options);
     console.log(pc.green(`${installed.reused ? "Activated cached" : "Installed"} paperclipai git payload ${sha.slice(0, 12)}.`));
@@ -411,7 +412,7 @@ export async function installCommand(
       throw error;
     }
     writeManagedShim(paths);
-    pruneInstallPayloads(nextManifest, paths);
+    reportPrunedPayloads(pruneInstallPayloads(nextManifest, paths));
     return payload;
   }, paths);
   await ensureShimOnPath(options);

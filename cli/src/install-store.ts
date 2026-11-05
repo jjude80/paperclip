@@ -25,6 +25,12 @@ export type InstallRecord = {
 export type InstallManifest = InstallRecord & {
   schemaVersion: typeof INSTALL_MANIFEST_VERSION;
   previous: InstallRecord[];
+  /**
+   * Payloads this install store has activated. Only these are eligible for
+   * pruning: a payload directory the store has never activated may have been
+   * staged ahead of a deploy window and must survive an install or an update.
+   */
+  activatedPayloads?: string[];
 };
 
 export type InstallStorePaths = {
@@ -219,7 +225,10 @@ export function readInstallManifest(paths = resolveInstallStorePaths()): Install
       value.schemaVersion !== INSTALL_MANIFEST_VERSION ||
       (value.source !== "npm" && value.source !== "git") ||
       !Array.isArray(value.previous) ||
-      typeof value.payloadPath !== "string"
+      typeof value.payloadPath !== "string" ||
+      (value.activatedPayloads !== undefined &&
+        (!Array.isArray(value.activatedPayloads) ||
+          value.activatedPayloads.some((entry) => typeof entry !== "string")))
     ) {
       throw new Error("unsupported manifest shape");
     }
@@ -318,7 +327,20 @@ export function buildNextManifest(
     )
     .slice(0, 2);
 
-  return { schemaVersion: INSTALL_MANIFEST_VERSION, ...record, previous };
+  // Older manifests do not carry the activation list. Seed it from the
+  // records they do carry so pruning keeps working after an upgrade, and never
+  // treat a payload they do not name as removable.
+  const activatedPayloads = new Set<string>(
+    current?.activatedPayloads ?? (current ? [current.payloadPath, ...current.previous.map((entry) => entry.payloadPath)] : []),
+  );
+  activatedPayloads.add(record.payloadPath);
+
+  return {
+    schemaVersion: INSTALL_MANIFEST_VERSION,
+    ...record,
+    previous,
+    activatedPayloads: [...activatedPayloads].map((payloadPath) => path.resolve(payloadPath)),
+  };
 }
 
 export function pruneInstallPayloads(
@@ -327,6 +349,12 @@ export function pruneInstallPayloads(
 ): string[] {
   const retained = new Set(
     [manifest, ...manifest.previous].map((record) => path.resolve(record.payloadPath)),
+  );
+  // A manifest without an activation list cannot distinguish a payload that
+  // dropped out of retention from one that was staged for a pending deploy, so
+  // it must remove nothing. Files written by this version always carry the list.
+  const activated = new Set(
+    (manifest.activatedPayloads ?? []).map((payloadPath) => path.resolve(payloadPath)),
   );
   const removed: string[] = [];
   for (const source of ["npm", "git"] as const) {
@@ -339,13 +367,21 @@ export function pruneInstallPayloads(
     for (const entry of fs.readdirSync(sourceRoot)) {
       if (entry.startsWith(".")) continue;
       const candidate = path.join(sourceRoot, entry);
-      if (!retained.has(path.resolve(candidate))) {
-        fs.rmSync(candidate, { recursive: true, force: true });
-        removed.push(candidate);
-      }
+      const resolved = path.resolve(candidate);
+      if (retained.has(resolved) || !activated.has(resolved)) continue;
+      fs.rmSync(candidate, { recursive: true, force: true });
+      removed.push(candidate);
     }
   }
   return removed;
+}
+
+export function reportPrunedPayloads(removed: string[]): void {
+  if (removed.length === 0) return;
+  process.stderr.write(
+    `Pruned ${removed.length} superseded install payload${removed.length === 1 ? "" : "s"}:\n` +
+      removed.map((payloadPath) => `  ${payloadPath}\n`).join(""),
+  );
 }
 
 export function assertManagedShimWritable(paths = resolveInstallStorePaths()): void {

@@ -144,23 +144,39 @@ export function managedInstallChecks(
   const retained = new Set(
     [manifest, ...manifest.previous].map((record) => path.resolve(record.payloadPath)),
   );
+  const activated = new Set(
+    (manifest.activatedPayloads ?? []).map((payloadPath) => path.resolve(payloadPath)),
+  );
   const orphaned: string[] = [];
+  const staged: string[] = [];
   for (const source of ["npm", "git"] as const) {
     const sourceRoot = path.join(paths.installsRoot, source);
     if (!fs.existsSync(sourceRoot)) continue;
     for (const entry of fs.readdirSync(sourceRoot)) {
+      if (entry.startsWith(".")) continue;
       const candidate = path.join(sourceRoot, entry);
-      if (!entry.startsWith(".") && !retained.has(path.resolve(candidate))) orphaned.push(candidate);
+      const resolved = path.resolve(candidate);
+      if (retained.has(resolved)) continue;
+      if (activated.has(resolved)) orphaned.push(candidate);
+      else staged.push(candidate);
     }
   }
+  const stagedNote =
+    staged.length === 0
+      ? ""
+      : `; ${staged.length} staged payload${staged.length === 1 ? "" : "s"} kept for a pending deploy`;
   results.push(
     orphaned.length === 0
-      ? { name: "Managed install retention", status: "pass", message: "No orphaned payloads" }
+      ? {
+          name: "Managed install retention",
+          status: "pass",
+          message: staged.length === 0 ? "No orphaned payloads" : `No orphaned payloads${stagedNote}`,
+        }
       : {
           name: "Managed install retention",
           status: "warn",
-          message: `${orphaned.length} orphaned payload${orphaned.length === 1 ? "" : "s"} found`,
-          repairHint: "A successful `paperclipai update` prunes unretained payloads",
+          message: `${orphaned.length} orphaned payload${orphaned.length === 1 ? "" : "s"} found${stagedNote}`,
+          repairHint: "A successful `paperclipai install` or `paperclipai update` removes unretained activated payloads",
         },
   );
 
