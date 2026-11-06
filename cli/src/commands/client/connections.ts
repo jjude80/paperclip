@@ -4,6 +4,7 @@ import {
   connectionRequestInputSchema,
   connectionsSearchInputSchema,
 } from "@paperclipai/shared";
+import { readRuntimeToolsToken } from "@paperclipai/shared/secret-carrier";
 
 interface RuntimeConnectionOptions {
   retryProviderChoice?: boolean;
@@ -15,7 +16,9 @@ async function callRuntimeConnectionTool(
   body: unknown,
 ) {
   const endpoint = process.env[endpointEnv]?.trim();
-  const token = process.env.PAPERCLIP_RUNTIME_TOOLS_TOKEN?.trim();
+  // NEXA-643: the run environment carries the token as a 0600 file path; the
+  // legacy variable is still honoured until every board runs the new adapter.
+  const token = readRuntimeToolsToken();
   if (!endpoint || !token) {
     throw new Error("This command requires the runtime connection environment from an active heartbeat run");
   }

@@ -19,6 +19,7 @@ import {
 } from "@paperclipai/shared";
 import { PaperclipApiClient } from "./client.js";
 import { formatErrorResponse, formatTextResponse } from "./format.js";
+import { readRuntimeToolsToken } from "@paperclipai/shared/secret-carrier";
 
 export interface ToolDefinition {
   name: string;
@@ -60,7 +61,8 @@ async function callRuntimeConnectionTool(
   body: unknown,
 ) {
   const endpoint = process.env[endpointEnv]?.trim();
-  const token = process.env.PAPERCLIP_RUNTIME_TOOLS_TOKEN?.trim();
+  // NEXA-643: read the 0600 file the adapter writes, falling back to env.
+  const token = readRuntimeToolsToken() ?? undefined;
   if (!endpoint || !token) {
     throw new Error("Connection intent tools are available only inside an active Paperclip heartbeat run");
   }

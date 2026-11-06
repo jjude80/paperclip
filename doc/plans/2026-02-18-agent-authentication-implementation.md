@@ -70,3 +70,22 @@
 - Auth remains company-scoped (`req.actor.companyId` used by existing checks).
 - JWT generation and verification errors are logged as non-leaking structured events.
 - Scope remains local-only (`claude_local`, `codex_local`) while adapter capability model is generic.
+
+## 7) Run-token lifetime (NEXA-720)
+
+A run token is a credential for **one run**, not a durable agent key. `exp`
+bounds the maximum lifetime; the run's `finished_at` bounds the actual one.
+
+- `actorMiddleware` rejects an agent JWT with `401 { code: "agent_run_ended" }`
+  once the referenced `heartbeat_runs` row has `finished_at` older than
+  `AGENT_RUN_TOKEN_GRACE_MS` (60s, in `server/src/agent-run-token.ts`).
+- The grace window absorbs requests already in flight when the run row closed
+  and clock skew between runner and board.
+- The check keys off `finished_at`, not a status string, so any path that ends
+  a run (success, failure, cancel, timeout) ends the token with it.
+- Consequence for host tooling: a process that keeps polling **after** its run
+  ends must use a board API key (in this deployment, the read-scoped
+  `paperclip-api-token` viewer/operator service key), not the run's
+  `PAPERCLIP_API_KEY`. The deploy-window waiter did the latter (NEXA-687) and
+  will receive `401 agent_run_ended` under this rule.
+

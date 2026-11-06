@@ -35,6 +35,10 @@ async function main() {
   {
     for (const key of Object.keys(env)) {
       if (/^(GH_TOKEN|GITHUB_TOKEN|GH_ENTERPRISE_TOKEN|GITHUB_ENTERPRISE_TOKEN|PAPERCLIP_GIT_TOKEN|GIT_AUTHOR_.*|GIT_COMMITTER_.*|GIT_CONFIG_.*|GIT_ASKPASS|SSH_ASKPASS|SSH_AUTH_SOCK|GIT_SSH.*)$/.test(key)) delete env[key];
+      // NEXA-643: the captured bearers are read by this launcher, not by the git
+      // or gh child it starts. A path left in the environment is a second way to
+      // the same value.
+      else if (/^PAPERCLIP_(RUNTIME_TOOLS_TOKEN_FILE|AGENT_PRIVATE_KEY_FILE)$/.test(key)) delete env[key];
     }
     Object.assign(env, {
       GH_CONFIG_DIR: configDirectory, SSH_AUTH_SOCK: '',
@@ -50,9 +54,29 @@ async function main() {
       GIT_CONFIG_KEY_4: 'user.useConfigOnly', GIT_CONFIG_VALUE_4: 'true',
     });
     const base = env.PAPERCLIP_GITHUB_BROKER_URL || env.PAPERCLIP_API_URL;
+    // NEXA-643: the run environment hands over paths, not bearer values. Read
+    // each token from its 0600 file, fall back to the legacy env variable so a
+    // launcher staged before the board upgrade still works, and drop the path
+    // from this process's env once read -- nothing below needs it.
+    const readToken = (fileKey, key) => {
+      const file = env[fileKey];
+      if (file) {
+        try {
+          const value = fs.readFileSync(file, 'utf8').trim();
+          delete env[fileKey];
+          if (value) return value;
+        } catch { /* fall through to the legacy value */ }
+      }
+      return env[key] || '';
+    };
+    const brokerToken = readToken('PAPERCLIP_GITHUB_BROKER_TOKEN_FILE', 'PAPERCLIP_GITHUB_BROKER_TOKEN');
+    const bridgeToken = readToken('PAPERCLIP_GITHUB_BRIDGE_TOKEN_FILE', 'PAPERCLIP_GITHUB_BRIDGE_TOKEN');
+    const boardToken = readToken('PAPERCLIP_API_TOKEN_FILE', 'PAPERCLIP_API_KEY');
+    // Captured above: the child gets none of them, in either form.
+    for (const key of ['PAPERCLIP_GITHUB_BROKER_TOKEN', 'PAPERCLIP_GITHUB_BRIDGE_TOKEN', 'PAPERCLIP_API_KEY', 'PAPERCLIP_RUNTIME_TOOLS_TOKEN', 'PAPERCLIP_AGENT_PRIVATE_KEY']) delete env[key];
     try {
     let response;
-    if (base && env.PAPERCLIP_GITHUB_BROKER_TOKEN) {
+    if (base && brokerToken) {
       const url = base.replace(/\/+$/, '').replace(/\/api$/, '') + '/runtime-tools/github/credentials';
       // A slow or restarting control plane must not cost the operation its
       // managed identity, so a failed request is retried before giving up.
@@ -63,8 +87,8 @@ async function main() {
         try {
           response = await fetch(url, {
             method: 'POST', redirect: 'error', signal: AbortSignal.timeout(10000),
-            headers: { authorization: 'Bearer ' + (env.PAPERCLIP_GITHUB_BRIDGE_TOKEN || env.PAPERCLIP_API_KEY || env.PAPERCLIP_GITHUB_BROKER_TOKEN),
-              'x-paperclip-github-capability': env.PAPERCLIP_GITHUB_BROKER_TOKEN, 'content-type': 'application/json' },
+            headers: { authorization: 'Bearer ' + (bridgeToken || boardToken || brokerToken),
+              'x-paperclip-github-capability': brokerToken, 'content-type': 'application/json' },
             body: '{}',
           });
           if (response.status === 409 && conflicts < 29) {

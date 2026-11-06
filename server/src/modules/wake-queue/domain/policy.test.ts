@@ -30,6 +30,7 @@ const basePreDrainFacts: PreDrainFacts = {
   assigneeAgentMatchesRunAgent: true,
   legacyExecutionNeedsReconciliation: false,
   executionCancellationAcknowledged: false,
+  durableHandoffWakePending: false,
 };
 
 describe("decidePreDrain", () => {
@@ -91,6 +92,25 @@ describe("decidePreDrain", () => {
     {
       name: "released: an acknowledged execution cancellation",
       facts: { ...basePreDrainFacts, executionCancellationAcknowledged: true },
+      expected: { kind: "released" },
+    },
+    {
+      name: "proceed: an acknowledged cancellation still has a durable hand-off wake for the new assignee",
+      facts: {
+        ...basePreDrainFacts,
+        executionCancellationAcknowledged: true,
+        durableHandoffWakePending: true,
+      },
+      expected: { kind: "proceed" },
+    },
+    {
+      name: "released: a durable hand-off wake does not override legacy-execution reconciliation",
+      facts: {
+        ...basePreDrainFacts,
+        legacyExecutionNeedsReconciliation: true,
+        executionCancellationAcknowledged: true,
+        durableHandoffWakePending: true,
+      },
       expected: { kind: "released" },
     },
     {

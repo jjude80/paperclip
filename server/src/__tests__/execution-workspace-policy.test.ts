@@ -6,6 +6,7 @@ import {
 import {
   applyDefaultIsolatedExecutionWorkspacePolicy,
   buildExecutionWorkspaceAdapterConfig,
+  buildInheritedExecutionWorkspaceSettings,
   defaultIssueExecutionWorkspaceSettingsForProject,
   gateProjectExecutionWorkspacePolicy,
   isUnrunnableWorktreeCombo,
@@ -16,8 +17,12 @@ import {
   ManagedSandboxUnavailableError,
   resolveEffectiveWorkspaceStrategyType,
   resolveExecutionWorkspaceEnvironmentId,
+  resolveExecutionWorkspaceInheritanceDecision,
   resolvePinnedIssueWorkspaceStrategyType,
   resolveExecutionWorkspaceMode,
+  resolveExecutionWorkspaceConflictNotice,
+  resolveExecutionWorkspaceReuseWorkspaceId,
+  resolveExecutionWorkspaceStrategyConfig,
   resolveSharedWorkspaceConcurrency,
   selectEnvironmentExecutionWorkspaceSettings,
 } from "../services/execution-workspace-policy.ts";
@@ -785,5 +790,309 @@ describe("operator default isolated execution workspaces", () => {
     const defaults = {agentDefaultEnvironmentId: "agent-env", instanceDefaultEnvironmentId: "instance-env", localDefaultEnvironmentId: "local-env"};
     expect(resolveExecutionWorkspaceEnvironmentId({...defaults, lowTrustIssueEnvironmentId: "phone-sandbox"})).toEqual({environmentId: "phone-sandbox", source: "issue"});
     expect(resolveExecutionWorkspaceEnvironmentId(defaults)).toEqual({environmentId: "agent-env", source: "agent"});
+  });
+});
+
+describe("execution workspace inheritance", () => {
+  it("does not bind a child to the parent's isolated workspace", () => {
+    expect(
+      resolveExecutionWorkspaceInheritanceDecision({
+        sourceWorkspaceMode: "isolated_workspace",
+        hasExplicitExecutionWorkspaceOverride: false,
+      }),
+    ).toEqual({
+      bindSourceWorkspace: false,
+      inheritSourceSettings: true,
+      reason: "source_workspace_isolated_per_issue",
+    });
+  });
+
+  it("keeps inheriting a shared workspace, which is shared by design", () => {
+    expect(
+      resolveExecutionWorkspaceInheritanceDecision({
+        sourceWorkspaceMode: "shared_workspace",
+        hasExplicitExecutionWorkspaceOverride: false,
+      }),
+    ).toEqual({
+      bindSourceWorkspace: true,
+      inheritSourceSettings: true,
+      reason: "source_workspace_shared",
+    });
+  });
+
+  it("inherits nothing when the caller named its own workspace", () => {
+    expect(
+      resolveExecutionWorkspaceInheritanceDecision({
+        sourceWorkspaceMode: "isolated_workspace",
+        hasExplicitExecutionWorkspaceOverride: true,
+      }),
+    ).toEqual({
+      bindSourceWorkspace: false,
+      inheritSourceSettings: false,
+      reason: "explicit_override",
+    });
+  });
+
+  it("carries the isolated mode to the child without the parent's tree", () => {
+    expect(
+      buildInheritedExecutionWorkspaceSettings({
+        sourceSettings: { mode: "isolated_workspace", workspaceRuntime: { profile: "agent" } },
+        sourceWorkspaceMode: "isolated_workspace",
+        bindSourceWorkspace: false,
+      }),
+    ).toEqual({
+      mode: "isolated_workspace",
+      workspaceRuntime: { profile: "agent" },
+    });
+  });
+
+  it("retargets a pinned exact branch as the child's base ref instead of dropping the target", () => {
+    expect(
+      buildInheritedExecutionWorkspaceSettings({
+        sourceSettings: {
+          mode: "isolated_workspace",
+          workspaceStrategy: { type: "git_worktree", existingBranch: "holder-branch", branchTemplate: "{{issue.identifier}}-{{slug}}" },
+        },
+        sourceWorkspaceMode: "isolated_workspace",
+        bindSourceWorkspace: false,
+      }),
+    ).toEqual({
+      mode: "isolated_workspace",
+      workspaceStrategy: { type: "git_worktree", baseRef: "holder-branch", branchTemplate: "{{issue.identifier}}-{{slug}}" },
+    });
+  });
+
+  it("bases a child on the parent workspace's integration branch, not the project default", () => {
+    expect(
+      buildInheritedExecutionWorkspaceSettings({
+        sourceSettings: { mode: "isolated_workspace" },
+        sourceWorkspaceMode: "isolated_workspace",
+        sourceWorkspaceStrategyType: "git_worktree",
+        sourceWorkspaceBranchName: "NEXA-415-integration",
+        bindSourceWorkspace: false,
+      }),
+    ).toEqual({
+      mode: "isolated_workspace",
+      workspaceStrategy: { type: "git_worktree", baseRef: "NEXA-415-integration" },
+    });
+  });
+
+  it("prefers the parent workspace's integration branch over an older inherited base ref", () => {
+    expect(
+      buildInheritedExecutionWorkspaceSettings({
+        sourceSettings: {
+          mode: "isolated_workspace",
+          workspaceStrategy: { type: "git_worktree", baseRef: "origin/main", existingBranch: "older-target" },
+        },
+        sourceWorkspaceMode: "isolated_workspace",
+        sourceWorkspaceStrategyType: "git_worktree",
+        sourceWorkspaceBranchName: "NEXA-415-integration",
+        bindSourceWorkspace: false,
+      }),
+    ).toEqual({
+      mode: "isolated_workspace",
+      workspaceStrategy: { type: "git_worktree", baseRef: "NEXA-415-integration" },
+    });
+  });
+
+  it("bases a child on the parent's durable base, not a transient runtime branch", () => {
+    // The parent workspace created its own task branch. That branch is deleted
+    // when the parent is reclaimed, so a child that has not started yet would
+    // otherwise fail with workspace_base_ref_unresolved. Base it on the ref the
+    // parent itself started from instead.
+    expect(
+      buildInheritedExecutionWorkspaceSettings({
+        sourceSettings: { mode: "isolated_workspace" },
+        sourceWorkspaceMode: "isolated_workspace",
+        sourceWorkspaceStrategyType: "git_worktree",
+        sourceWorkspaceBranchName: "NEXA-415-feature-work",
+        sourceWorkspaceBaseRef: "origin/main",
+        sourceWorkspaceBranchIsTransient: true,
+        bindSourceWorkspace: false,
+      }),
+    ).toEqual({
+      mode: "isolated_workspace",
+      workspaceStrategy: { type: "git_worktree", baseRef: "origin/main" },
+    });
+  });
+
+  it("leaves a transient-branch child on the project default when the parent recorded no base", () => {
+    expect(
+      buildInheritedExecutionWorkspaceSettings({
+        sourceSettings: { mode: "isolated_workspace" },
+        sourceWorkspaceMode: "isolated_workspace",
+        sourceWorkspaceStrategyType: "git_worktree",
+        sourceWorkspaceBranchName: "NEXA-415-feature-work",
+        sourceWorkspaceBranchIsTransient: true,
+        bindSourceWorkspace: false,
+      }),
+    ).toEqual({ mode: "isolated_workspace" });
+  });
+
+  it("keeps inheriting an operator-owned branch that outlives the parent", () => {
+    expect(
+      buildInheritedExecutionWorkspaceSettings({
+        sourceSettings: { mode: "isolated_workspace" },
+        sourceWorkspaceMode: "isolated_workspace",
+        sourceWorkspaceStrategyType: "git_worktree",
+        sourceWorkspaceBranchName: "release/integration",
+        sourceWorkspaceBaseRef: "origin/main",
+        sourceWorkspaceBranchIsTransient: false,
+        bindSourceWorkspace: false,
+      }),
+    ).toEqual({
+      mode: "isolated_workspace",
+      workspaceStrategy: { type: "git_worktree", baseRef: "release/integration" },
+    });
+  });
+
+  it("does not invent a base ref from a non-git-workspace source", () => {
+    expect(
+      buildInheritedExecutionWorkspaceSettings({
+        sourceSettings: { mode: "isolated_workspace" },
+        sourceWorkspaceMode: "isolated_workspace",
+        sourceWorkspaceStrategyType: "project_primary",
+        sourceWorkspaceBranchName: "unrelated-branch",
+        bindSourceWorkspace: false,
+      }),
+    ).toEqual({ mode: "isolated_workspace" });
+  });
+
+  it("keeps the pinned branch when the workspace itself is inherited", () => {
+    expect(
+      buildInheritedExecutionWorkspaceSettings({
+        sourceSettings: {
+          mode: "isolated_workspace",
+          workspaceStrategy: { type: "git_worktree", existingBranch: "holder-branch" },
+        },
+        sourceWorkspaceMode: "isolated_workspace",
+        bindSourceWorkspace: true,
+      }),
+    ).toEqual({
+      mode: "isolated_workspace",
+      workspaceStrategy: { type: "git_worktree", existingBranch: "holder-branch" },
+    });
+  });
+
+  it("falls back to the source mode when the source has no settings of its own", () => {
+    expect(
+      buildInheritedExecutionWorkspaceSettings({
+        sourceSettings: null,
+        sourceWorkspaceMode: "shared_workspace",
+        bindSourceWorkspace: true,
+      }),
+    ).toEqual({ mode: "shared_workspace" });
+  });
+
+  it("retargets a pinned branch as the base ref when another issue owns the workspace", () => {
+    expect(
+      resolveExecutionWorkspaceStrategyConfig({
+        config: {
+          mode: "isolated_workspace",
+          workspaceStrategy: { type: "git_worktree", existingBranch: "holder-branch" },
+        },
+        conflictingWorkspaceOwnerIssueId: "issue-parent",
+      }),
+    ).toEqual({
+      mode: "isolated_workspace",
+      workspaceStrategy: { type: "git_worktree", baseRef: "holder-branch" },
+    });
+  });
+
+  it("keeps the pinned branch when the workspace is the issue's own", () => {
+    expect(
+      resolveExecutionWorkspaceStrategyConfig({
+        config: {
+          workspaceStrategy: { type: "git_worktree", existingBranch: "own-branch" },
+        },
+        conflictingWorkspaceOwnerIssueId: null,
+      }),
+    ).toEqual({
+      workspaceStrategy: { type: "git_worktree", existingBranch: "own-branch" },
+    });
+  });
+
+  it("keeps the target branch as a base ref when the pinned branch was all the strategy held", () => {
+    expect(
+      resolveExecutionWorkspaceStrategyConfig({
+        config: { workspaceStrategy: { existingBranch: "holder-branch" } },
+        conflictingWorkspaceOwnerIssueId: "issue-parent",
+      }),
+    ).toEqual({ workspaceStrategy: { baseRef: "holder-branch" } });
+  });
+
+  it("keeps the requested workspace when no other issue owns it", () => {
+    expect(
+      resolveExecutionWorkspaceReuseWorkspaceId({
+        reusableWorkspaceId: null,
+        requestedWorkspaceId: "workspace-own",
+        conflictingWorkspaceOwnerIssueId: null,
+      }),
+    ).toBe("workspace-own");
+  });
+
+  it("prefers the reusable workspace over the requested one", () => {
+    expect(
+      resolveExecutionWorkspaceReuseWorkspaceId({
+        reusableWorkspaceId: "workspace-own",
+        requestedWorkspaceId: "workspace-own",
+        conflictingWorkspaceOwnerIssueId: null,
+      }),
+    ).toBe("workspace-own");
+  });
+
+  it("does not hand a refused child the holder's workspace", () => {
+    expect(
+      resolveExecutionWorkspaceReuseWorkspaceId({
+        reusableWorkspaceId: null,
+        requestedWorkspaceId: "workspace-parent",
+        conflictingWorkspaceOwnerIssueId: "issue-parent",
+      }),
+    ).toBeNull();
+  });
+
+  it("notifies the holder only for a refused reuse request", () => {
+    expect(
+      resolveExecutionWorkspaceConflictNotice({
+        conflictingWorkspaceOwnerIssueId: "issue-parent",
+        executionWorkspacePreference: "reuse_existing",
+        requestedExecutionWorkspaceId: "workspace-parent",
+        executionWorkspaceId: "workspace-parent",
+      }),
+    ).toEqual({
+      shouldNotify: true,
+      ownerIssueId: "issue-parent",
+      marker: "workspace_conflict:workspace-parent",
+    });
+  });
+
+  it("stays quiet when the issue never asked to reuse the workspace", () => {
+    expect(
+      resolveExecutionWorkspaceConflictNotice({
+        conflictingWorkspaceOwnerIssueId: "issue-parent",
+        executionWorkspacePreference: null,
+        requestedExecutionWorkspaceId: "workspace-parent",
+        executionWorkspaceId: "workspace-parent",
+      }),
+    ).toEqual({
+      shouldNotify: false,
+      ownerIssueId: "issue-parent",
+      marker: "workspace_conflict:workspace-parent",
+    });
+  });
+
+  it("stays quiet when no other issue owns the workspace", () => {
+    expect(
+      resolveExecutionWorkspaceConflictNotice({
+        conflictingWorkspaceOwnerIssueId: null,
+        executionWorkspacePreference: "reuse_existing",
+        requestedExecutionWorkspaceId: "workspace-own",
+        executionWorkspaceId: "workspace-own",
+      }),
+    ).toEqual({
+      shouldNotify: false,
+      ownerIssueId: null,
+      marker: "workspace_conflict:workspace-own",
+    });
   });
 });

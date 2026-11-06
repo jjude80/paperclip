@@ -777,6 +777,65 @@ describe("issue thread interaction routes", () => {
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
+  it("maps requestedResolverPolicy onto resolverPolicy instead of dropping it", async () => {
+    mockInteractionService.create.mockResolvedValueOnce({
+      id: "interaction-alias",
+      companyId: "company-1",
+      issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "none",
+      requestedResolverPolicy: "human_only",
+      effectiveResolverPolicy: "human_only",
+      resolverPolicyProvenance: "explicit",
+      effectiveResolverPolicySource: "requested",
+      idempotencyKey: null,
+      sourceCommentId: null,
+      sourceRunId: null,
+      createdByAgentId: null,
+      payload: { version: 1, prompt: "Publish this post?" },
+      result: null,
+      createdAt: "2026-07-25T12:00:00.000Z",
+      updatedAt: "2026-07-25T12:00:00.000Z",
+    });
+    const app = await createApp();
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions")
+      .send({
+        kind: "request_confirmation",
+        requestedResolverPolicy: "human_only",
+        payload: { version: 1, prompt: "Publish this post?" },
+      });
+
+    expect(res.status).toBe(201);
+    expect(mockInteractionService.create).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        kind: "request_confirmation",
+        resolverPolicy: "human_only",
+      }),
+      expect.anything(),
+    );
+  });
+
+  it("rejects a conflicting requestedResolverPolicy and resolverPolicy", async () => {
+    const app = await createApp();
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions")
+      .send({
+        kind: "request_confirmation",
+        resolverPolicy: "anyone",
+        requestedResolverPolicy: "human_only",
+        payload: { version: 1, prompt: "Publish this post?" },
+      });
+
+    expect(res.status).toBe(400);
+    expect(JSON.stringify(res.body)).toContain("requestedResolverPolicy");
+    expect(mockInteractionService.create).not.toHaveBeenCalled();
+  });
+
   it("returns 400 for agent-addressed tool-action confirmations", async () => {
     const app = await createApp();
     const res = await request(app)

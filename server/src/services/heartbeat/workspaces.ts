@@ -2221,6 +2221,7 @@ export type ExecutionWorkspaceReuseRequestForIssue = {
   requestedExecutionWorkspaceId: string | null;
   requestedShouldReuseExisting: boolean;
   existingExecutionWorkspaceAvailable: boolean;
+  conflictingWorkspaceOwnerIssueId: string | null;
 };
 
 /**
@@ -2242,6 +2243,10 @@ export function resolveExecutionWorkspaceReuseRequestForIssue(input: {
   existingExecutionWorkspaceStatus?: string | null;
   requestedExistingBranch?: string | null;
   existingExecutionWorkspaceBranchName?: string | null;
+  issueId?: string | null;
+  existingExecutionWorkspaceMode?: string | null;
+  existingExecutionWorkspaceSourceIssueId?: string | null;
+  allowForeignIsolatedWorkspaceReuse?: boolean;
 }): ExecutionWorkspaceReuseRequestForIssue {
   const requestedExecutionWorkspaceId = readNonEmptyString(
     input.issueExecutionWorkspaceId,
@@ -2256,10 +2261,23 @@ export function resolveExecutionWorkspaceReuseRequestForIssue(input: {
     requestedExistingBranch === null ||
     readNonEmptyString(input.existingExecutionWorkspaceBranchName) ===
       requestedExistingBranch;
+  const workspaceOwnerIssueId = readNonEmptyString(
+    input.existingExecutionWorkspaceSourceIssueId,
+  );
+  const currentIssueId = readNonEmptyString(input.issueId);
+  const conflictingWorkspaceOwnerIssueId =
+    input.allowForeignIsolatedWorkspaceReuse === true ||
+    input.existingExecutionWorkspaceMode !== "isolated_workspace" ||
+    workspaceOwnerIssueId === null ||
+    currentIssueId === null ||
+    workspaceOwnerIssueId === currentIssueId
+      ? null
+      : workspaceOwnerIssueId;
   const requestedShouldReuseExisting =
     input.issueExecutionWorkspacePreference === "reuse_existing" &&
     requestedExecutionWorkspaceId !== null &&
-    existingWorkspaceMatchesRequestedBranch;
+    existingWorkspaceMatchesRequestedBranch &&
+    conflictingWorkspaceOwnerIssueId === null;
 
   return {
     requestedExecutionWorkspaceId,
@@ -2269,6 +2287,7 @@ export function resolveExecutionWorkspaceReuseRequestForIssue(input: {
       input.existingExecutionWorkspaceStatus !== null &&
       input.existingExecutionWorkspaceStatus !== undefined &&
       input.existingExecutionWorkspaceStatus !== "archived",
+    conflictingWorkspaceOwnerIssueId,
   };
 }
 

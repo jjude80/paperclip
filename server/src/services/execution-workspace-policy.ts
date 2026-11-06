@@ -373,6 +373,163 @@ export function issueExecutionWorkspaceModeForPersistedWorkspace(
   return "shared_workspace";
 }
 
+export type ExecutionWorkspaceInheritanceDecision = {
+  bindSourceWorkspace: boolean;
+  inheritSourceSettings: boolean;
+  reason:
+    | "explicit_override"
+    | "source_workspace_isolated_per_issue"
+    | "source_workspace_shared";
+};
+
+export function resolveExecutionWorkspaceInheritanceDecision(input: {
+  sourceWorkspaceMode: string | null | undefined;
+  hasExplicitExecutionWorkspaceOverride: boolean;
+}): ExecutionWorkspaceInheritanceDecision {
+  if (input.hasExplicitExecutionWorkspaceOverride) {
+    return {
+      bindSourceWorkspace: false,
+      inheritSourceSettings: false,
+      reason: "explicit_override",
+    };
+  }
+  if (input.sourceWorkspaceMode === "isolated_workspace") {
+    return {
+      bindSourceWorkspace: false,
+      inheritSourceSettings: true,
+      reason: "source_workspace_isolated_per_issue",
+    };
+  }
+  return {
+    bindSourceWorkspace: true,
+    inheritSourceSettings: true,
+    reason: "source_workspace_shared",
+  };
+}
+
+function retargetPinnedBranchAsBaseRef(
+  strategy: Record<string, unknown>,
+  fallbackBaseRef: string | null,
+): Record<string, unknown> {
+  const nextStrategy = { ...strategy };
+  const pinnedBranch =
+    typeof nextStrategy.existingBranch === "string"
+      ? nextStrategy.existingBranch.trim()
+      : "";
+  delete nextStrategy.existingBranch;
+  if (typeof nextStrategy.baseRef !== "string" || nextStrategy.baseRef.trim().length === 0) {
+    const baseRef = fallbackBaseRef ?? (pinnedBranch.length > 0 ? pinnedBranch : null);
+    if (baseRef) nextStrategy.baseRef = baseRef;
+  }
+  return nextStrategy;
+}
+
+export function buildInheritedExecutionWorkspaceSettings(input: {
+  sourceSettings: Record<string, unknown> | null | undefined;
+  sourceWorkspaceMode: string | null | undefined;
+  sourceWorkspaceStrategyType?: string | null;
+  sourceWorkspaceBranchName?: string | null;
+  /**
+   * The source workspace's own resolved base ref (for example `origin/main`).
+   * It is the durable ref a child should fall back to when the source branch
+   * cannot outlive the parent.
+   */
+  sourceWorkspaceBaseRef?: string | null;
+  /**
+   * True when the source workspace created its branch itself and therefore
+   * deletes it when the workspace is cleaned up. A transient branch must never
+   * become a child's base ref: the child then cannot start once the parent
+   * lands, because the ref is gone before the child's first dispatch.
+   */
+  sourceWorkspaceBranchIsTransient?: boolean;
+  bindSourceWorkspace: boolean;
+}): Record<string, unknown> {
+  const settings: Record<string, unknown> = { ...(input.sourceSettings ?? {}) };
+  settings.mode = issueExecutionWorkspaceModeForPersistedWorkspace(
+    input.sourceWorkspaceMode,
+  );
+  if (!input.bindSourceWorkspace) {
+    const sourceStrategy = parseObject(settings.workspaceStrategy);
+    const sourceWorkspaceBranchName =
+      typeof input.sourceWorkspaceBranchName === "string"
+        ? input.sourceWorkspaceBranchName.trim()
+        : "";
+    const sourceWorkspaceBaseRef =
+      typeof input.sourceWorkspaceBaseRef === "string"
+        ? input.sourceWorkspaceBaseRef.trim()
+        : "";
+    // A branch the source workspace created for its own task is deleted when
+    // that workspace is reclaimed, so it cannot be a durable base for a child
+    // that has not started yet. Keep inheriting operator-owned integration
+    // branches, which survive the parent.
+    const parentDurableBranch =
+      input.sourceWorkspaceStrategyType === "git_worktree" &&
+      !input.sourceWorkspaceBranchIsTransient &&
+      sourceWorkspaceBranchName.length > 0
+        ? sourceWorkspaceBranchName
+        : null;
+    // Falling back to the parent's own base ref is the same retarget a human
+    // performs by hand on a stranded child (usually `origin/main`).
+    const parentBaseRef = parentDurableBranch ?? (sourceWorkspaceBaseRef.length > 0 ? sourceWorkspaceBaseRef : null);
+    const nextStrategy = retargetPinnedBranchAsBaseRef(sourceStrategy, parentBaseRef);
+    if (parentBaseRef) {
+      nextStrategy.baseRef = parentBaseRef;
+      if (nextStrategy.type === undefined) {
+        nextStrategy.type = "git_worktree";
+      }
+    }
+    if (Object.keys(nextStrategy).length > 0) {
+      settings.workspaceStrategy = nextStrategy;
+    } else {
+      delete settings.workspaceStrategy;
+    }
+  }
+  return settings;
+}
+
+export function resolveExecutionWorkspaceStrategyConfig(input: {
+  config: Record<string, unknown> | null | undefined;
+  conflictingWorkspaceOwnerIssueId: string | null | undefined;
+}): Record<string, unknown> {
+  const config = { ...(input.config ?? {}) };
+  if (!input.conflictingWorkspaceOwnerIssueId) return config;
+  const strategy = parseObject(config.workspaceStrategy);
+  if (typeof strategy.existingBranch !== "string") return config;
+  const nextStrategy = retargetPinnedBranchAsBaseRef(strategy, null);
+  if (Object.keys(nextStrategy).length > 0) {
+    config.workspaceStrategy = nextStrategy;
+  } else {
+    delete config.workspaceStrategy;
+  }
+  return config;
+}
+
+export function resolveExecutionWorkspaceReuseWorkspaceId(input: {
+  reusableWorkspaceId: string | null | undefined;
+  requestedWorkspaceId: string | null | undefined;
+  conflictingWorkspaceOwnerIssueId: string | null | undefined;
+}): string | null {
+  if (input.reusableWorkspaceId) return input.reusableWorkspaceId;
+  if (input.conflictingWorkspaceOwnerIssueId) return null;
+  return input.requestedWorkspaceId ?? null;
+}
+
+export function resolveExecutionWorkspaceConflictNotice(input: {
+  conflictingWorkspaceOwnerIssueId: string | null | undefined;
+  executionWorkspacePreference: string | null | undefined;
+  requestedExecutionWorkspaceId: string | null | undefined;
+  executionWorkspaceId: string | null | undefined;
+}): { shouldNotify: boolean; ownerIssueId: string | null; marker: string } {
+  const ownerIssueId = input.conflictingWorkspaceOwnerIssueId ?? null;
+  const marker = `workspace_conflict:${input.executionWorkspaceId ?? "none"}`;
+  const shouldNotify = Boolean(
+    ownerIssueId &&
+      input.executionWorkspacePreference === "reuse_existing" &&
+      input.requestedExecutionWorkspaceId,
+  );
+  return { shouldNotify, ownerIssueId, marker };
+}
+
 export function resolveExecutionWorkspaceMode(input: {
   projectPolicy: ProjectExecutionWorkspacePolicy | null;
   issueSettings: IssueExecutionWorkspaceSettings | null;

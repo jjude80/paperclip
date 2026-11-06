@@ -138,12 +138,13 @@ import {
   SUCCESSFUL_RUN_HANDOFF_LIVE_WAKE_STATUSES,
 } from "./successful-run-handoff-state.js";
 import {
+  buildInheritedExecutionWorkspaceSettings,
   defaultIssueExecutionWorkspaceSettingsForProject,
   gateProjectExecutionWorkspacePolicy,
-  issueExecutionWorkspaceModeForPersistedWorkspace,
   isUnrunnableWorktreeCombo,
   parseIssueExecutionWorkspaceSettings,
   parseProjectExecutionWorkspacePolicy,
+  resolveExecutionWorkspaceInheritanceDecision,
   resolvePinnedIssueWorkspaceStrategyType,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE,
@@ -151,6 +152,7 @@ import {
   type ParsedExecutionWorkspaceMode,
 } from "./execution-workspace-policy.js";
 import { mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
+import { isRuntimeOwnedGitBranch } from "./execution-workspace-branch-ownership.js";
 import { hasChatRunOwnedProviderInteraction } from "./chat-interaction-arbitration.js";
 import { readChatControlChronology } from "./chat-control-chronology.js";
 import { authorizeChatConversationForBoundRun } from "./native-runtime/chat-attachment-reuse.js";
@@ -10203,6 +10205,10 @@ export function issueService(db: Db) {
               .select({
                 id: executionWorkspaces.id,
                 mode: executionWorkspaces.mode,
+                strategyType: executionWorkspaces.strategyType,
+                branchName: executionWorkspaces.branchName,
+                baseRef: executionWorkspaces.baseRef,
+                metadata: executionWorkspaces.metadata,
               })
               .from(executionWorkspaces)
               .where(
@@ -10213,16 +10219,29 @@ export function issueService(db: Db) {
               )
               .then((rows) => rows[0] ?? null);
             if (sourceWorkspace) {
-              executionWorkspaceId = sourceWorkspace.id;
-              inheritedWorkspaceSelection = true;
-              executionWorkspacePreference = "reuse_existing";
-              executionWorkspaceSettings = {
-                ...((workspaceSource.executionWorkspaceSettings as
-                  Record<string, unknown> | null | undefined) ?? {}),
-                mode: issueExecutionWorkspaceModeForPersistedWorkspace(
-                  sourceWorkspace.mode,
-                ),
-              };
+              const inheritance = resolveExecutionWorkspaceInheritanceDecision({
+                sourceWorkspaceMode: sourceWorkspace.mode,
+                hasExplicitExecutionWorkspaceOverride,
+              });
+              if (inheritance.inheritSourceSettings) {
+                executionWorkspaceSettings = buildInheritedExecutionWorkspaceSettings({
+                  sourceSettings: workspaceSource.executionWorkspaceSettings as
+                    Record<string, unknown> | null | undefined,
+                  sourceWorkspaceMode: sourceWorkspace.mode,
+                  sourceWorkspaceStrategyType: sourceWorkspace.strategyType,
+                  sourceWorkspaceBranchName: sourceWorkspace.branchName,
+                  sourceWorkspaceBaseRef: sourceWorkspace.baseRef,
+                  sourceWorkspaceBranchIsTransient: isRuntimeOwnedGitBranch(
+                    sourceWorkspace.metadata as Record<string, unknown> | null,
+                  ),
+                  bindSourceWorkspace: inheritance.bindSourceWorkspace,
+                });
+              }
+              if (inheritance.bindSourceWorkspace) {
+                executionWorkspaceId = sourceWorkspace.id;
+                inheritedWorkspaceSelection = true;
+                executionWorkspacePreference = "reuse_existing";
+              }
             }
           }
         }

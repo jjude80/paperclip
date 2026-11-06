@@ -41,9 +41,16 @@ describe("legacy environment tool access on resumed conversations", () => {
         : type === "pi_local"
           ? JSON.stringify({ type: "agent_end", messages: [{ role: "assistant", content: "done" }] })
           : JSON.stringify({ type: "result", subtype: "success", session_id: sessionId, result: "done" });
-    const invocations: Array<{ args: string[]; env: Record<string, string> }> = [];
+    const invocations: Array<{ args: string[]; env: Record<string, string>; tokenFile?: { mode: number; content: string } }> = [];
     vi.mocked(runAdapterExecutionTargetProcess).mockImplementation(async (_runId, _target, _command, args, options) => {
-      invocations.push({ args, env: options.env ?? {} });
+      const env = options.env ?? {};
+      const tokenFilePath = env.PAPERCLIP_RUNTIME_TOOLS_TOKEN_FILE;
+      // The adapter disposes the carrier when the child exits, so read the file
+      // while the child that was handed it is still running.
+      const tokenFile = tokenFilePath
+        ? { mode: (await fs.stat(tokenFilePath)).mode & 0o777, content: (await fs.readFile(tokenFilePath, "utf8")).trim() }
+        : undefined;
+      invocations.push({ args, env, tokenFile });
       return { exitCode: 0, signal: null, timedOut: false, stdout, stderr: "", pid: null, startedAt: null };
     });
     const getFreshSessionHandoff = vi.fn(async () => "FRESH_HANDOFF_ONLY");
@@ -51,7 +58,7 @@ describe("legacy environment tool access on resumed conversations", () => {
       getFreshSessionHandoff,
       runId: "refresh", agent: { id: "agent", companyId: "company", name: "Agent", adapterType: type, adapterConfig: {} },
       runtime: { sessionId, sessionParams: { sessionId, cwd: root }, sessionDisplayId: sessionId, taskKey: null },
-      config: { command, cwd: root, model: "openai/gpt-5", engine: "cli", env: { HOME: root, XDG_CONFIG_HOME: root, OPENCODE_ALLOW_ALL_MODELS: "1" } },
+      config: { command, cwd: root, model: "openai/gpt-5", engine: "cli", env: { HOME: root, XDG_CONFIG_HOME: root, OPENCODE_ALLOW_ALL_MODELS: "1", PAPERCLIP_SECRET_FILE_DIR: path.join(root, "secret-env") } },
       context: { refreshTools: true, paperclipFreshSessionHandoffMarkdown: "FRESH_HANDOFF_ONLY" }, onLog: async () => {},
       runtimeTools: { version: 1, guidance: "Tools available", mcpEndpoint: "https://example.test/current-tools/mcp",
         rest: { connectionsSearch: "https://example.test/search", connectionRequest: "https://example.test/request" },
@@ -62,12 +69,24 @@ describe("legacy environment tool access on resumed conversations", () => {
     const invocation = invocations.at(-1)!;
     expect(invocation.args[invocation.args.indexOf(resumeFlag) + 1]).toBe(sessionId);
     expect(invocation.env.PAPERCLIP_RUNTIME_TOOLS_MCP_URL).toBe(ctx.runtimeTools!.mcpEndpoint);
-    expect(invocation.env.PAPERCLIP_RUNTIME_TOOLS_TOKEN).toBe("current-tool-token");
+    if (type === "opencode_local") {
+      // NEXA-643: the local OpenCode adapter hands the bearer to the child as a
+      // 0600 file, so the value is intentionally absent from its environment.
+      expect(invocation.env.PAPERCLIP_RUNTIME_TOOLS_TOKEN).toBeUndefined();
+      const tokenFile = invocation.env.PAPERCLIP_RUNTIME_TOOLS_TOKEN_FILE;
+      expect(tokenFile).toBeTruthy();
+      expect(tokenFile!.startsWith(`${root}${path.sep}`)).toBe(true);
+      expect(invocation.tokenFile).toEqual({ mode: 0o600, content: "current-tool-token" });
+    } else {
+      expect(invocation.env.PAPERCLIP_RUNTIME_TOOLS_TOKEN).toBe("current-tool-token");
+    }
     expect(invocation.args.join(" ")).not.toContain("FRESH_HANDOFF_ONLY");
     expect(result.sessionParams?.sessionId).toBe(sessionId);
     // Revocation likewise gets the current environment on the same session.
     await execute({ ...ctx, runtimeTools: undefined });
     expect(invocations.at(-1)!.env.PAPERCLIP_RUNTIME_TOOLS_MCP_URL).toBeUndefined();
+    expect(invocations.at(-1)!.env.PAPERCLIP_RUNTIME_TOOLS_TOKEN).toBeUndefined();
+    expect(invocations.at(-1)!.env.PAPERCLIP_RUNTIME_TOOLS_TOKEN_FILE).toBeUndefined();
     expect(getFreshSessionHandoff).not.toHaveBeenCalled();
   });
 });

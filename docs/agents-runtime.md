@@ -176,6 +176,37 @@ That means:
 
 Start with least privilege where possible, and avoid exposing secrets in broad reusable prompts unless intentionally required.
 
+### Run bearers are files, not environment values (NEXA-643)
+
+The adapter used to export the run's bearer values into the child's environment, so
+every shell the agent spawned could read them, and each of those shells could write
+one to a transcript, a log, or a build cache. They are now written to a private
+`0700` directory as `0600` files and the child gets the path:
+
+| value | was | is |
+|---|---|---|
+| board JWT | `PAPERCLIP_API_KEY` | `PAPERCLIP_API_TOKEN_FILE` |
+| runtime-tools JWT | `PAPERCLIP_RUNTIME_TOOLS_TOKEN` | `PAPERCLIP_RUNTIME_TOOLS_TOKEN_FILE` |
+| GitHub broker capability | `PAPERCLIP_GITHUB_BROKER_TOKEN` | `PAPERCLIP_GITHUB_BROKER_TOKEN_FILE` |
+| agent identity signing key | `PAPERCLIP_AGENT_PRIVATE_KEY` | `PAPERCLIP_AGENT_PRIVATE_KEY_FILE` |
+
+The directory is per run, deleted when the run ends, and swept after 24 hours if
+a run died before cleaning up.
+
+- **Rollback:** `PAPERCLIP_SECRET_FILE_ENV=0` restores the previous environment
+  injection on the next run, with no code change. `PAPERCLIP_SECRET_FILE_DIR`
+  moves the private directories off the temporary filesystem.
+- **Consumers** read the file first and still accept the old variable, so one
+  binary works on both sides of a board upgrade. That covers `agent-report.sh`,
+  `check-disposition.sh`, the GitHub launcher, the `connections` CLI, and the MCP
+  server.
+- **Remote execution targets are not converted yet.** The file would be written on
+  the control-plane host while the child runs elsewhere, so a remote run keeps the
+  old env behaviour until the carrier exists on the target.
+- A value with no consumer left in the child is not a value to keep: if you add a
+  bearer, add it to `SECRET_FILE_CARRIERS` in
+  `packages/shared/src/secret-carrier.ts` and to its consumer, not to `env`.
+
 ## 10. Minimal setup checklist
 
 1. Choose adapter (e.g. `claude_local`, `codex_local`, `opencode_local`, `hermes_local`, `hermes_gateway`, `cursor`, or `openclaw_gateway`). External plugins like `droid_local` are also available via the adapter manager.

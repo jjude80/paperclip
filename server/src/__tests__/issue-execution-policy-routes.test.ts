@@ -260,6 +260,7 @@ describe("issue execution policy routes", () => {
             "issue:read",
             "issue:mutate",
             "runtime:manage",
+            "tasks:assign",
           ].includes(input.action ?? "")
           ? true
           : Boolean(await mockAccessService.canUser() || await mockAccessService.hasPermission());
@@ -457,8 +458,93 @@ describe("issue execution policy routes", () => {
     expect(res.body.details).toMatchObject({
       code: "invalid_issue_disposition",
       missing: "review_path",
+      validReviewPaths: expect.arrayContaining(["agent_assignee_agent_id"]),
     });
     expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("keeps rejecting an in_review transition that only reassigns the issue to the acting agent", async () => {
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "todo",
+      assigneeAgentId: null,
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1003",
+      title: "Self assignment is not a review path",
+      executionPolicy: null,
+      executionState: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      companyId: "company-1",
+      runId: "55555555-5555-4555-8555-555555555555",
+    }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({
+        status: "in_review",
+        assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      });
+
+    expect(res.status).toBe(422);
+    expect(res.body.details).toMatchObject({
+      code: "invalid_issue_disposition",
+      missing: "review_path",
+    });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("allows an agent-authored in_review transition handed to a different agent reviewer", async () => {
+    const actorAgentId = "33333333-3333-4333-8333-333333333333";
+    const reviewerAgentId = "44444444-4444-4444-8444-444444444444";
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_progress",
+      assigneeAgentId: actorAgentId,
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1005",
+      title: "Hand to an agent reviewer",
+      executionPolicy: null,
+      executionState: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: actorAgentId,
+      companyId: "company-1",
+      runId: "55555555-5555-4555-8555-555555555555",
+    }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ status: "in_review", assigneeAgentId: reviewerAgentId });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      expect.objectContaining({
+        status: "in_review",
+        assigneeAgentId: reviewerAgentId,
+      }),
+      expect.anything(),
+    );
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      reviewerAgentId,
+      expect.objectContaining({
+        reason: "issue_assigned",
+        payload: expect.objectContaining({ issueId: issue.id }),
+      }),
+    );
   });
 
   it("allows an agent-authored in_review transition with a pending confirmation interaction", async () => {
