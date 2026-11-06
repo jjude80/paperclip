@@ -472,14 +472,17 @@ describeEmbeddedPostgres("git restore point expiration", () => {
       expect(await exists(f.cwd)).toBe(true);
     });
 
-    it("keeps the worktree for a child created later that inherits it with reuse_existing", async () => {
+    it("does not pin an isolated workspace for a child created later that never selects it", async () => {
       const f = await fixture();
       const created = await issueService(db).create(f.companyId, { parentId: f.issueId, title: "Inherited follow-up", status: "todo" });
-      expect(created).toMatchObject({ executionWorkspaceId: f.workspaceId, executionWorkspacePreference: "reuse_existing" });
-      expect(await f.expire()).toMatchObject({ expired: false, skipReason: "live_or_unresolved_consumer" });
-      expect(await worker().sweepTerminalWorkspaces()).toMatchObject({ archived: 0, skippedNonTerminalTree: 1 });
+      // An isolated workspace belongs to its issue (6639788da3). A child
+      // inherits the settings but is not bound to the parent's worktree, so it
+      // is not a consumer that keeps that worktree alive.
+      expect(created).toMatchObject({ executionWorkspaceId: null, executionWorkspacePreference: null });
+      expect(created.executionWorkspaceSettings).toMatchObject({ mode: "isolated_workspace" });
+      expect(await f.expire({ dryRun: true })).toMatchObject({ candidate: true, expired: false, skipReason: null });
       expect(await exists(f.cwd)).toBe(true);
-    });
+    }, 60_000);
 
     it("keeps the worktree while an open child selects it as its existing workspace", async () => {
       const f = await fixture();
