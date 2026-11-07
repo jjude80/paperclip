@@ -38,6 +38,32 @@ describe("issue thread interaction schemas", () => {
     expect(askUserQuestionsPayloadSchema.parse(parsed.payload)).toEqual(parsed.payload);
   });
 
+  it("defaults request_confirmation continuationPolicy to wake_assignee (NEXA-802)", () => {
+    const payload = { version: 1 as const, prompt: "Approve this action?" };
+    const omitted = createIssueThreadInteractionSchema.parse({
+      kind: "request_confirmation",
+      payload,
+    });
+    if (omitted.kind !== "request_confirmation") throw new Error("expected confirmation");
+    expect(omitted.continuationPolicy).toBe("wake_assignee");
+
+    const explicitNone = createIssueThreadInteractionSchema.parse({
+      kind: "request_confirmation",
+      continuationPolicy: "none",
+      payload,
+    });
+    if (explicitNone.kind !== "request_confirmation") throw new Error("expected confirmation");
+    expect(explicitNone.continuationPolicy).toBe("none");
+
+    const explicitOnAccept = createIssueThreadInteractionSchema.parse({
+      kind: "request_confirmation",
+      continuationPolicy: "wake_assignee_on_accept",
+      payload,
+    });
+    if (explicitOnAccept.kind !== "request_confirmation") throw new Error("expected confirmation");
+    expect(explicitOnAccept.continuationPolicy).toBe("wake_assignee_on_accept");
+  });
+
   it("rejects canonical-only forms with invalid modes or missing questions", () => {
     for (const questionSet of [
       { schema: "paperclip.question_set.v1", questions: [] },
@@ -151,7 +177,7 @@ describe("issue thread interaction schemas", () => {
     expect(parsed.resolverPolicy).toBeUndefined();
   });
 
-  it("parses request_confirmation payloads with default no-wake continuation", () => {
+  it("parses request_confirmation payloads with the wake_assignee default", () => {
     const parsed = createIssueThreadInteractionSchema.parse({
       kind: "request_confirmation",
       payload: {
@@ -169,7 +195,9 @@ describe("issue thread interaction schemas", () => {
 
     expect(parsed).toMatchObject({
       kind: "request_confirmation",
-      continuationPolicy: "none",
+      // NEXA-802: an omitted policy must wake the assignee, not leave the
+      // accepted card inert.
+      continuationPolicy: "wake_assignee",
       payload: {
         prompt: "Apply this plan?",
         acceptLabel: "Apply",
