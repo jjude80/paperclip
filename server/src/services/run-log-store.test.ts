@@ -562,6 +562,67 @@ describe("in-flight mirror", () => {
     expect(body.toString("utf8")).not.toContain("raced-append");
   });
 
+  it("redacts literal secrets and credential shapes before persisting and mirroring", async () => {
+    const { provider, objects } = createMemoryProvider();
+    const store = createDurableRunLogStore({
+      basePath: baseDir,
+      s3: { provider, keyPrefix: "run-logs" },
+      redactionLiterals: ["registered-secret-value-42"],
+    });
+    const boardKey = `pcp_board_${"e".repeat(48)}`;
+    const handle = await store.begin(begin);
+    await store.append(handle, {
+      stream: "stdout",
+      chunk: `env: registered-secret-value-42 board: ${boardKey}`,
+      ts: "t1",
+    });
+    await store.finalize(handle);
+
+    const local = (await fs.readFile(path.join(baseDir, handle.logRef))).toString("utf8");
+    expect(local).not.toContain("registered-secret-value-42");
+    expect(local).not.toContain(boardKey);
+    expect(local).toContain("***REDACTED***");
+    const mirrored = objects.get(`run-logs/${handle.logRef}`)!.toString("utf8");
+    expect(mirrored).toBe(local);
+  });
+
+  it("redacts per-run registered secret values passed to begin, including split chunks", async () => {
+    const { provider } = createMemoryProvider();
+    const store = createDurableRunLogStore({ basePath: baseDir, s3: { provider } });
+    const secret = "run-registered-secret-value";
+    const handle = await store.begin({ ...begin, secretValues: [secret] });
+    await store.append(handle, { stream: "stdout", chunk: "key=run-registered-", ts: "t1" });
+    await store.append(handle, { stream: "stdout", chunk: "secret-value done", ts: "t2" });
+    const summary = await store.finalize(handle);
+
+    const body = (await fs.readFile(path.join(baseDir, handle.logRef))).toString("utf8");
+    expect(body).not.toContain(secret);
+    expect(body).toContain("key=");
+    expect(body).toContain(" done");
+    expect(summary.bytes).toBe(Buffer.byteLength(body));
+  });
+
+  it("writes run-log directories 0700 and files 0600, correcting an existing log", async () => {
+    const { provider } = createMemoryProvider();
+    const store = createDurableRunLogStore({ basePath: baseDir, s3: { provider } });
+    const handle = await store.begin(begin);
+    const logPath = path.join(baseDir, handle.logRef);
+    // Simulate a log created by an older build with the process umask leaking
+    // group/world read access.
+    await fs.chmod(logPath, 0o664);
+    await fs.chmod(path.dirname(logPath), 0o775);
+    await store.append(handle, { stream: "stdout", chunk: "hello", ts: "t1" });
+
+    // A retry of the same run re-opens the existing file: it must be narrowed,
+    // not only logs created after this deploy.
+    await store.begin(begin);
+    const next = await store.begin({ ...begin, runId: "run2" });
+    const nextDir = path.join(baseDir, path.dirname(next.logRef));
+    expect((await fs.stat(logPath)).mode & 0o777).toBe(0o600);
+    expect((await fs.stat(nextDir)).mode & 0o777).toBe(0o700);
+    expect((await fs.stat(baseDir)).mode & 0o777).toBe(0o700);
+  });
+
   it("in-flight upload failures never break appends and recover on the next flush", async () => {
     const { provider, objects, calls } = createMemoryProvider();
     let failPuts = true;

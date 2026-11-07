@@ -6,6 +6,7 @@ import type { createAgentIdentityRedactor } from "../agent-identity-redaction.js
 import { touchHeartbeatRunRuntimeStatus } from "../heartbeat-run-runtime-status.js";
 import { publishLiveEvent } from "../live-events.js";
 import type { RunLogHandle, RunLogStore } from "../run-log-store.js";
+import { createRunSecretRedactionRegistry } from "../run-secret-redaction.js";
 import { appendExcerpt, compactRunLogChunk } from "./run-log.js";
 import { isHeartbeatRunRuntimeStatusActive, publishHeartbeatRunRuntimeProgress, type createHeartbeatLifecycle } from "./run-lifecycle.js";
 
@@ -85,11 +86,26 @@ export function createHeartbeatRunOutput(db: Db, input: HeartbeatRunOutputInput)
   // above use only the immutable run ID from the initial row.
   async function begin(currentRun: Run) {
     const run = currentRun;
+    // Secrets injected into this run are also redacted from its output before
+    // the NDJSON line is written. Failure to resolve them must not stop the
+    // run: the sink still applies environment, secret-file and credential-shape
+    // redaction, and old logs keep their own redaction path.
+    let runSecretValues: string[] = [];
+    try {
+      runSecretValues = await createRunSecretRedactionRegistry(db)
+        .secretValuesForRun(run.companyId, runId);
+    } catch (error) {
+      console.warn(
+        `[heartbeat] Could not resolve run secret values for write-time log redaction (run ${runId}):`,
+        error instanceof Error ? error.message : error,
+      );
+    }
     handle = await runLogStore.begin({
       companyId: run.companyId,
       agentId: run.agentId,
       runId,
       newRun: isNewRunLog(run),
+      secretValues: runSecretValues,
     });
 
     await db
