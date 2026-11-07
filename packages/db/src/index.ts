@@ -54,13 +54,18 @@ export {
   hasEmbeddedPostgresAdminPassword,
   ensureEmbeddedPostgresAdminRole,
   restrictEmbeddedPostgresApplicationRole,
+  provisionEmbeddedPostgresApplicationRole,
+  roleAttributeRestoreClauses,
+  suppressCredentialStatementLogging,
   resolveEmbeddedPostgresDataDir,
   resolveEmbeddedPostgresUrl,
   resolveEmbeddedPostgresCredentials,
   hasEmbeddedPostgresPassword,
   generateEmbeddedPostgresPassword,
   resolveEmbeddedPostgresInitialisationPassword,
+  resolveEmbeddedPostgresAdminInitialisationPassword,
   persistEmbeddedPostgresPassword,
+  persistEmbeddedPostgresAdminPassword,
   rotateEmbeddedPostgresPassword,
   EMBEDDED_POSTGRES_HBA_FILENAME,
   embeddedPostgresHbaPath,
@@ -79,6 +84,8 @@ export {
   type EmbeddedPostgresAdminRoleOutcome,
   type RestrictEmbeddedPostgresApplicationRoleOptions,
   type EmbeddedPostgresApplicationRoleOutcome,
+  type ProvisionEmbeddedPostgresApplicationRoleOptions,
+  type EmbeddedPostgresApplicationRoleProvisionOutcome,
 } from "./embedded-postgres-credentials.js";
 export { loadWithoutEmbeddedPostgresExitHooks } from "./embedded-postgres-lifecycle.js";
 export { issueRelations } from "./schema/issue_relations.js";

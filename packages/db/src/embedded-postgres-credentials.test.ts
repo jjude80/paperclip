@@ -6,6 +6,7 @@ import postgres from "postgres";
 import {
   EMBEDDED_POSTGRES_PASSWORD_FILENAME,
   EMBEDDED_POSTGRES_ADMIN_PASSWORD_FILENAME,
+  EMBEDDED_POSTGRES_ADMIN_USER,
   LEGACY_EMBEDDED_POSTGRES_PASSWORD,
   embeddedPostgresPasswordPath,
   embeddedPostgresAdminPasswordPath,
@@ -13,14 +14,19 @@ import {
   embeddedPostgresAdminUrl,
   generateEmbeddedPostgresPassword,
   persistEmbeddedPostgresPassword,
+  persistEmbeddedPostgresAdminPassword,
   resolveEmbeddedPostgresCredentials,
   resolveEmbeddedPostgresAdminCredentials,
   resolveEmbeddedPostgresInitialisationPassword,
+  resolveEmbeddedPostgresAdminInitialisationPassword,
   rotateEmbeddedPostgresPassword,
   embeddedPostgresHbaPath,
   ensureEmbeddedPostgresScramAuth,
   ensureEmbeddedPostgresAdminRole,
   restrictEmbeddedPostgresApplicationRole,
+  provisionEmbeddedPostgresApplicationRole,
+  roleAttributeRestoreClauses,
+  suppressCredentialStatementLogging,
   planCleartextAuthRewrite,
 } from "./embedded-postgres-credentials.js";
 import { prepareEmbeddedPostgresNativeRuntime } from "./embedded-postgres-native.js";
@@ -157,6 +163,53 @@ describe("embedded postgres admin credentials", () => {
       /No embedded PostgreSQL administrative credential/,
     );
   });
+
+  it("stores the bootstrap admin credential at 0600 and refuses to overwrite it", () => {
+    const dataDir = createTempDataDir();
+    persistEmbeddedPostgresAdminPassword(dataDir, "admin-first-value");
+
+    expect(fs.statSync(embeddedPostgresAdminPasswordPath(dataDir)).mode & 0o777).toBe(0o600);
+    expect(resolveEmbeddedPostgresAdminCredentials(dataDir)).toEqual({
+      user: EMBEDDED_POSTGRES_ADMIN_USER,
+      password: "admin-first-value",
+    });
+    expect(() => persistEmbeddedPostgresAdminPassword(dataDir, "admin-second-value")).toThrow(
+      /different credential is already stored/,
+    );
+  });
+
+  it("generates and reuses the bootstrap admin initialisation password", () => {
+    const dataDir = createTempDataDir();
+    const generated = resolveEmbeddedPostgresAdminInitialisationPassword(dataDir);
+    expect(generated).not.toBe(EMBEDDED_POSTGRES_ADMIN_USER);
+    expect(generated.length).toBeGreaterThanOrEqual(40);
+    // Reading it must not persist it: initdb has not run yet.
+    expect(fs.readdirSync(dataDir)).toEqual([]);
+
+    persistEmbeddedPostgresAdminPassword(dataDir, generated);
+    expect(resolveEmbeddedPostgresAdminInitialisationPassword(dataDir)).toBe(generated);
+  });
+});
+
+describe("application-role rollback planning (NEXA-814)", () => {
+  it("restores only the attributes the restriction actually removed", () => {
+    // Prior non-bootstrap shape: only CREATEROLE was taken away.
+    expect(
+      roleAttributeRestoreClauses({ rolsuper: false, rolcreaterole: true }, false),
+    ).toEqual(["CREATEROLE"]);
+    // Prior non-bootstrap superuser: only SUPERUSER was taken away.
+    expect(
+      roleAttributeRestoreClauses({ rolsuper: true, rolcreaterole: false }, false),
+    ).toEqual(["SUPERUSER"]);
+    // Bootstrap superuser: SUPERUSER is untouchable, so only CREATEROLE returns.
+    expect(
+      roleAttributeRestoreClauses({ rolsuper: true, rolcreaterole: true }, true),
+    ).toEqual(["CREATEROLE"]);
+    // Nothing was removed: a rollback must grant nothing.
+    expect(
+      roleAttributeRestoreClauses({ rolsuper: true, rolcreaterole: false }, true),
+    ).toEqual([]);
+  });
 });
 
 type LegacyCluster = {
@@ -185,6 +238,64 @@ async function startLegacyCluster(): Promise<LegacyCluster> {
     onError: () => {},
   });
   await instance.initialise();
+  await instance.start();
+  const stop = async () => {
+    await instance.stop().catch(() => undefined);
+  };
+  cleanups.push(stop);
+  return { dataDir, port, stop };
+}
+
+/**
+ * A legacy cluster whose server stderr is captured, for assertions about what
+ * PostgreSQL writes to its log.
+ */
+async function startLegacyClusterWithLogs(): Promise<LegacyCluster & { logs: string[] }> {
+  const { default: EmbeddedPostgres } = await import("embedded-postgres");
+  await prepareEmbeddedPostgresNativeRuntime();
+  const dataDir = createTempDataDir();
+  const port = 20000 + Math.floor(Math.random() * 20000);
+  const logs: string[] = [];
+  const instance = new EmbeddedPostgres({
+    databaseDir: dataDir,
+    user: "paperclip",
+    password: LEGACY_EMBEDDED_POSTGRES_PASSWORD,
+    port,
+    persistent: false,
+    initdbFlags: ["--encoding=UTF8", "--locale=C", "--lc-messages=C"],
+    onLog: (message) => logs.push(String(message)),
+    onError: (message) => logs.push(String(message)),
+  });
+  await instance.initialise();
+  await instance.start();
+  const stop = async () => {
+    await instance.stop().catch(() => undefined);
+  };
+  cleanups.push(stop);
+  return { dataDir, port, stop, logs };
+}
+
+async function startAdminBootstrappedCluster(): Promise<LegacyCluster> {
+  const { default: EmbeddedPostgres } = await import("embedded-postgres");
+  await prepareEmbeddedPostgresNativeRuntime();
+  const dataDir = createTempDataDir();
+  const port = 20000 + Math.floor(Math.random() * 20000);
+  const adminPassword = resolveEmbeddedPostgresAdminInitialisationPassword(dataDir);
+  const applicationPassword = resolveEmbeddedPostgresInitialisationPassword(dataDir);
+  const instance = new EmbeddedPostgres({
+    databaseDir: dataDir,
+    user: EMBEDDED_POSTGRES_ADMIN_USER,
+    password: adminPassword,
+    port,
+    persistent: false,
+    authMethod: "scram-sha-256" as const,
+    initdbFlags: ["--encoding=UTF8", "--locale=C", "--lc-messages=C"],
+    onLog: () => {},
+    onError: () => {},
+  });
+  await instance.initialise();
+  persistEmbeddedPostgresAdminPassword(dataDir, adminPassword);
+  persistEmbeddedPostgresPassword(dataDir, applicationPassword);
   await instance.start();
   const stop = async () => {
     await instance.stop().catch(() => undefined);
@@ -607,6 +718,139 @@ describeEmbeddedPostgres("embedded postgres least privilege (NEXA-755 control 2)
       // SUPERUSER is retained because the engine forbids removing it from the
       // bootstrap superuser; CREATEROLE is gone, which is the reachable limit.
       expect(attributes).toMatchObject({ rolsuper: true, rolcreaterole: false });
+    },
+    EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
+  );
+});
+
+describeEmbeddedPostgres("embedded postgres role model (NEXA-805)", () => {
+  async function readCurrentRole(url: string) {
+    const sql = postgres(url, { max: 1, onnotice: () => {} });
+    try {
+      const rows = await sql<{
+        rolsuper: boolean;
+        rolcreaterole: boolean;
+        rolcreatedb: boolean;
+      }[]>`
+        select rolsuper, rolcreaterole, rolcreatedb
+        from pg_roles where rolname = current_user
+      `;
+      return rows[0];
+    } finally {
+      await sql.end({ timeout: 5 }).catch(() => undefined);
+    }
+  }
+
+  it(
+    "creates the application role as a non-superuser that can still create its own database",
+    async () => {
+      const cluster = await startAdminBootstrappedCluster();
+      const outcome = await provisionEmbeddedPostgresApplicationRole({
+        dataDir: cluster.dataDir,
+        port: cluster.port,
+      });
+      expect(outcome).toEqual({ status: "created" });
+
+      const applicationUrl = embeddedPostgresUrl({
+        dataDir: cluster.dataDir,
+        port: cluster.port,
+        database: "postgres",
+      });
+      const attributes = await readCurrentRole(applicationUrl);
+      expect(attributes).toMatchObject({
+        rolsuper: false,
+        rolcreaterole: false,
+        rolcreatedb: true,
+      });
+
+      // First-run database creation still works with the least-privilege role.
+      const applicationSql = postgres(applicationUrl, { max: 1, onnotice: () => {} });
+      try {
+        await applicationSql.unsafe('create database nexa805_probe');
+      } finally {
+        await applicationSql.end({ timeout: 5 }).catch(() => undefined);
+      }
+
+      // An admin-bootstrapped cluster reaches the fully restricted state: the
+      // application role is not the bootstrap superuser, so nothing is retained.
+      expect(
+        await restrictEmbeddedPostgresApplicationRole({
+          dataDir: cluster.dataDir,
+          port: cluster.port,
+        }),
+      ).toEqual({ status: "restricted" });
+
+      // Provisioning is idempotent across restarts.
+      expect(
+        await provisionEmbeddedPostgresApplicationRole({
+          dataDir: cluster.dataDir,
+          port: cluster.port,
+        }),
+      ).toEqual({ status: "existing" });
+    },
+    EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "skips provisioning when the cluster has no administrative credential",
+    async () => {
+      const cluster = await startLegacyCluster();
+      await rotateEmbeddedPostgresPassword({ dataDir: cluster.dataDir, port: cluster.port });
+
+      const outcome = await provisionEmbeddedPostgresApplicationRole({
+        dataDir: cluster.dataDir,
+        port: cluster.port,
+      });
+
+      expect(outcome).toEqual({ status: "skipped", reason: "no-admin-credential" });
+      // The historical role is untouched: still the bootstrap superuser.
+      expect(
+        (await readCurrentRole(
+          embeddedPostgresUrl({ dataDir: cluster.dataDir, port: cluster.port, database: "postgres" }),
+        ))?.rolsuper,
+      ).toBe(true);
+    },
+    EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
+  );
+});
+
+describeEmbeddedPostgres("credential statement logging (NEXA-806)", () => {
+  const waitForLog = async () => {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  };
+
+  it(
+    "keeps a failing credential statement out of the server log",
+    async () => {
+      const cluster = await startLegacyClusterWithLogs();
+      const url = `postgres://paperclip:${LEGACY_EMBEDDED_POSTGRES_PASSWORD}@127.0.0.1:${cluster.port}/postgres`;
+
+      // Control: PostgreSQL logs a failing statement by default, including the
+      // rendered credential. This is the defect NEXA-806 records.
+      const control = postgres(url, { max: 1, onnotice: () => {} });
+      try {
+        await control
+          .unsafe(`ALTER ROLE no_such_role_nexa806 WITH PASSWORD 'CANARY-CONTROL-123'`)
+          .catch(() => undefined);
+      } finally {
+        await control.end({ timeout: 5 }).catch(() => undefined);
+      }
+      await waitForLog();
+      expect(cluster.logs.join("")).toContain("CANARY-CONTROL-123");
+
+      // The real credential path: suppress before the statement is sent.
+      cluster.logs.length = 0;
+      const suppressed = postgres(url, { max: 1, onnotice: () => {} });
+      try {
+        await suppressCredentialStatementLogging(suppressed, "test a credential statement");
+        await suppressed
+          .unsafe(`ALTER ROLE no_such_role_nexa806 WITH PASSWORD 'CANARY-SUPPRESSED-456'`)
+          .catch(() => undefined);
+      } finally {
+        await suppressed.end({ timeout: 5 }).catch(() => undefined);
+      }
+      await waitForLog();
+      expect(cluster.logs.join("")).not.toContain("CANARY-SUPPRESSED-456");
     },
     EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
   );

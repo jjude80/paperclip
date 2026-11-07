@@ -74,12 +74,16 @@ import {
   prepareEmbeddedPostgresNativeRuntime,
   embeddedPostgresUrl,
   persistEmbeddedPostgresPassword,
+  persistEmbeddedPostgresAdminPassword,
   resolveEmbeddedPostgresCredentials,
   resolveEmbeddedPostgresInitialisationPassword,
+  resolveEmbeddedPostgresAdminInitialisationPassword,
   rotateEmbeddedPostgresPassword,
   ensureEmbeddedPostgresScramAuth,
   ensureEmbeddedPostgresAdminRole,
   restrictEmbeddedPostgresApplicationRole,
+  provisionEmbeddedPostgresApplicationRole,
+  EMBEDDED_POSTGRES_ADMIN_USER,
   reconcilePendingMigrationHistory,
   formatDatabaseBackupResult,
   runDatabaseBackup,
@@ -600,20 +604,42 @@ async function startServerWithDatabaseTeardown(
         }
         port = detectedPort;
         logger.info(`Using embedded PostgreSQL because no DATABASE_URL set (dataDir=${dataDir}, port=${port})`);
-        const initPassword = clusterAlreadyInitialized
-          ? resolveEmbeddedPostgresCredentials(dataDir).password
-          : resolveEmbeddedPostgresInitialisationPassword(dataDir);
-        const createEmbeddedPostgres = () => {
-          // Read at call time: the supervisor restarts the cluster after this
-          // process has rotated a legacy cluster onto a generated password.
-          const credentials = resolveEmbeddedPostgresCredentials(dataDir);
+        const existingCredentials = clusterAlreadyInitialized
+          ? resolveEmbeddedPostgresCredentials(dataDir)
+          : null;
+        // A brand new cluster is bootstrapped by the administrative role so the
+        // application role can be created as a non-superuser afterwards
+        // (NEXA-805). Both passwords are generated before `initdb` runs.
+        const bootstrap = existingCredentials ?? {
+          user: EMBEDDED_POSTGRES_ADMIN_USER,
+          password: resolveEmbeddedPostgresAdminInitialisationPassword(dataDir),
+        };
+        const applicationInitialPassword = existingCredentials?.password
+          ?? resolveEmbeddedPostgresInitialisationPassword(dataDir);
+        const createEmbeddedPostgres = () => new EmbeddedPostgres({
+          databaseDir: dataDir,
+          user: bootstrap.user,
+          password: bootstrap.password,
+          port,
+          persistent: true,
+          ...(clusterAlreadyInitialized ? {} : { authMethod: "scram-sha-256" as const }),
+          initdbFlags: ["--encoding=UTF8", "--locale=C", "--lc-messages=C"],
+          onLog: appendEmbeddedPostgresLog,
+          onError: appendEmbeddedPostgresLog,
+        });
+        // The supervisor restarts the cluster after initdb has created it and
+        // after this process provisioned the application role, so a restart
+        // connects as the application role (NEXA-805). Fall back to the
+        // bootstrap credential only when no application credential was stored.
+        const createRestartedEmbeddedPostgres = () => {
+          const resolved = resolveEmbeddedPostgresCredentials(dataDir);
+          const credentials = resolved.source === "legacy" ? bootstrap : resolved;
           return new EmbeddedPostgres({
             databaseDir: dataDir,
             user: credentials.user,
-            password: clusterAlreadyInitialized ? credentials.password : initPassword,
+            password: credentials.password,
             port,
             persistent: true,
-            ...(clusterAlreadyInitialized ? {} : { authMethod: "scram-sha-256" as const }),
             initdbFlags: ["--encoding=UTF8", "--locale=C", "--lc-messages=C"],
             onLog: appendEmbeddedPostgresLog,
             onError: appendEmbeddedPostgresLog,
@@ -624,9 +650,10 @@ async function startServerWithDatabaseTeardown(
         if (!clusterAlreadyInitialized) {
           try {
             await embeddedPostgres.initialise();
-            // Persist the generated credential the moment initdb created the
-            // data directory (NEXA-749).
-            persistEmbeddedPostgresPassword(dataDir, initPassword);
+            // Persist both credentials the moment initdb created the data
+            // directory (NEXA-749/805).
+            persistEmbeddedPostgresAdminPassword(dataDir, bootstrap.password);
+            persistEmbeddedPostgresPassword(dataDir, applicationInitialPassword);
           } catch (err) {
             logEmbeddedPostgresFailure("initialise", err);
             throw formatEmbeddedPostgresError(err, {
@@ -652,6 +679,12 @@ async function startServerWithDatabaseTeardown(
           });
         }
         embeddedPostgresStartedByThisProcess = true;
+        // A cluster this process bootstrapped with paperclip_admin has no
+        // application role yet: create it as a non-superuser before anything
+        // connects as it (NEXA-805). An existing cluster keeps its shape.
+        if (!clusterAlreadyInitialized) {
+          await provisionEmbeddedPostgresApplicationRole({ dataDir, port });
+        }
         // This process started the cluster, so it owns the credential: a
         // pre-NEXA-749 cluster is rotated off the shipped literal here, before
         // any pool or supervisor restart connects. A cluster that already has
@@ -705,7 +738,7 @@ async function startServerWithDatabaseTeardown(
         }
         embeddedPostgresSupervisor = createEmbeddedPostgresSupervisor({
           initialInstance: embeddedPostgres,
-          createInstance: createEmbeddedPostgres,
+          createInstance: createRestartedEmbeddedPostgres,
           beforeRestart: () => {
             const runningPostgresPid = getRunningPid();
             if (runningPostgresPid) {

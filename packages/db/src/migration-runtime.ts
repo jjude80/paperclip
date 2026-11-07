@@ -4,14 +4,18 @@ import path from "node:path";
 import { ensurePostgresDatabase, getPostgresDataDirectory } from "./client.js";
 import { createEmbeddedPostgresLogBuffer, formatEmbeddedPostgresError } from "./embedded-postgres-error.js";
 import {
+  EMBEDDED_POSTGRES_ADMIN_USER,
   embeddedPostgresUrl,
   persistEmbeddedPostgresPassword,
+  persistEmbeddedPostgresAdminPassword,
   resolveEmbeddedPostgresCredentials,
   resolveEmbeddedPostgresInitialisationPassword,
+  resolveEmbeddedPostgresAdminInitialisationPassword,
   rotateEmbeddedPostgresPassword,
   ensureEmbeddedPostgresScramAuth,
   ensureEmbeddedPostgresAdminRole,
   restrictEmbeddedPostgresApplicationRole,
+  provisionEmbeddedPostgresApplicationRole,
 } from "./embedded-postgres-credentials.js";
 import { prepareEmbeddedPostgresNativeRuntime } from "./embedded-postgres-native.js";
 import { resolveDatabaseTarget } from "./runtime-config.js";
@@ -153,16 +157,23 @@ async function ensureEmbeddedPostgresConnection(
   }
 
   const clusterAlreadyInitialised = existsSync(pgVersionFile);
-  // A brand new cluster gets a generated password before `initdb` runs, so the
-  // cluster never exists with the shipped literal (NEXA-749).
-  const initialPassword = clusterAlreadyInitialised
-    ? resolveEmbeddedPostgresCredentials(dataDir).password
-    : resolveEmbeddedPostgresInitialisationPassword(dataDir);
+  // A brand new cluster is bootstrapped by the administrative role so the
+  // application role can be created as a non-superuser afterwards (NEXA-805).
+  // Both passwords are generated before `initdb` runs (NEXA-749).
+  const existingCredentials = clusterAlreadyInitialised
+    ? resolveEmbeddedPostgresCredentials(dataDir)
+    : null;
+  const bootstrap = existingCredentials ?? {
+    user: EMBEDDED_POSTGRES_ADMIN_USER,
+    password: resolveEmbeddedPostgresAdminInitialisationPassword(dataDir),
+  };
+  const applicationInitialPassword = existingCredentials?.password
+    ?? resolveEmbeddedPostgresInitialisationPassword(dataDir);
 
   const instance = new EmbeddedPostgres({
     databaseDir: dataDir,
-    user: "paperclip",
-    password: initialPassword,
+    user: bootstrap.user,
+    password: bootstrap.password,
     port: selectedPort,
     persistent: true,
     ...(clusterAlreadyInitialised ? {} : { authMethod: "scram-sha-256" as const }),
@@ -174,9 +185,10 @@ async function ensureEmbeddedPostgresConnection(
   if (!clusterAlreadyInitialised) {
     try {
       await instance.initialise();
-      // initdb created the data directory; persist the credential now so the
-      // cluster is never left with a password nobody stored (NEXA-749).
-      persistEmbeddedPostgresPassword(dataDir, initialPassword);
+      // initdb created the data directory; persist both credentials now so the
+      // cluster is never left with a password nobody stored (NEXA-749/805).
+      persistEmbeddedPostgresAdminPassword(dataDir, bootstrap.password);
+      persistEmbeddedPostgresPassword(dataDir, applicationInitialPassword);
     } catch (error) {
       throw formatEmbeddedPostgresError(error, {
         fallbackMessage:
@@ -195,6 +207,13 @@ async function ensureEmbeddedPostgresConnection(
       fallbackMessage: `Failed to start embedded PostgreSQL on port ${selectedPort}`,
       recentLogs: logBuffer.getRecentLogs(),
     });
+  }
+
+  // A cluster this process bootstrapped with paperclip_admin has no application
+  // role yet: create it as a non-superuser before anything connects as it
+  // (NEXA-805). An already-initialised cluster keeps its historical shape.
+  if (!clusterAlreadyInitialised) {
+    await provisionEmbeddedPostgresApplicationRole({ dataDir, port: selectedPort });
   }
 
   // This process started the cluster, so it is the owner and may rotate a
