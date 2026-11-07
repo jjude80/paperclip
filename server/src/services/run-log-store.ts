@@ -7,6 +7,11 @@ import { notFound } from "../errors.js";
 import { resolvePaperclipInstanceRoot } from "../home-paths.js";
 import { createS3StorageProvider } from "../storage/s3-provider.js";
 import type { StorageProvider } from "../storage/types.js";
+import {
+  collectRunLogLiteralSecrets,
+  createRunLogRedactor,
+  type RunLogRedactor,
+} from "./run-log-redaction.js";
 
 export type RunLogStoreType = "local_file";
 
@@ -50,6 +55,9 @@ export interface RunLogBeginInput {
   // began this log, so no durable prefix can exist to restore. Omitted means
   // the run may be a retry or recovery and the durable mirror is checked.
   newRun?: boolean;
+  // Secret values registered for this run (the material injected into its
+  // agent environment). They are redacted from output before it is persisted.
+  secretValues?: Iterable<string>;
 }
 
 export interface RunLogStore {
@@ -100,6 +108,12 @@ export interface DurableRunLogStoreOptions {
     // mirroring: no extra PUT traffic unless explicitly opted in.
     inflightMirrorMs?: number;
   };
+  // Test seam only. Production must keep write-time redaction on: the NDJSON
+  // file is a secret-bearing sink on disk and in object storage.
+  disableRedaction?: boolean;
+  // Additional literal values (tests / embedding callers) on top of the
+  // process environment and instance secret files.
+  redactionLiterals?: Iterable<string>;
 }
 
 // Run-log store with TRANSPARENT durability. The store id stays "local_file" so
@@ -130,6 +144,35 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
   const pendingAppends = new WeakMap<RunLogHandle, Set<Promise<void>>>();
   const closingHandles = new WeakSet<RunLogHandle>();
   const abandonedHandles = new WeakSet<RunLogHandle>();
+  // One streaming redactor per handle: it holds a partial secret between
+  // chunks, so interleaved runs can never share redaction state.
+  const handleRedactors = new WeakMap<RunLogHandle, RunLogRedactor>();
+
+  function serializeEvent(
+    handle: RunLogHandle,
+    event: { stream: "stdout" | "stderr" | "system"; chunk: string; ts: string; seq?: number },
+  ) {
+    return JSON.stringify({
+      ts: event.ts,
+      ...(handle.attemptId ? { attemptId: handle.attemptId } : {}),
+      stream: event.stream,
+      chunk: event.chunk,
+      // Monotonic per-run sequence so readers can dedupe and order records
+      // even when several identical chunks share the same millisecond ts
+      // (common for ACP-style token deltas).
+      ...(typeof event.seq === "number" && Number.isFinite(event.seq) ? { seq: event.seq } : {}),
+    });
+  }
+
+  async function baseRedactionLiterals(): Promise<string[]> {
+    if (options.disableRedaction) return [];
+    return collectRunLogLiteralSecrets().catch((error) => {
+      // Losing the literal list must not stop a run from being recorded, but a
+      // silently missing redactor is worth surfacing to operators.
+      console.warn("[run-log-store] Secret redaction literal collection failed:", error);
+      return [];
+    });
+  }
 
   function s3Key(logRef: string): string {
     return s3Prefix ? `${s3Prefix}/${logRef}` : logRef;
@@ -227,9 +270,24 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
     if (entry.upload) await entry.upload;
   }
 
+  // Run logs are secret-bearing for their whole lifetime (a finished log can
+  // contain output from before a rotation). Mode is enforced explicitly:
+  // `mkdir`/`open` modes only apply on creation, so a pre-existing tree can
+  // otherwise keep wide group/world access.
+  async function restrictToOwner(target: string) {
+    await fs.chmod(target, 0o700).catch(() => undefined);
+  }
+
   async function ensureDir(relativeDir: string) {
     const dir = resolveWithin(basePath, relativeDir);
-    await fs.mkdir(dir, { recursive: true });
+    await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+    const base = path.resolve(basePath);
+    let current = path.resolve(dir);
+    while (current === base || current.startsWith(base + path.sep)) {
+      await restrictToOwner(current);
+      if (current === base) break;
+      current = path.dirname(current);
+    }
   }
 
   async function readLocalRange(
@@ -342,23 +400,28 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
         }
       }
       const file = await fs.open(absPath, "a", 0o600);
+      await file.chmod(0o600).catch(() => undefined);
       await file.close();
-      return { store: "local_file", logRef: relPath, attemptId: randomUUID() };
+      const handle: RunLogHandle = { store: "local_file", logRef: relPath, attemptId: randomUUID() };
+      if (!options.disableRedaction) {
+        const literals = await baseRedactionLiterals();
+        handleRedactors.set(handle, createRunLogRedactor([
+          ...literals,
+          ...(options.redactionLiterals ?? []),
+          ...(input.secretValues ?? []),
+        ]));
+      }
+      return handle;
     },
 
     async append(handle, event) {
       if (handle.store !== "local_file" || closingHandles.has(handle)) return 0;
       const absPath = resolveWithin(basePath, handle.logRef);
-      const line = JSON.stringify({
-        ts: event.ts,
-        ...(handle.attemptId ? { attemptId: handle.attemptId } : {}),
-        stream: event.stream,
-        chunk: event.chunk,
-        // Monotonic per-run sequence so readers can dedupe and order records
-        // even when several identical chunks share the same millisecond ts
-        // (common for ACP-style token deltas).
-        ...(typeof event.seq === "number" && Number.isFinite(event.seq) ? { seq: event.seq } : {}),
-      });
+      const redactor = handleRedactors.get(handle);
+      const safeEvent = redactor
+        ? { ...event, chunk: redactor.push(event.stream, event.chunk) }
+        : event;
+      const line = serializeEvent(handle, safeEvent);
       const persisted = `${line}\n`;
       let pending = pendingAppends.get(handle);
       if (!pending) {
@@ -403,6 +466,18 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
       }
       await retireInflightMirror(handle.logRef);
       const absPath = resolveWithin(basePath, handle.logRef);
+      // Emit any tail the redactor held back for split-chunk matching before
+      // the file is hashed and mirrored. This is the last chance to redact it.
+      const redactor = handleRedactors.get(handle);
+      if (redactor) {
+        handleRedactors.delete(handle);
+        for (const stream of ["stdout", "stderr", "system"] as const) {
+          const tail = redactor.finish(stream);
+          if (!tail) continue;
+          const line = serializeEvent(handle, { stream, chunk: tail, ts: new Date().toISOString() });
+          await fs.appendFile(absPath, `${line}\n`, "utf8");
+        }
+      }
       const stat = await fs.stat(absPath).catch(() => null);
       if (!stat) throw notFound("Run log not found");
       const hash = await sha256File(absPath);

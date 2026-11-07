@@ -149,6 +149,11 @@ export function createRunSecretRedactionRegistry(db: Db) {
       const disclosure = await valuesForRun(companyId, runId, viewerUserId);
       return redactRegisteredSecretValues(value, disclosure.values, disclosure.credentialConnectionName);
     },
+    // Write-time sinks (the NDJSON output log) need the values themselves, not
+    // a redacted object. Keep the resolution inside the registry so the
+    // encrypted material never leaves this module as plaintext rows.
+    secretValuesForRun: async (companyId: string, runId: string): Promise<string[]> =>
+      (await valuesForRun(companyId, runId, null)).values,
     redactForIssue: async <T>(companyId: string, issueId: string, value: T): Promise<T> =>
       redactRegisteredSecretValues(value, await valuesForIssue(companyId, issueId)),
   };
