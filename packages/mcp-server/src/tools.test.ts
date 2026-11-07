@@ -288,7 +288,8 @@ describe("paperclip MCP tools", () => {
     expect(init.method).toBe("POST");
     expect(JSON.parse(String(init.body))).toEqual({
       kind: "request_confirmation",
-      continuationPolicy: "none",
+      // An omitted policy must not leave the card inert (NEXA-802).
+      continuationPolicy: "wake_assignee",
       idempotencyKey: "confirmation:PAP-1135:plan:33333333-3333-4333-8333-333333333333",
       title: "Plan approval",
       payload: {
@@ -306,6 +307,26 @@ describe("paperclip MCP tools", () => {
           revisionNumber: 3,
         },
       },
+    });
+  });
+
+  it("keeps an explicit continuationPolicy none on request_confirmation", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      mockJsonResponse({ id: "interaction-1", kind: "request_confirmation" }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipRequestConfirmation");
+    await tool.execute({
+      issueId: "PAP-1135",
+      continuationPolicy: "none",
+      payload: { version: 1, prompt: "Attest out of band; no follow-up run." },
+    });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(String(init.body))).toMatchObject({
+      kind: "request_confirmation",
+      continuationPolicy: "none",
     });
   });
 

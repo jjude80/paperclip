@@ -177,7 +177,10 @@ const createRequestConfirmationToolSchema = z.object({
   sourceRunId: z.string().guid().nullable().optional(),
   title: z.string().trim().max(240).nullable().optional(),
   summary: z.string().trim().max(1000).nullable().optional(),
-  continuationPolicy: issueThreadInteractionContinuationPolicySchema.optional().default("none"),
+  // Match the shared create schema (NEXA-802): an omitted continuation policy
+  // must not silently create an inert confirmation. Use "none" explicitly for
+  // a card whose acceptance needs no follow-up run.
+  continuationPolicy: issueThreadInteractionContinuationPolicySchema.optional().default("wake_assignee"),
   payload: requestConfirmationPayloadSchema,
 });
 

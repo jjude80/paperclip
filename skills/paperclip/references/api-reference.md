@@ -1162,7 +1162,7 @@ Payload field reference (`RequestCheckboxConfirmationPayload`):
 
 Envelope defaults that differ from other kinds:
 
-- `continuationPolicy` defaults to `"wake_assignee"` for `request_checkbox_confirmation` (same as `suggest_tasks` and `ask_user_questions`). Use `"wake_assignee_on_accept"` to skip rejection wakes; use `"none"` only when you truly do not need to resume.
+- `continuationPolicy` defaults to `"wake_assignee"` for `request_confirmation` and `request_checkbox_confirmation` (same as `suggest_tasks` and `ask_user_questions`). Use `"wake_assignee_on_accept"` to skip rejection wakes; use `"none"` explicitly only when you truly do not need to resume.
 
 Accept (board action, requires board/user role; agents creating the interaction cannot accept):
 

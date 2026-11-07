@@ -2124,9 +2124,15 @@ const createIssueThreadInteractionUnionSchema = z.discriminatedUnion("kind", [
     sourceRunId: z.string().guid().nullable().optional(),
     title: z.string().trim().max(240).nullable().optional(),
     summary: z.string().trim().max(1000).nullable().optional(),
+    // A confirmation gates an action the assignee is expected to take (or to
+    // stop taking) after the yes/no. Defaulting to "none" made an omitted
+    // field silently inert: the owner saw a completed decision and no run was
+    // woken to act on it (NEXA-802). Every other interaction kind defaults to
+    // wake_assignee; a caller that truly needs a human-only, no-follow-up card
+    // must now say so explicitly.
     continuationPolicy: issueThreadInteractionContinuationPolicySchema
       .optional()
-      .default("none"),
+      .default("wake_assignee"),
     payload: requestConfirmationPayloadSchema,
   }),
   z.object({
