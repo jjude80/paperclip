@@ -1958,6 +1958,43 @@ describe("effective run execution workspace config freshness", () => {
     });
   });
 
+  it.each(["done", "cancelled"])(
+    "hands a closed owner's isolated workspace to an open child (%s owner)",
+    () => {
+      expect(resolveExecutionWorkspaceReuseRequestForIssue({
+        issueExecutionWorkspaceId: "workspace-parent",
+        issueExecutionWorkspacePreference: "reuse_existing",
+        existingExecutionWorkspaceStatus: "active",
+        issueId: "issue-child",
+        existingExecutionWorkspaceMode: "isolated_workspace",
+        existingExecutionWorkspaceSourceIssueId: "issue-parent",
+        existingExecutionWorkspaceSourceIssueClosed: true,
+      })).toEqual({
+        requestedExecutionWorkspaceId: "workspace-parent",
+        requestedShouldReuseExisting: true,
+        existingExecutionWorkspaceAvailable: true,
+        conflictingWorkspaceOwnerIssueId: null,
+      });
+    },
+  );
+
+  it("still refuses an open owner's isolated workspace", () => {
+    expect(resolveExecutionWorkspaceReuseRequestForIssue({
+      issueExecutionWorkspaceId: "workspace-parent",
+      issueExecutionWorkspacePreference: "reuse_existing",
+      existingExecutionWorkspaceStatus: "active",
+      issueId: "issue-child",
+      existingExecutionWorkspaceMode: "isolated_workspace",
+      existingExecutionWorkspaceSourceIssueId: "issue-parent",
+      existingExecutionWorkspaceSourceIssueClosed: false,
+    })).toEqual({
+      requestedExecutionWorkspaceId: "workspace-parent",
+      requestedShouldReuseExisting: false,
+      existingExecutionWorkspaceAvailable: false,
+      conflictingWorkspaceOwnerIssueId: "issue-parent",
+    });
+  });
+
   it("drops the inherited branch pin and keeps it as the refused child's base ref", () => {
     const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
       issueExecutionWorkspaceId: "workspace-parent",

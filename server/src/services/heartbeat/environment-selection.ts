@@ -150,6 +150,20 @@ export async function selectHeartbeatEnvironment(db: Db, input: HeartbeatEnviron
       bindingId: persistedNativeExecutionWorkspaceId,
       persistedWorkspaceFound: existingExecutionWorkspace !== null,
     });
+  // A closed owner cannot be running, so an explicit reuse binding to its
+  // isolated workspace is a handoff, not two issues sharing one tree. Only
+  // ask when the owner is another issue; the same-issue and shared-workspace
+  // cases are already allowed without the lookup.
+  const existingWorkspaceOwnerIssueId =
+    existingExecutionWorkspace?.mode === "isolated_workspace"
+      ? readNonEmptyString(existingExecutionWorkspace.sourceIssueId)
+      : null;
+  let existingWorkspaceOwnerIssueClosed = false;
+  if (existingWorkspaceOwnerIssueId && issueId && existingWorkspaceOwnerIssueId !== issueId) {
+    const [ownerIssue] = await db.select({ status: issues.status }).from(issues)
+      .where(and(eq(issues.id, existingWorkspaceOwnerIssueId), eq(issues.companyId, agent.companyId)));
+    existingWorkspaceOwnerIssueClosed = ownerIssue?.status === "done" || ownerIssue?.status === "cancelled";
+  }
   const workspaceReuseRequest =
     resolveExecutionWorkspaceReuseRequestForIssue({
       issueExecutionWorkspaceId: requestedExecutionWorkspaceId,
@@ -162,6 +176,8 @@ export async function selectHeartbeatEnvironment(db: Db, input: HeartbeatEnviron
       existingExecutionWorkspaceMode: existingExecutionWorkspace?.mode ?? null,
       existingExecutionWorkspaceSourceIssueId:
         existingExecutionWorkspace?.sourceIssueId ?? null,
+      existingExecutionWorkspaceSourceIssueClosed:
+        existingWorkspaceOwnerIssueClosed,
       allowForeignIsolatedWorkspaceReuse: Boolean(
         nativeRecoveryExecutionWorkspaceId,
       ),
