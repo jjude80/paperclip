@@ -2,6 +2,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { assertCliTestUserBusIsolated } from "./user-bus-preflight.js";
+
 /**
  * Point the user bus at a directory that has no bus in it, for every CLI test.
  *
@@ -23,6 +25,12 @@ fs.mkdirSync(runtimeDir, { recursive: true, mode: 0o700 });
 
 process.env.XDG_RUNTIME_DIR = runtimeDir;
 process.env.DBUS_SESSION_BUS_ADDRESS = `unix:path=${path.join(runtimeDir, "bus")}`;
+
+// Defence in depth (NEXA-861): set up the fake bus above, then prove it is
+// really unreachable. If this process can still see a live `paperclipai.service`
+// on the operator's bus, the isolation did not take effect and the run must
+// fail closed before any test can reach `systemctl --user stop`.
+assertCliTestUserBusIsolated();
 
 process.once("exit", () => {
   try {
