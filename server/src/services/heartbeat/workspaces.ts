@@ -2246,6 +2246,13 @@ export function resolveExecutionWorkspaceReuseRequestForIssue(input: {
   issueId?: string | null;
   existingExecutionWorkspaceMode?: string | null;
   existingExecutionWorkspaceSourceIssueId?: string | null;
+  /**
+   * The owner of the requested isolated workspace has reached a terminal
+   * state (done/cancelled). A closed owner cannot run concurrently, so the
+   * workspace may be handed to an open child — the restore-point path exists
+   * precisely to bring an expired one back for that handoff.
+   */
+  existingExecutionWorkspaceSourceIssueClosed?: boolean;
   allowForeignIsolatedWorkspaceReuse?: boolean;
 }): ExecutionWorkspaceReuseRequestForIssue {
   const requestedExecutionWorkspaceId = readNonEmptyString(
@@ -2267,6 +2274,7 @@ export function resolveExecutionWorkspaceReuseRequestForIssue(input: {
   const currentIssueId = readNonEmptyString(input.issueId);
   const conflictingWorkspaceOwnerIssueId =
     input.allowForeignIsolatedWorkspaceReuse === true ||
+    input.existingExecutionWorkspaceSourceIssueClosed === true ||
     input.existingExecutionWorkspaceMode !== "isolated_workspace" ||
     workspaceOwnerIssueId === null ||
     currentIssueId === null ||
