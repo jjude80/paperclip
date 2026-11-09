@@ -101,6 +101,37 @@ describe.skipIf(!support.supported)("heartbeat queue database wiring", () => {
     return { company, agent, issue, wake, run };
   }
 
+  // NEXA-864: the queue writes the pending intent; admission is the first
+  // execution boundary. A queued run must not hold the issue's execution lock,
+  // and two concurrent admissions of the same snapshot must stamp it once.
+  it("stamps the issue execution lock at admission, not at enqueue", async () => {
+    const [company] = await db.insert(companies).values({ name: "Queue admission", issuePrefix: "QA" }).returning();
+    const [agent] = await db.insert(agents).values({ companyId: company.id, name: "Admission agent", role: "engineer", status: "idle", adapterType: "process", adapterConfig: {} }).returning();
+    const [issue] = await db.insert(issues).values({ companyId: company.id, title: "Admission task", status: "in_progress", assigneeAgentId: agent.id }).returning();
+    const [wake] = await db.insert(agentWakeupRequests).values({ companyId: company.id, agentId: agent.id, source: "automation", reason: "issue_execution_recovery", status: "queued", payload: { issueId: issue.id } }).returning();
+    const [run] = await db.insert(heartbeatRuns).values({ companyId: company.id, agentId: agent.id, status: "queued", invocationSource: "automation", wakeupRequestId: wake.id, startedAt: null, contextSnapshot: { issueId: issue.id, wakeReason: "issue_execution_recovery" } }).returning();
+    await db.update(agentWakeupRequests).set({ runId: run.id }).where(eq(agentWakeupRequests.id, wake.id));
+
+    expect((await db.select().from(issues).where(eq(issues.id, issue.id)))[0]?.executionRunId).toBeNull();
+
+    const deps = callbacks(db);
+    deps.getAgent.mockResolvedValue(agent);
+    deps.instanceSettings.getExperimental.mockResolvedValue({ enableCases: false } as Awaited<ReturnType<HeartbeatQueueDependencies["instanceSettings"]["getExperimental"]>>);
+    const queue = createHeartbeatQueue(db, deps);
+
+    const claims = await Promise.all([
+      queue.claimQueuedRun({ ...run, responsibleUserId: "queue-test-user" }),
+      queue.claimQueuedRun({ ...run, responsibleUserId: "queue-test-user" }),
+    ]);
+    const admitted = claims.filter((claim) => claim !== null);
+    expect(admitted).toHaveLength(1);
+    expect(admitted[0]).toMatchObject({ id: run.id, status: "running" });
+
+    const [currentIssue] = await db.select().from(issues).where(eq(issues.id, issue.id));
+    expect(currentIssue?.executionRunId).toBe(run.id);
+    expect(currentIssue?.executionLockedAt).not.toBeNull();
+  });
+
   async function strandedMention(runtimeMode = "legacy") {
     const seeded = await fixture("succeeded");
     await db.update(heartbeatRuns).set({ runtimeMode, nativeIssueId: runtimeMode === "native" ? seeded.issue.id : null, finishedAt: new Date() }).where(eq(heartbeatRuns.id, seeded.run.id));

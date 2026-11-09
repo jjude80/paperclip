@@ -121,4 +121,32 @@ describe("enrichPromotedWakeContext", () => {
     expect(result.contextSnapshot.acceptedPlanWakeRouting).toEqual({ targetAgentId: "agent-1" });
     expect(result.contextSnapshot.workspaceRefreshReason).toBe("accepted_plan_confirmation");
   });
+  it("fills the issue scope from a payload-only deferred wake so admission can take the execution lock", () => {
+    // A board Retry stores only the payload. The promoted context would
+    // otherwise have no issueId, and admission would skip the issue lock.
+    const result = enrichPromotedWakeContext({
+      contextSnapshot: { retryOfRunId: "run-1" },
+      reason: "issue_execution_promoted",
+      source: "automation",
+      triggerDetail: null,
+      payload: { issueId: "issue-42" },
+    });
+
+    expect(result.contextSnapshot.issueId).toBe("issue-42");
+    expect(result.contextSnapshot.taskId).toBe("issue-42");
+    expect(result.contextSnapshot.retryOfRunId).toBe("run-1");
+  });
+
+  it("does not overwrite an issue scope the deferred wake already carries", () => {
+    const result = enrichPromotedWakeContext({
+      contextSnapshot: { issueId: "issue-from-context", taskId: "task-from-context" },
+      reason: "issue_execution_promoted",
+      source: "automation",
+      triggerDetail: null,
+      payload: { issueId: "issue-from-payload" },
+    });
+
+    expect(result.contextSnapshot.issueId).toBe("issue-from-context");
+    expect(result.contextSnapshot.taskId).toBe("task-from-context");
+  });
 });

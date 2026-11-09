@@ -961,6 +961,12 @@ export function recoveryService(
     ) => boolean;
     liveRunExecutions?: Readonly<{ has(id: string): boolean }>;
     beforeOrphanedRunTerminalWrite?: (runId: string) => Promise<void>;
+    /**
+     * Bounded release for a run that was stamped as its issue's execution
+     * owner at enqueue but never admitted. Defaults to
+     * `PAPERCLIP_NEVER_ADMITTED_RUN_TIMEOUT_MINUTES` (120 minutes when unset).
+     */
+    neverAdmittedQueuedRunTimeoutMs?: number;
   },
 ) {
   const issuesSvc = issueService(db);
@@ -6297,15 +6303,153 @@ export function recoveryService(
     return { terminalized: true, status: updated.status };
   }
 
+  // A run that is still `queued` with no `startedAt` never crossed the
+  // admission boundary. Before NEXA-864 the queue-side recovery paths stamped
+  // such a run as its issue's `executionRunId` in the same transaction that
+  // inserted the run row. If the dispatcher then never admitted it, the issue
+  // held a lock nothing could release: adoption requires a free lock, and
+  // terminal-lock clearing only looks at terminal runs. New enqueues no longer
+  // take the lock, so this bounded path exists for rows written before that
+  // fix. The deadline is deliberately generous and configurable
+  // (`PAPERCLIP_NEVER_ADMITTED_RUN_TIMEOUT_MINUTES`) so a queue held for a
+  // legitimate reason (temporary budget hold, external connection hold) is not
+  // cancelled by a timer.
+  const NEVER_ADMITTED_QUEUED_RUN_TIMEOUT_DEFAULT_MS = 120 * 60 * 1000;
+  function neverAdmittedQueuedRunTimeoutMs(): number {
+    const configured = deps.neverAdmittedQueuedRunTimeoutMs;
+    if (configured !== undefined && Number.isFinite(configured) && configured > 0) return configured;
+    const raw = process.env.PAPERCLIP_NEVER_ADMITTED_RUN_TIMEOUT_MINUTES?.trim();
+    const minutes = Number(raw);
+    return raw && Number.isFinite(minutes) && minutes > 0
+      ? minutes * 60 * 1000
+      : NEVER_ADMITTED_QUEUED_RUN_TIMEOUT_DEFAULT_MS;
+  }
+
+  // Cancels one never-admitted queued run and clears the issue lock only while
+  // the issue still points at that exact run. Returns the issue id when this
+  // call expired the run, so the sweep can report and log it once.
+  async function expireNeverAdmittedQueuedRun(
+    run: typeof heartbeatRuns.$inferSelect,
+    issueId: string,
+    timeoutMs: number,
+    now: Date,
+  ): Promise<string | null> {
+    if (run.status !== "queued" || run.startedAt) return null;
+    if (deps.liveRunExecutions?.has(run.id)) return null;
+    const deadlineMs = new Date(run.createdAt).getTime() + timeoutMs;
+    if (now.getTime() < deadlineMs) return null;
+
+    return db.transaction(async (tx) => {
+      // Re-read under a row lock: a concurrent admission that already flipped
+      // the run to `running` wins and this expiry must not touch it.
+      const [current] = await tx
+        .select()
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.id, run.id),
+          eq(heartbeatRuns.companyId, run.companyId),
+          eq(heartbeatRuns.status, "queued"),
+          isNull(heartbeatRuns.startedAt),
+        ))
+        .for("update");
+      if (!current || new Date(current.createdAt).getTime() + timeoutMs > now.getTime()) return null;
+
+      // Compare-and-set the issue lock: a newer legitimate owner must survive.
+      const [lockedIssue] = await tx
+        .select({ id: issues.id })
+        .from(issues)
+        .where(and(
+          eq(issues.id, issueId),
+          eq(issues.companyId, run.companyId),
+          eq(issues.executionRunId, run.id),
+        ))
+        .for("update");
+      if (!lockedIssue) return null;
+
+      const error =
+        "Cancelled because the run stayed queued without being admitted before the admission deadline";
+      const [cancelled] = await tx
+        .update(heartbeatRuns)
+        .set({
+          status: "cancelled",
+          finishedAt: now,
+          errorCode: "admission_timeout",
+          error,
+          resultJson: {
+            ...parseObject(current.resultJson),
+            admissionTimeout: {
+              queuedAt: new Date(current.createdAt).toISOString(),
+              deadline: new Date(deadlineMs).toISOString(),
+            },
+          },
+          updatedAt: now,
+        })
+        .where(and(
+          eq(heartbeatRuns.id, current.id),
+          eq(heartbeatRuns.companyId, current.companyId),
+          eq(heartbeatRuns.status, "queued"),
+          isNull(heartbeatRuns.startedAt),
+        ))
+        .returning();
+      if (!cancelled) return null;
+
+      if (current.wakeupRequestId) {
+        await tx
+          .update(agentWakeupRequests)
+          .set({ status: "skipped", finishedAt: now, error, updatedAt: now })
+          .where(and(
+            eq(agentWakeupRequests.id, current.wakeupRequestId),
+            eq(agentWakeupRequests.companyId, current.companyId),
+            eq(agentWakeupRequests.runId, current.id),
+            inArray(agentWakeupRequests.status, ["queued", "claimed"]),
+          ));
+      }
+
+      await tx
+        .update(issues)
+        .set({
+          executionRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
+          updatedAt: now,
+        })
+        .where(and(
+          eq(issues.id, issueId),
+          eq(issues.companyId, run.companyId),
+          eq(issues.executionRunId, run.id),
+        ));
+
+      await appendHeartbeatRunEvent(tx as unknown as Db, {
+        companyId: run.companyId,
+        runId: run.id,
+        agentId: run.agentId,
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: error,
+        payload: {
+          issueId,
+          cause: "admission_timeout",
+          queuedAt: new Date(current.createdAt).toISOString(),
+          deadline: new Date(deadlineMs).toISOString(),
+        },
+      });
+
+      return issueId;
+    });
+  }
+
   // Backstop sweeper: clears stale lock columns on issues whose checkoutRunId
   // or executionRunId points at a heartbeat_runs row that is either missing or
   // in a terminal status. Provides self-heal for stale locks that fell outside
   // releaseIssueExecutionAndPromote / clearCheckoutRunIfTerminal / adoption.
   // Before it evaluates cleanability, it terminalizes any referenced run that
   // still claims to be live but can no longer reach a terminal status on its
-  // own, so a stuck "running" run can no longer block the sweep. Idempotent and
-  // safe: clears at most one row's worth of lock columns per candidate.
-  async function sweepStaleIssueLocks() {
+  // own, so a stuck "running" run can no longer block the sweep. It also
+  // expires a queued run that was never admitted beyond the admission deadline
+  // (see expireNeverAdmittedQueuedRun). Idempotent and safe: clears at most
+  // one row's worth of lock columns per candidate.
+  async function sweepStaleIssueLocks(opts?: { companyId?: string; issueId?: string; onDeferredDeadline?: (at: number) => void }) {
     const result = {
       cleared: 0,
       issueIds: [] as string[],
@@ -6322,7 +6466,9 @@ export function recoveryService(
       })
       .from(issues)
       .where(
-        sql`(${issues.checkoutRunId} is not null or ${issues.executionRunId} is not null)`,
+        and(sql`(${issues.checkoutRunId} is not null or ${issues.executionRunId} is not null)`,
+          opts?.companyId ? eq(issues.companyId, opts.companyId) : undefined,
+          opts?.issueId ? eq(issues.id, opts.issueId) : undefined),
       );
 
     const referencedRunIds = [
@@ -6393,6 +6539,61 @@ export function recoveryService(
       });
       runStatusById.set(row.id, outcome.status);
       if (outcome.terminalized) result.terminalizedRunIds.push(row.id);
+    }
+
+    // Pre-pass: release a queued run that was written as its issue's execution
+    // owner before admission and never admitted. Only `executionRunId` is in
+    // scope: that is the lock the queue-side recovery paths used to stamp at
+    // enqueue. A run still inside its deadline keeps the lock and reschedules
+    // this sweep for the deadline instead of polling.
+    const expiresAtByRunId = new Map<string, number>();
+    const executionOwnerIssuesByRunId = new Map<string, string[]>();
+    for (const issue of candidates) {
+      if (!issue.executionRunId) continue;
+      const runId = issue.executionRunId;
+      executionOwnerIssuesByRunId.set(runId, [...(executionOwnerIssuesByRunId.get(runId) ?? []), issue.id]);
+      const owner = runById.get(runId);
+      if (owner && owner.status === "queued" && !owner.startedAt) {
+        expiresAtByRunId.set(runId, new Date(owner.createdAt).getTime() + neverAdmittedQueuedRunTimeoutMs());
+      }
+    }
+    for (const row of runRows) {
+      const referencingIssueIds = executionOwnerIssuesByRunId.get(row.id) ?? [];
+      if (referencingIssueIds.length === 0 || row.status !== "queued" || row.startedAt) continue;
+      const expiresAt = expiresAtByRunId.get(row.id);
+      if (expiresAt === undefined) continue;
+      const now = new Date();
+      if (now.getTime() < expiresAt) {
+        opts?.onDeferredDeadline?.(expiresAt);
+        continue;
+      }
+      for (const issueId of referencingIssueIds) {
+        const expiredIssueId = await expireNeverAdmittedQueuedRun(row, issueId, neverAdmittedQueuedRunTimeoutMs(), now);
+        if (!expiredIssueId) continue;
+        runStatusById.set(row.id, "cancelled");
+        result.terminalizedRunIds.push(row.id);
+        result.cleared += 1;
+        result.issueIds.push(expiredIssueId);
+        await logActivity(db, {
+          companyId: row.companyId,
+          actorType: "system",
+          actorId: "system",
+          agentId: row.agentId,
+          runId: row.id,
+          action: "issue.never_admitted_run_expired",
+          entityType: "heartbeat_run",
+          entityId: row.id,
+          issueId: expiredIssueId,
+          details: {
+            issueId: expiredIssueId,
+            runId: row.id,
+            cause: "admission_timeout",
+            source: "recovery.sweep_stale_issue_locks",
+            queuedAt: new Date(row.createdAt).toISOString(),
+            deadline: new Date(expiresAt).toISOString(),
+          },
+        });
+      }
     }
 
     const isCleanable = (runId: string | null) => {
