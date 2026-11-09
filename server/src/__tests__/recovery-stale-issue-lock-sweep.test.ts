@@ -1258,4 +1258,166 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       .where(eq(heartbeatRunEvents.runId, runningRunId));
     expect(events).toEqual([]);
   });
+
+  async function seedNeverAdmittedQueuedRun(input: {
+    companyId: string;
+    agentId: string;
+    issueId: string;
+    createdAt: Date;
+  }) {
+    const wakeupRequestId = randomUUID();
+    const runId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: wakeupRequestId,
+      companyId: input.companyId,
+      agentId: input.agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_execution_recovery",
+      status: "queued",
+      requestedByActorType: "system",
+      payload: { issueId: input.issueId },
+      updatedAt: input.createdAt,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: input.companyId,
+      agentId: input.agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "queued",
+      startedAt: null,
+      wakeupRequestId,
+      contextSnapshot: { issueId: input.issueId },
+      createdAt: input.createdAt,
+      updatedAt: input.createdAt,
+    });
+    await db.update(agentWakeupRequests).set({ runId }).where(eq(agentWakeupRequests.id, wakeupRequestId));
+    return { runId, wakeupRequestId };
+  }
+
+  // NEXA-864: a run stamped as its issue's execution owner while still queued
+  // and never admitted must not hold the lock forever.
+  it("expires a queued run that was never admitted past the deadline and clears its execution lock", async () => {
+    const { companyId, agentId } = await seed();
+    const issueId = randomUUID();
+    const createdAt = new Date(Date.now() - 10 * 60_000);
+    const { runId, wakeupRequestId } = await seedNeverAdmittedQueuedRun({ companyId, agentId, issueId, createdAt });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Never-admitted queued recovery run",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      executionRunId: runId,
+      executionLockedAt: createdAt,
+    });
+
+    const result = await recoveryService(db, {
+      enqueueWakeup: vi.fn(),
+      neverAdmittedQueuedRunTimeoutMs: 5 * 60_000,
+    }).sweepStaleIssueLocks({ companyId, issueId });
+
+    expect(result.cleared).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+    expect(result.terminalizedRunIds).toEqual([runId]);
+
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run).toMatchObject({ status: "cancelled", errorCode: "admission_timeout" });
+    expect(run!.resultJson).toMatchObject({ admissionTimeout: { queuedAt: createdAt.toISOString() } });
+
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeupRequestId));
+    expect(wake).toMatchObject({ status: "skipped", runId });
+
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(issue?.executionRunId).toBeNull();
+    expect(issue?.executionLockedAt).toBeNull();
+
+    const [audit] = await db.select().from(activityLog)
+      .where(eq(activityLog.action, "issue.never_admitted_run_expired"));
+    expect(audit?.entityType).toBe("heartbeat_run");
+    expect(audit?.entityId).toBe(runId);
+    expect(audit?.details).toMatchObject({ issueId, runId, cause: "admission_timeout" });
+  });
+
+  it("keeps a never-admitted run inside its deadline and schedules the sweep for that deadline", async () => {
+    const { companyId, agentId } = await seed();
+    const issueId = randomUUID();
+    const createdAt = new Date(Date.now() - 60_000);
+    const { runId } = await seedNeverAdmittedQueuedRun({ companyId, agentId, issueId, createdAt });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Still inside the admission deadline",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      executionRunId: runId,
+    });
+
+    const onDeferredDeadline = vi.fn();
+    const timeoutMs = 5 * 60_000;
+    const result = await recoveryService(db, {
+      enqueueWakeup: vi.fn(),
+      neverAdmittedQueuedRunTimeoutMs: timeoutMs,
+    }).sweepStaleIssueLocks({ companyId, issueId, onDeferredDeadline });
+
+    expect(result.cleared).toBe(0);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run).toMatchObject({ status: "queued", startedAt: null });
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(issue?.executionRunId).toBe(runId);
+    expect(onDeferredDeadline).toHaveBeenCalledWith(createdAt.getTime() + timeoutMs);
+  });
+
+  it("expires only the matching run id and never clears a newer legitimate owner", async () => {
+    const { companyId, agentId } = await seed();
+    const staleIssueId = randomUUID();
+    const liveIssueId = randomUUID();
+    const stale = await seedNeverAdmittedQueuedRun({
+      companyId,
+      agentId,
+      issueId: staleIssueId,
+      createdAt: new Date(Date.now() - 10 * 60_000),
+    });
+    const [newerOwner] = await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "running",
+      startedAt: new Date(),
+    }).returning();
+    await db.insert(issues).values([
+      {
+        id: staleIssueId,
+        companyId,
+        title: "Stale queued owner",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        executionRunId: stale.runId,
+      },
+      {
+        id: liveIssueId,
+        companyId,
+        title: "Newer legitimate owner",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        executionRunId: newerOwner.id,
+      },
+    ]);
+
+    const result = await recoveryService(db, {
+      enqueueWakeup: vi.fn(),
+      neverAdmittedQueuedRunTimeoutMs: 5 * 60_000,
+    }).sweepStaleIssueLocks({ companyId });
+
+    expect(result.issueIds).toEqual([staleIssueId]);
+    const [liveIssue] = await db.select().from(issues).where(eq(issues.id, liveIssueId));
+    expect(liveIssue?.executionRunId).toBe(newerOwner.id);
+    const [newerOwnerRow] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, newerOwner.id));
+    expect(newerOwnerRow).toMatchObject({ status: "running", startedAt: newerOwner.startedAt });
+  });
 });

@@ -533,27 +533,12 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
           ),
         );
 
-      // Promoted mention wakes are issue-scoped, not issue ownership
-      // transfers. The lock-clearing step earlier in this transaction
-      // already set `executionRunId` to null for this issue, so the `is
-      // null` guard only protects against taking the lock twice.
-      await tx
-        .update(issues)
-        .set({
-          executionRunId: newRun.id,
-          executionAgentNameKey: normalizeAgentNameKey(input.deferredAgent.name),
-          executionLockedAt: input.now,
-          updatedAt: input.now,
-        })
-        .where(
-          and(
-            eq(issues.id, input.issue.id),
-            eq(issues.companyId, input.companyId),
-            eq(issues.assigneeAgentId, input.deferredAgent.id),
-            isNull(issues.executionRunId),
-          ),
-        );
-
+      // Do not stamp `executionRunId` here. The lock represents actual
+      // execution, not a queued intent: if this wake is never admitted, a
+      // queued run holding the lock strands the issue (NEXA-864). The pending
+      // intent is already durable in the run row and `agentWakeupRequests.runId`;
+      // the queue claim stamps the issue lock in the same transaction that
+      // flips the run to `running` (`claimQueuedRun`).
       return toRunSummary(newRun);
     },
 
@@ -692,16 +677,9 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
         .set({ runId: queuedRun.id, updatedAt: now })
         .where(and(eq(agentWakeupRequests.id, wakeupRequest.id), eq(agentWakeupRequests.companyId, companyId)));
 
-      await tx
-        .update(issues)
-        .set({
-          executionRunId: queuedRun.id,
-          executionAgentNameKey: normalizeAgentNameKey(recoveryAgent.name),
-          executionLockedAt: now,
-          updatedAt: now,
-        })
-        .where(and(eq(issues.id, issue.id), eq(issues.companyId, companyId)));
-
+      // The issue lock is stamped at admission, not enqueue (NEXA-864). A
+      // review participant may not even be the issue assignee, and a queued
+      // recovery run that is never admitted must not hold `executionRunId`.
       return toRunSummary(queuedRun);
     },
 
@@ -758,16 +736,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
         .set({ runId: queuedRun.id, updatedAt: now })
         .where(and(eq(agentWakeupRequests.id, wakeupRequest.id), eq(agentWakeupRequests.companyId, companyId)));
 
-      await tx
-        .update(issues)
-        .set({
-          executionRunId: queuedRun.id,
-          executionAgentNameKey: normalizeAgentNameKey(recoveryAgent.name),
-          executionLockedAt: now,
-          updatedAt: now,
-        })
-        .where(and(eq(issues.id, issue.id), eq(issues.companyId, companyId)));
-
+      // Enqueue does not take the issue lock; admission does (NEXA-864).
       return toRunSummary(queuedRun);
     },
   };
