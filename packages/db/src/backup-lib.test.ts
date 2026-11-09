@@ -620,6 +620,135 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
   );
 
   it(
+    "restores a JavaScript backup as a non-superuser application role",
+    async () => {
+      // Regression for NEXA-873: a least-privileged embedded cluster gives the
+      // `paperclip` role no SUPERUSER, so a reseed that restored with
+      // `SET LOCAL session_replication_role = replica` died before inserting a
+      // single row. The JavaScript backup no longer needs that GUC, and data is
+      // emitted before foreign keys and triggers so restore order is safe.
+      const sourceConnectionString = await createTempDatabase();
+      const sourceSql = postgres(sourceConnectionString, { max: 1, onnotice: () => {} });
+      const adminSql = postgres(sourceConnectionString, { max: 1, onnotice: () => {} });
+      const backupDir = createTempDir("paperclip-db-nonsuperuser-backup-");
+      const originalPgDumpPath = process.env.PAPERCLIP_PG_DUMP_PATH;
+      const originalPsqlPath = process.env.PAPERCLIP_PSQL_PATH;
+      process.env.PAPERCLIP_PG_DUMP_PATH = "/bin/false";
+      process.env.PAPERCLIP_PSQL_PATH = "/bin/false";
+      const databaseName = "paperclip_nonsuperuser_restore_target";
+      const roleName = "paperclip_restore_limited";
+      const rolePassword = "restore-limited-password";
+      let restoreSql: ReturnType<typeof postgres> | null = null;
+
+      try {
+        await sourceSql.unsafe(`
+          CREATE TABLE "public"."zzz_nonsuperuser_parent" (
+            "id" uuid PRIMARY KEY,
+            "name" text NOT NULL
+          );
+          CREATE TABLE "public"."aaa_nonsuperuser_child" (
+            "id" uuid PRIMARY KEY,
+            "parent_id" uuid NOT NULL REFERENCES "public"."zzz_nonsuperuser_parent"("id") ON DELETE CASCADE,
+            "note" text NOT NULL
+          );
+          CREATE FUNCTION "public"."reject_nonsuperuser_restore_writes"() RETURNS trigger
+          LANGUAGE plpgsql AS $$
+          BEGIN
+            RAISE EXCEPTION 'restored writes are rejected';
+          END;
+          $$;
+          INSERT INTO "public"."zzz_nonsuperuser_parent" ("id", "name")
+          VALUES ('11111111-1111-4111-8111-111111111111', 'parent');
+          INSERT INTO "public"."aaa_nonsuperuser_child" ("id", "parent_id", "note")
+          VALUES (
+            '22222222-2222-4222-8222-222222222222',
+            '11111111-1111-4111-8111-111111111111',
+            'child emitted before parent'
+          );
+          CREATE TRIGGER "reject_nonsuperuser_restore_writes"
+            BEFORE INSERT ON "public"."zzz_nonsuperuser_parent"
+            FOR EACH ROW EXECUTE FUNCTION "public"."reject_nonsuperuser_restore_writes"();
+        `);
+
+        const result = await runDatabaseBackup({
+          connectionString: sourceConnectionString,
+          backupDir,
+          retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+          filenamePrefix: "paperclip-nonsuperuser-test",
+          backupEngine: "auto",
+        });
+
+        const backupSql = gunzipSync(await fs.promises.readFile(result.backupFile)).toString("utf8");
+        expect(backupSql).not.toContain("session_replication_role");
+        const childData = backupSql.indexOf("-- Data for: public.aaa_nonsuperuser_child");
+        expect(childData).toBeGreaterThan(-1);
+        expect(childData).toBeLessThan(backupSql.indexOf("-- Foreign keys"));
+        expect(childData).toBeLessThan(backupSql.indexOf("-- Triggers"));
+
+        await adminSql.unsafe(`CREATE ROLE "${roleName}" LOGIN PASSWORD '${rolePassword}' NOSUPERUSER NOCREATEDB NOCREATEROLE;`);
+        await adminSql.unsafe(`CREATE DATABASE "${databaseName}" OWNER "${roleName}";`);
+        const targetUrl = new URL(sourceConnectionString);
+        targetUrl.pathname = `/${databaseName}`;
+        targetUrl.username = roleName;
+        targetUrl.password = rolePassword;
+        restoreSql = postgres(targetUrl.toString(), { max: 1, onnotice: () => {} });
+
+        // Prove the restore role really cannot use the GUC the old writer
+        // emitted, so a pass cannot be an accident of a privileged role.
+        await expect(restoreSql.unsafe("SET session_replication_role = replica"))
+          .rejects.toThrow(/permission denied/i);
+
+        await runDatabaseRestore({
+          connectionString: targetUrl.toString(),
+          backupFile: result.backupFile,
+        });
+
+        const rows = await restoreSql.unsafe<{ note: string; name: string }[]>(`
+          SELECT child."note", parent."name"
+          FROM "public"."aaa_nonsuperuser_child" child
+          JOIN "public"."zzz_nonsuperuser_parent" parent ON parent."id" = child."parent_id"
+        `);
+        expect(rows).toEqual([{ note: "child emitted before parent", name: "parent" }]);
+
+        const constraints = await restoreSql.unsafe<{ count: number }[]>(`
+          SELECT count(*)::int AS count
+          FROM pg_constraint
+          WHERE contype = 'f' AND conrelid = 'public.aaa_nonsuperuser_child'::regclass
+        `);
+        expect(constraints[0]?.count).toBe(1);
+
+        const triggers = await restoreSql.unsafe<{ count: number }[]>(`
+          SELECT count(*)::int AS count
+          FROM pg_trigger
+          WHERE NOT tgisinternal AND tgrelid = 'public.zzz_nonsuperuser_parent'::regclass
+        `);
+        expect(triggers[0]?.count).toBe(1);
+
+        // The trigger is present but did not fire while the data was restored.
+        await expect(restoreSql.unsafe(`
+          INSERT INTO "public"."zzz_nonsuperuser_parent" ("id", "name")
+          VALUES ('33333333-3333-4333-8333-333333333333', 'later write')
+        `)).rejects.toThrow(/restored writes are rejected/);
+      } finally {
+        if (originalPgDumpPath === undefined) {
+          delete process.env.PAPERCLIP_PG_DUMP_PATH;
+        } else {
+          process.env.PAPERCLIP_PG_DUMP_PATH = originalPgDumpPath;
+        }
+        if (originalPsqlPath === undefined) {
+          delete process.env.PAPERCLIP_PSQL_PATH;
+        } else {
+          process.env.PAPERCLIP_PSQL_PATH = originalPsqlPath;
+        }
+        await restoreSql?.end();
+        await sourceSql.end();
+        await adminSql.end();
+      }
+    },
+    60_000,
+  );
+
+  it(
     "restores legacy public-only backups without migration history",
     async () => {
       const restoreConnectionString = await createTempDatabase();

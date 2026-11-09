@@ -602,7 +602,14 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     emit(`-- Created: ${new Date().toISOString()}`);
     emit("");
     emitStatement("BEGIN;");
-    emitStatement("SET LOCAL session_replication_role = replica;");
+    // Deliberately no `SET LOCAL session_replication_role = replica`. That
+    // parameter is superuser-only (PGC_SUSET), and the application role
+    // `paperclip` on a least-privileged embedded cluster is not a superuser.
+    // A worktree reseed therefore died on this statement before restoring a
+    // single row (NEXA-873). Replica mode only existed to keep triggers and
+    // foreign keys from rejecting data emitted in table-name order; this
+    // writer now emits both of those after the data section instead, which
+    // gives the same restore semantics without needing elevated privileges.
     emitStatement("SET LOCAL client_min_messages = warning;");
     emitStatement("SET LOCAL check_function_bodies = false;");
     emit("");
@@ -941,17 +948,11 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
       emit("");
     }
 
-    if (fks.length > 0) {
-      emit("-- Foreign keys");
-      for (const fk of fks) {
-        const srcCols = fk.source_columns.map((c) => `"${c}"`).join(", ");
-        const tgtCols = fk.target_columns.map((c) => `"${c}"`).join(", ");
-        emitStatement(
-          `ALTER TABLE ${quoteQualifiedName(fk.source_schema, fk.source_table)} ADD CONSTRAINT "${fk.constraint_name}" FOREIGN KEY (${srcCols}) REFERENCES ${quoteQualifiedName(fk.target_schema, fk.target_table)} (${tgtCols}) ON UPDATE ${fk.update_rule} ON DELETE ${fk.delete_rule};`,
-        );
-      }
-      emit("");
-    }
+    // Foreign keys are emitted after the data section (see note below the data
+    // loop): adding them up front would reject rows whose parent table is
+    // dumped later, because data is emitted in table-name order, not dependency
+    // order. They stay after the standalone indexes because PostgreSQL allows a
+    // non-constraint unique index to be the target of a foreign key.
 
     // Dump data for each table
     for (const { schema_name, tablename } of tables) {
@@ -1009,6 +1010,26 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
       emit("");
     }
 
+    // Every row is present now, so foreign keys can be added without either
+    // side being missing. Doing this here (rather than before the data, with
+    // constraint triggers disabled through a superuser-only GUC) is what lets
+    // a least-privileged application role restore its own backup (NEXA-873).
+    if (fks.length > 0) {
+      emit("-- Foreign keys");
+      for (const fk of fks) {
+        const srcCols = fk.source_columns.map((c) => `"${c}"`).join(", ");
+        const tgtCols = fk.target_columns.map((c) => `"${c}"`).join(", ");
+        emitStatement(
+          `ALTER TABLE ${quoteQualifiedName(fk.source_schema, fk.source_table)} ADD CONSTRAINT "${fk.constraint_name}" FOREIGN KEY (${srcCols}) REFERENCES ${quoteQualifiedName(fk.target_schema, fk.target_table)} (${tgtCols}) ON UPDATE ${fk.update_rule} ON DELETE ${fk.delete_rule};`,
+        );
+      }
+      emit("");
+    }
+
+    // Triggers are created after the data for the same reason replica mode was
+    // used before: restoring rows must not fire application triggers. The
+    // trigger definitions are still part of the backup, so a restored database
+    // behaves identically for every later write.
     const allTriggers = await sql<{
       schema_name: string;
       tablename: string;
