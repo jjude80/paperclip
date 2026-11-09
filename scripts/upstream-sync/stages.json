@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "awaitingStagePlan": true,
+  "_notice": "NEXA-880 owns the chronological stage boundaries and per-stage verification commands. Until that plan lands this file deliberately defines no stages, and the replay exits 5 instead of guessing. See stages.provisional.json for a runnable daily-slice example.",
+  "branch": "sync/upstream-2026-11-09",
+  "forkRemote": "origin",
+  "upstreamRemote": "upstream",
+  "forkBranch": "master",
+  "upstreamBranch": "master",
+  "stateDir": ".upstream-sync",
+  "stages": []
+}

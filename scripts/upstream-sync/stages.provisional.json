@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "_notice": "PROVISIONAL ONLY. NEXA-880 owns the final boundaries, and NEXA-882..886 add the per-stage build/typecheck/targeted-test commands. These daily slices exist so the replay tooling can be exercised end to end; the structural gate alone is not sufficient evidence to land a stage.",
+  "branch": "sync/upstream-2026-11-09",
+  "forkRemote": "origin",
+  "upstreamRemote": "upstream",
+  "forkBranch": "master",
+  "upstreamBranch": "master",
+  "stateDir": ".upstream-sync",
+  "stages": [
+    { "id": "s01-2026-10-23", "upstream": "2026-10-23", "verify": ["node scripts/upstream-sync/verify-merged-tree.mjs"] },
+    { "id": "s02-2026-10-24", "upstream": "2026-10-24", "verify": ["node scripts/upstream-sync/verify-merged-tree.mjs"] },
+    { "id": "s03-2026-10-25", "upstream": "2026-10-25", "verify": ["node scripts/upstream-sync/verify-merged-tree.mjs"] },
+    { "id": "s04-2026-10-26", "upstream": "2026-10-26", "verify": ["node scripts/upstream-sync/verify-merged-tree.mjs"] },
+    { "id": "s05-2026-10-27", "upstream": "2026-10-27", "verify": ["node scripts/upstream-sync/verify-merged-tree.mjs"] },
+    { "id": "s06-2026-10-28", "upstream": "2026-10-28", "verify": ["node scripts/upstream-sync/verify-merged-tree.mjs"] },
+    { "id": "s07-2026-10-29", "upstream": "2026-10-29", "verify": ["node scripts/upstream-sync/verify-merged-tree.mjs"] },
+    { "id": "s08-2026-10-30", "upstream": "2026-10-30", "verify": ["node scripts/upstream-sync/verify-merged-tree.mjs"] },
+    { "id": "s09-2026-10-31", "upstream": "2026-10-31", "verify": ["node scripts/upstream-sync/verify-merged-tree.mjs"] },
+    { "id": "s10-2026-11-01", "upstream": "2026-11-01", "verify": ["node scripts/upstream-sync/verify-merged-tree.mjs"] },
+    { "id": "s11-2026-11-02", "upstream": "2026-11-02", "verify": ["node scripts/upstream-sync/verify-merged-tree.mjs"] },
+    { "id": "s12-2026-11-03", "upstream": "2026-11-03", "verify": ["node scripts/upstream-sync/verify-merged-tree.mjs"] },
+    { "id": "s13-2026-11-04", "upstream": "2026-11-04", "verify": ["node scripts/upstream-sync/verify-merged-tree.mjs"] },
+    { "id": "s14-2026-11-05", "upstream": "2026-11-05", "verify": ["node scripts/upstream-sync/verify-merged-tree.mjs"] },
+    { "id": "s15-2026-11-06", "upstream": "2026-11-06", "verify": ["node scripts/upstream-sync/verify-merged-tree.mjs"] },
+    { "id": "s16-2026-11-07", "upstream": "2026-11-07", "verify": ["node scripts/upstream-sync/verify-merged-tree.mjs"] },
+    { "id": "s17-2026-11-08", "upstream": "2026-11-08", "verify": ["node scripts/upstream-sync/verify-merged-tree.mjs"] },
+    { "id": "s18-2026-11-09", "upstream": "2026-11-09", "verify": ["node scripts/upstream-sync/verify-merged-tree.mjs"] }
+  ]
+}
