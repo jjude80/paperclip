@@ -126,6 +126,111 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
     expect(await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.companyId),
       eq(heartbeatRuns.status, "queued")))).toHaveLength(0);
   });
+  it.each(["accepted", "agent_resolved", "pending", "foreign_run", "no_wake_policy"])(
+    "starts the run an accepted human confirmation authorises after its creating run lost its lease (%s)", async gate => {
+      const f = await seed();
+      await db.update(agents).set({ adapterType: "opencode_local" }).where(eq(agents.id, f.agentId));
+      await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.sourceRunId));
+      const finishedAt = new Date("2026-09-11T10:00:00Z");
+      await db.update(heartbeatRuns).set({
+        runtimeMode: "legacy", nativeIssueId: null, nativeSessionId: null, issueId: f.issueId,
+        status: "cancelled", errorCode: "cancelled",
+        contextSnapshot: { issueId: f.issueId },
+        resultJson: { executionCancellation: { state: "acknowledged" } },
+        finishedAt,
+      }).where(eq(heartbeatRuns.id, f.sourceRunId));
+      await db.update(issues).set({ status: "in_review" }).where(eq(issues.id, f.issueId));
+      await db.update(issueRecoveryActions).set({
+        cause: "legacy_execution_requires_reconciliation", status: "resolved", outcome: "blocked",
+        returnOwnerAgentId: f.agentId,
+        evidence: { runId: f.sourceRunId, automaticRecovery: { replay: "blocked", actionOutcome: "unknown" } },
+      }).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+      const interactionSourceRunId = gate === "foreign_run" ? randomUUID() : f.sourceRunId;
+      if (gate === "foreign_run") await db.insert(heartbeatRuns).values({
+        id: interactionSourceRunId, companyId: f.companyId, agentId: f.agentId,
+        status: "succeeded", runtimeMode: "legacy", issueId: f.issueId,
+        contextSnapshot: { issueId: f.issueId }, finishedAt: new Date("2026-09-11T10:30:00Z"),
+      });
+      const [interaction] = await db.insert(issueThreadInteractions).values({
+        companyId: f.companyId, issueId: f.issueId, sourceRunId: interactionSourceRunId,
+        createdByAgentId: f.agentId, kind: "request_confirmation",
+        status: gate === "pending" ? "pending" : "accepted",
+        continuationPolicy: gate === "no_wake_policy" ? "none" : "wake_assignee",
+        resolvedByUserId: gate === "agent_resolved" ? null : f.actorId,
+        resolvedByAgentId: gate === "agent_resolved" ? f.agentId : null,
+        resolvedAt: gate === "pending" ? null : new Date("2026-09-11T11:00:00Z"),
+        payload: { version: 1, prompt: "Restart the board?" },
+      }).returning();
+      const result = await db.transaction(async tx => {
+        await tx.select().from(issues).where(eq(issues.id, f.issueId)).for("update");
+        return admitExplicitNativeContinuation({ ...f, db: tx as unknown as typeof db,
+          reason: "issue_commented", commentId: null, interactionId: interaction.id });
+      });
+      if (gate !== "accepted") {
+        expect(result).toBeNull();
+        expect(await getExecutionBlocker(db, f.companyId, f.issueId)).not.toBeNull();
+        return;
+      }
+      expect(result).toEqual({ previousRunId: f.sourceRunId, commentId: null, interactionId: interaction.id });
+      expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+      const [action] = await db.select().from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+      expect(action.evidence.explicitUserContinuation).toMatchObject({
+        interactionId: interaction.id, previousRunId: f.sourceRunId,
+      });
+    },
+  );
+  it("queues an accepted confirmation's wake instead of deferring it behind the legacy hold", async () => {
+    const f = await seed();
+    await db.update(agents).set({ adapterType: "opencode_local" }).where(eq(agents.id, f.agentId));
+    await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.sourceRunId));
+    await db.update(heartbeatRuns).set({
+      runtimeMode: "legacy", nativeIssueId: null, nativeSessionId: null, issueId: f.issueId,
+      status: "cancelled", errorCode: "cancelled",
+      contextSnapshot: { issueId: f.issueId },
+      resultJson: { executionCancellation: { state: "acknowledged" } },
+      finishedAt: new Date("2026-09-11T10:00:00Z"),
+    }).where(eq(heartbeatRuns.id, f.sourceRunId));
+    await db.update(issues).set({ status: "in_review" }).where(eq(issues.id, f.issueId));
+    await db.update(issueRecoveryActions).set({
+      cause: "legacy_execution_requires_reconciliation", status: "resolved", outcome: "blocked",
+      returnOwnerAgentId: f.agentId,
+      evidence: { runId: f.sourceRunId, automaticRecovery: { replay: "blocked", actionOutcome: "unknown" } },
+    }).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+    const [interaction] = await db.insert(issueThreadInteractions).values({
+      companyId: f.companyId, issueId: f.issueId, sourceRunId: f.sourceRunId,
+      createdByAgentId: f.agentId, kind: "request_confirmation", status: "accepted",
+      continuationPolicy: "wake_assignee", resolvedByUserId: f.actorId,
+      resolvedAt: new Date("2026-09-11T11:00:00Z"), payload: { version: 1, prompt: "Restart the board?" },
+    }).returning();
+    // Keep the admitted successor queued so this test never starts a provider.
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running" });
+    const run = await heartbeatService(db).wakeup(f.agentId, {
+      source: "automation", triggerDetail: "system", reason: "issue_commented",
+      requestedByActorType: "user", requestedByActorId: f.actorId,
+      payload: { issueId: f.issueId, interactionId: interaction.id,
+        interactionKind: interaction.kind, interactionStatus: interaction.status, mutation: "interaction" },
+      contextSnapshot: { issueId: f.issueId, taskId: f.issueId, interactionId: interaction.id,
+        interactionKind: interaction.kind, interactionStatus: interaction.status,
+        wakeReason: "issue_commented", source: "issue.interaction" },
+    });
+    expect(run).toMatchObject({ status: "queued", retryOfRunId: null });
+    expect(run?.contextSnapshot).toMatchObject({
+      forceFreshSession: true,
+      explicitUserContinuation: { interactionId: interaction.id, previousRunId: f.sourceRunId },
+    });
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+    // Dispatch must accept the interaction receipt, not a comment id.
+    await expect(buildExecutionContinuation({ db, companyId: f.companyId, issueId: f.issueId,
+      agentId: f.agentId, runId: run!.id, context: run!.contextSnapshot!,
+      summary: null, exposeLowTrustRaw: false })).resolves.toMatchObject({ interruptedRunId: f.sourceRunId });
+    const deferred = await db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, f.companyId),
+      eq(agentWakeupRequests.status, "deferred_issue_execution"),
+    ));
+    expect(deferred).toHaveLength(0);
+  }, 30_000);
+
   it("automatically admits a saved historical local message once after isolated fallback becomes eligible", async () => {
     const f = await seed();
     const processStartedAt = new Date();

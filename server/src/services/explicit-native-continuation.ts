@@ -42,6 +42,50 @@ function processStopped(pid: number): boolean {
   catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH"; }
 }
 
+type InteractionContinuationAuthorization = {
+  interactionId: string;
+  authorizedAt: Date;
+  sourceRunId: string | null;
+};
+
+/**
+ * Reads the board-authorised decision a resolved interaction wake carries.
+ *
+ * An accepted restart/approval card is a human instruction to continue the
+ * task, exactly like a comment. It has no comment id, so the comment gate in
+ * `admitExplicitNativeContinuation` cannot see it. This helper turns the
+ * resolved interaction into the same authorization evidence: a human resolver,
+ * a continuation policy that promises a wake, and the decision time that must
+ * post-date the stopped run. Agent/system resolutions keep their own paths.
+ */
+async function readInteractionContinuationAuthorization(input: {
+  db: Db;
+  companyId: string;
+  issueId: string;
+  interactionId: string;
+  actorId: string;
+  reason: string | null;
+}): Promise<InteractionContinuationAuthorization | null> {
+  if (!isUserCommentContinuationReason(input.reason)) return null;
+  if (!z.string().guid().safeParse(input.interactionId).success) return null;
+  const [interaction] = await input.db.select().from(issueThreadInteractions).where(and(
+    eq(issueThreadInteractions.companyId, input.companyId),
+    eq(issueThreadInteractions.issueId, input.issueId),
+    eq(issueThreadInteractions.id, input.interactionId),
+  ));
+  if (!interaction || interaction.resolvedByAgentId !== null ||
+      interaction.resolvedByUserId !== input.actorId) return null;
+  const policyAllowsWake =
+    interaction.continuationPolicy === "wake_assignee" ||
+    (interaction.continuationPolicy === "wake_assignee_on_accept" && interaction.status === "accepted");
+  if (!policyAllowsWake || !["accepted", "answered"].includes(interaction.status)) return null;
+  return {
+    interactionId: interaction.id,
+    authorizedAt: interaction.resolvedAt ?? interaction.updatedAt,
+    sourceRunId: interaction.sourceRunId,
+  };
+}
+
 /** Validate the whole saved queue, preserving order and original authors.
  * Call again under the task lock before adopting IDs into a new run.
  */
@@ -93,16 +137,27 @@ export async function admitExplicitNativeContinuation(input: {
   queuedCommentInterruptId?: string;
   /** Internal delivery of an unconsumed, user-authored saved queue entry. */
   queuedCommentRequestId?: string;
+  /** A resolved board-authorised interaction whose continuation wake started this turn. */
+  interactionId?: string | null;
   durableChatRequest?: DurableChatWakeupRequest;
   dryRun?: boolean;
   onBlocked?: (reason: string, message: string) => void;
-}): Promise<{ previousRunId: string; commentId: string | null; failedRunId?: string; taskRetryRequestId?: string; readiness?: ContinuationReadiness } | null> {
+}): Promise<{ previousRunId: string; commentId: string | null; interactionId?: string; failedRunId?: string; taskRetryRequestId?: string; readiness?: ContinuationReadiness } | null> {
   const { db, companyId, issueId, agentId, actorId, commentId } = input;
   const blocked = (reason: string, message: string) => { input.onBlocked?.(reason, message); return null; };
   if (input.actorType !== "user" || !actorId) return null;
   const retry = input.reason === "retry_failed_run" &&
     z.string().guid().safeParse(input.failedRunId).success;
-  if (!retry && !input.taskRetryRequestId && !input.queuedCommentInterruptId && (!commentId || !z.string().guid().safeParse(commentId).success ||
+  const interactionAuthorization = input.interactionId
+    ? await readInteractionContinuationAuthorization({
+        db, companyId, issueId,
+        interactionId: input.interactionId,
+        actorId,
+        reason: input.reason,
+      })
+    : null;
+  if (!retry && !input.taskRetryRequestId && !input.queuedCommentInterruptId && !interactionAuthorization &&
+      (!commentId || !z.string().guid().safeParse(commentId).success ||
       !isUserCommentContinuationReason(input.reason))) return null;
   const [task] = await db.select().from(issues).where(and(
     eq(issues.companyId, companyId), eq(issues.id, issueId),
@@ -162,14 +217,15 @@ export async function admitExplicitNativeContinuation(input: {
     if (undelivered.at(-1) !== commentId) return null;
     partiallyDeliveredQueue = undelivered.length !== ids.length;
   }
-  const [comment] = retry || taskRetry || response ? [] : await db.select().from(issueComments).where(and(
+  const [comment] = retry || taskRetry || response || interactionAuthorization ? [] : await db.select().from(issueComments).where(and(
     eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
     eq(issueComments.id, commentId!), eq(issueComments.authorType, "user"),
     queuedInterrupt ? undefined : eq(issueComments.authorUserId, actorId), isNull(issueComments.createdByRunId),
     isNull(issueComments.deletedAt),
   ));
-  if (!retry && !taskRetry && !response && !comment?.body.trim()) return null;
-  const authorizedAt = response?.comment.createdAt ?? comment?.createdAt ?? retryWake?.requestedAt ?? new Date();
+  if (!retry && !taskRetry && !response && !interactionAuthorization && !comment?.body.trim()) return null;
+  const authorizedAt = interactionAuthorization?.authorizedAt
+    ?? response?.comment.createdAt ?? comment?.createdAt ?? retryWake?.requestedAt ?? new Date();
   const [agent] = await db.select().from(agents).where(and(eq(agents.companyId, companyId), eq(agents.id, agentId)));
   if (!agent || (!isConversationAdapter(agent.adapterType) && agent.adapterType !== "paperclip_runner")) return null;
   if (queuedInterrupt && !isConversationAdapter(agent.adapterType) && !response?.source.requiresFreshSession) return null;
@@ -183,6 +239,13 @@ export async function admitExplicitNativeContinuation(input: {
     )),
   )).for("update");
   if (!actions.length) return null;
+  // Scope an interaction decision to the stopped run that produced its card.
+  // A newer card for the same (still live) task cannot retire an older hold.
+  if (interactionAuthorization?.sourceRunId &&
+      !actions.some(action =>
+        (action.evidence.runId ?? action.evidence.sourceRunId) === interactionAuthorization.sourceRunId)) {
+    return null;
+  }
   const blocker = await getExecutionBlocker(db, companyId, issueId);
   if (blocker && blocker.recoveryActionId === null) return null;
   const [pendingInteraction] = await db.select({ id: issueThreadInteractions.id }).from(issueThreadInteractions).where(and(
@@ -232,11 +295,18 @@ export async function admitExplicitNativeContinuation(input: {
       action.cause === "legacy_execution_requires_reconciliation" &&
       (isConversationAdapter(agent.adapterType) ||
         (agent.adapterType === "paperclip_runner" && (freshIntent || await hasVerifiedWorkspaceRepair(db, run))));
+    // An accepted board-authorised interaction is a new human instruction even
+    // when the recovery action's cause is not the legacy-continuation label.
+    // It still only starts a fresh turn on an adapter that can hold a
+    // conversation; process and lease termination proofs below still apply.
+    const interactionUserTurn = Boolean(interactionAuthorization) &&
+      (run.runtimeMode === "native" || isConversationAdapter(agent.adapterType) ||
+        (agent.adapterType === "paperclip_runner" && (freshIntent || await hasVerifiedWorkspaceRepair(db, run))));
     // Saved input is a request for a new turn, never permission to undo an
     // operator Stop or redeliver a message already consumed by this run.
     if (queuedRequest && !queuedInterrupt && (run.contextSnapshot?.wakeCommentId === commentId ||
         (Array.isArray(run.contextSnapshot?.wakeCommentIds) && run.contextSnapshot.wakeCommentIds.includes(commentId)))) return null;
-    if (legacyUserTurn) {
+    if (legacyUserTurn || (interactionUserTurn && run.runtimeMode !== "native")) {
       const historicalAdapter = await historicalAdapterType(db, run);
       // A settings change never converts a known process/webhook execution into
       // a conversation. Those adapters retain their reconciliation contract.
@@ -291,7 +361,7 @@ export async function admitExplicitNativeContinuation(input: {
     if (retry && run.status === "cancelled" && !canContinueCancelledRun(run) && !cancelledStartup)
       return blocked("cancelled_by_operator", "Inspect the stopped run and send a new message to continue.");
     if (cancelledStartup) cancelledStartupIds.add(run.id);
-    if (run.runtimeMode !== "native" && !unusedAdmission && !legacyUserTurn && !cancelledStartup) return null;
+    if (run.runtimeMode !== "native" && !unusedAdmission && !legacyUserTurn && !interactionUserTurn && !cancelledStartup) return null;
     // A provider failure can finish the normal result/assessment commit path.
     // Its accepted failed result is immutable history, not a live controller.
     // Only a new user turn may pass this gate; the process/lease stop proofs
@@ -372,9 +442,12 @@ export async function admitExplicitNativeContinuation(input: {
   const previous = executedSources.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())[0]!;
   // Prove required task history is available before retiring any hold.
   await buildExecutionContinuation({ db, companyId, issueId, agentId,
-    context: { previousRunId: previous.id, wakeCommentId: commentId },
+    context: { previousRunId: previous.id, wakeCommentId: commentId,
+      ...(interactionAuthorization ? { interactionId: interactionAuthorization.interactionId } : {}) },
     summary: null, exposeLowTrustRaw: false });
-  const continuation = { previousRunId: previous.id, commentId, ...(retry ? { failedRunId: input.failedRunId! } : {}),
+  const continuation = { previousRunId: previous.id, commentId,
+    ...(interactionAuthorization ? { interactionId: interactionAuthorization.interactionId } : {}),
+    ...(retry ? { failedRunId: input.failedRunId! } : {}),
     ...(taskRetry ? { taskRetryRequestId: input.taskRetryRequestId! } : {}), ...(readiness ? { readiness } : {}) };
   if (input.dryRun) return continuation;
   for (const stopped of stoppedSessions) {
@@ -386,7 +459,10 @@ export async function admitExplicitNativeContinuation(input: {
       payload: stopped.evidence,
     });
   }
-  const authorization = { ...continuation, actorId, commentId, ...(response ? { interactionId: response.source.interactionId } : {}), ...(retry ? { failedRunId: input.failedRunId } : {}),
+  const authorization = { ...continuation, actorId, commentId,
+    ...(response ? { interactionId: response.source.interactionId }
+      : interactionAuthorization ? { interactionId: interactionAuthorization.interactionId } : {}),
+    ...(retry ? { failedRunId: input.failedRunId } : {}),
     ...(comment ? { commentUpdatedAt: comment.updatedAt.toISOString(),
       commentBodyHash: createHash("sha256").update(comment.body).digest("hex") } : {}),
     ...(queuedInterrupt ? { queuedCommentInterruptId: input.queuedCommentInterruptId } : {}),
@@ -428,7 +504,8 @@ export async function admitExplicitNativeContinuation(input: {
   }
   await persistActivity(db, { companyId, actorType: "user", actorId,
     action: "issue.execution_recovery_settled", entityType: "issue", entityId: issueId,
-    details: { continuation: retry ? "explicit_user_retry" : "explicit_user_message", ...authorization,
+    details: { continuation: interactionAuthorization ? "accepted_interaction"
+      : retry ? "explicit_user_retry" : "explicit_user_message", ...authorization,
       recoveryActionIds: actions.map(action => action.id), previousRunIds: sources.map(run => run.id) },
   });
   if (readiness) await persistActivity(db, { companyId, actorType: "system", actorId: "task-recovery",

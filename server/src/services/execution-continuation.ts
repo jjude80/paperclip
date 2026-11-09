@@ -421,6 +421,19 @@ export async function buildExecutionContinuation(input: {
         sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
         input.runId ? eq(agentWakeupRequests.runId, input.runId) : undefined,
       )) : [];
+    // An accepted board-authorised interaction has no comment to bind. Prove
+    // the exact resolved human decision instead: the same interaction, a human
+    // resolver, and a continuation policy that authorised the wake.
+    const interactionAuthorization = (value: Record<string, unknown>) => {
+      const id = string(value.interactionId);
+      if (!id) return false;
+      const interaction = interactions.find(row => row.id === id);
+      return Boolean(interaction &&
+        ["accepted", "answered"].includes(interaction.status) &&
+        interaction.resolvedByAgentId === null &&
+        interaction.resolvedByUserId === value.actorId &&
+        (interaction.sourceRunId === null || interaction.sourceRunId === value.previousRunId));
+    };
     const authorization = continuationAuthorizations.find(value => taskRetryId
           ? value.taskRetryRequestId === taskRetryId && taskRetryWake?.runId === value.runId &&
             taskRetryWake.requestedByActorId === value.actorId &&
@@ -429,6 +442,8 @@ export async function buildExecutionContinuation(input: {
           ? value.failedRunId === failedRunId && retryWakes.some(wake =>
               wake.runId === value.runId && wake.requestedByActorId === value.actorId &&
               priorRuns.some(run => run.id === wake.runId && run.retryOfRunId === failedRunId))
+          : value.interactionId
+          ? interactionAuthorization(value)
           : rows.some(comment => comment.id === value.commentId &&
               comment.authorType === "user" &&
               (!("commentUpdatedAt" in value || "commentBodyHash" in value || value.automaticRetry) || (
