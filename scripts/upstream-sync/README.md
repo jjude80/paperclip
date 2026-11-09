@@ -14,6 +14,7 @@ This directory contains the replay machinery:
 | `verify-merged-tree.mjs` | dependency-free structural gate: conflict markers, duplicate migration numbers, journal/file agreement, manifest parsing, lockfile shape |
 | `stages.json` | the real stage plan owned by NEXA-880; intentionally empty until that plan lands |
 | `stages.provisional.json` | daily-slice example used to exercise the tooling; not approval to land a stage |
+| `resolve-server-conflicts.mjs` | classifies an in-progress stage merge's `server/` conflicts and takes upstream for the mechanical ones |
 | `replay-upstream-sync.test.mjs` | end-to-end tests against throwaway git repositories |
 
 ## 1. Scratch clone
@@ -122,6 +123,21 @@ unmerged path, records the stage as `conflicted`, and exits 3. Resolve the
 paths, `git add` them, and re-run the same command: the script commits the
 merge resolution, then runs verification. It does not silently choose a side
 and it does not advance while unmerged paths remain.
+
+For the `server/` area (NEXA-882), `resolve-server-conflicts.mjs` automates the
+mechanical part of that resolution while the merge is in progress:
+
+```bash
+node scripts/upstream-sync/resolve-server-conflicts.mjs           # classify only
+node scripts/upstream-sync/resolve-server-conflicts.mjs --apply   # take upstream for mechanical paths
+```
+
+A path is **semantic** when a post-snapshot fork commit (`13ac9450..origin/master`)
+touched it or the fork blob still contains a `NEXA-*` marker; those are left
+unmerged for a human. Everything else is taken from upstream (including an
+upstream deletion, which becomes `git rm`). The tool never commits and exits 3
+while semantic conflicts remain, so a stage cannot advance by accident.
+
 
 ### Verification and resume
 
