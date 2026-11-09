@@ -15,7 +15,9 @@ This directory contains the replay machinery:
 | `stages.json` | the real stage plan owned by NEXA-880; intentionally empty until that plan lands |
 | `stages.provisional.json` | daily-slice example used to exercise the tooling; not approval to land a stage |
 | `resolve-server-conflicts.mjs` | classifies an in-progress stage merge's `server/` conflicts and takes upstream for the mechanical ones |
+| `port-semantic-overlay.mjs` | applies the fork's post-snapshot delta for the semantic `server/` paths on top of an upstream revision, writing clean ports and leaving real collisions as `.conflict` files |
 | `replay-upstream-sync.test.mjs` | end-to-end tests against throwaway git repositories |
+| `port-semantic-overlay.test.mjs` | unit tests for the semantic overlay port |
 
 ## 1. Scratch clone
 
@@ -138,6 +140,27 @@ unmerged for a human. Everything else is taken from upstream (including an
 upstream deletion, which becomes `git rm`). The tool never commits and exits 3
 while semantic conflicts remain, so a stage cannot advance by accident.
 
+Then pre-port the fork's semantic delta on top of the stage's upstream
+revision, so only genuinely colliding hunks are left for a human:
+
+```bash
+# Inside the stage merge (defaults: upstream=MERGE_HEAD, snapshot=13ac9450,
+# fork tip=origin/master, selected set=semantic unmerged server paths).
+node scripts/upstream-sync/port-semantic-overlay.mjs --json
+
+# Dry run against explicit refs and a path list (no merge required).
+node scripts/upstream-sync/port-semantic-overlay.mjs \
+  --snapshot 13ac9450 --fork-tip origin/master --upstream 3ef45fdd9 \
+  --paths-file /tmp/semantic-paths.txt --out-dir /tmp/server-overlay --json
+```
+
+Clean ports are written under `.upstream-sync/port/<upstream-sha>/` (add
+`--apply-clean` to write them into the worktree; they are not staged). Real
+collisions are written as `<path>.conflict` with `--diff3` markers and the tool
+exits 3, as does any path deleted on one side. It never commits and never
+guesses a deletion. This is staging help, not a resolution: the stage still has
+to be reviewed and its verification commands run before it can advance.
+
 
 ### Verification and resume
 
@@ -154,6 +177,7 @@ ledgers, and an append-only `runs.log`.
 
 ```bash
 node --test scripts/upstream-sync/replay-upstream-sync.test.mjs
+node --test scripts/upstream-sync/port-semantic-overlay.test.mjs
 ```
 
 The suite builds throwaway fork/upstream repositories and covers: chronological
