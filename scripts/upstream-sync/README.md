@@ -73,6 +73,11 @@ branch. Resolved SHAs are pinned in `.upstream-sync/state.json`; changing a
 stage endpoint after a replay has started is refused rather than silently
 redefining what was verified.
 
+For the real replay, prefer the **pinned triage SHA** over a date. Upstream
+moves roughly 100 commits a day, so date endpoints resolve differently for an
+operator starting a fresh clone tomorrow; a SHA makes every replay of the plan
+target the same upstream tip. A later "refresh" plan can add stages beyond it.
+
 `verify` must be non-empty. Commands run with `bash -c` from the repository
 root with `SYNC_STAGE_ID` and `SYNC_UPSTREAM_SHA` in the environment. The
 baseline `verify-merged-tree.mjs` is cheap and always useful; NEXA-880's

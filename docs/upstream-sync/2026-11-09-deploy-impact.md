@@ -25,7 +25,9 @@ created by `scripts/upstream-sync/bootstrap-scratch-clone.sh`.
 | service | user unit `paperclipai.service`, `TimeoutStartSec=420`, non-TTY |
 
 Upstream moved 5 commits during this run (`052c638b5` -> `87e755ce8`), which
-is itself evidence for the cadence section.
+is itself evidence for the cadence section. The triage pinned `3ef45fdd9`;
+the replay plan should pin that SHA (or the tip agreed at execution) rather
+than float on a date, so that two operators resolve the same target.
 
 ## Can the merged tree be served without a migration or payload switch?
 
