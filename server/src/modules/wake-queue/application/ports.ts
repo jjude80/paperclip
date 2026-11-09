@@ -187,8 +187,9 @@ export interface WakeQueueTransaction {
   claimDeferredWakeForPromotion(input: { companyId: string; wakeId: string; now: Date }): Promise<boolean>;
   /**
    * Finalizes a wake that `claimDeferredWakeForPromotion` already claimed:
-   * inserts the queued run, links it back onto the wake row, and takes the
-   * issue's execution lock. Call only after that claim returns `true`.
+   * inserts the queued run and links it back onto the wake row. The issue's
+   * execution lock is taken at admission, not here. Call only after that claim
+   * returns `true`.
    */
   finalizePromotedWake(input: PromoteDeferredWakeInput): Promise<RunSummary>;
   /** An open run already on this issue (optionally scoped to one agent) that would race a new recovery run. */

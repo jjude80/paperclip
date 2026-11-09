@@ -124,12 +124,22 @@ export function enrichPromotedWakeContext(
 ): EnrichPromotedWakeContextResult {
   const contextSnapshot = { ...input.contextSnapshot };
   const { reason, source, triggerDetail, payload } = input;
+  const issueIdFromPayload = readNonEmptyString(payload?.["issueId"]) ?? readNonEmptyString(payload?.["taskId"]);
   const commentIdFromPayload = readNonEmptyString(payload?.["commentId"]);
   const taskKey = deriveTaskKey(contextSnapshot, payload);
   const wakeCommentIds = mergeWakeCommentIds(contextSnapshot, commentIdFromPayload);
 
   if (!readNonEmptyString(contextSnapshot["wakeReason"]) && reason) {
     contextSnapshot.wakeReason = reason;
+  }
+  // Some durable receipts, such as a board Retry, store only the payload and
+  // never had a queued context snapshot. Keep their issue scope so admission
+  // can take the issue's execution lock (NEXA-864).
+  if (!readNonEmptyString(contextSnapshot["issueId"]) && issueIdFromPayload) {
+    contextSnapshot.issueId = issueIdFromPayload;
+  }
+  if (!readNonEmptyString(contextSnapshot["taskId"]) && issueIdFromPayload) {
+    contextSnapshot.taskId = issueIdFromPayload;
   }
   if (!readNonEmptyString(contextSnapshot["taskKey"]) && taskKey) {
     contextSnapshot.taskKey = taskKey;

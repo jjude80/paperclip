@@ -2689,6 +2689,19 @@ Environment overrides:
   non-numeric value falls back to the default.
 - `PAPERCLIP_WORKSPACE_COMPACTION_ENABLED=false` turns compaction off. Any other
   value keeps it on.
+- `PAPERCLIP_NEVER_ADMITTED_RUN_TIMEOUT_MINUTES=<minutes>` bounds how long a
+  `queued` run that never started may keep its issue's `executionRunId`. The
+  stale-lock sweep cancels such a run with `admission_timeout`, clears the lock
+  only while the issue still points at that run, and records an
+  `issue.never_admitted_run_expired` activity entry. The default is `120`
+  minutes, deliberately longer than the temporary admission holds (budget and
+  external-connection holds) so a legitimate hold is not cancelled by a timer.
+  A zero, negative, or non-numeric value falls back to the default.
+- `PAPERCLIP_SKILL_PACKAGE_STORAGE_ENABLED=false` disables external writes and automatic
+  package maintenance for a coordinated rolling upgrade. Default: enabled. Legacy
+  conversion runs automatically in bounded batches, outside turn preparation.
+  Existing external packages remain readable with the override. See
+  [package storage and acquisition](skill-package-storage.md).
 - `PAPERCLIP_SKILL_VERSION_RETENTION_KEEP=<count>` sets how many of the newest
   materialized versions of each skill stay on disk (see "Skill Version Snapshot
   Retention" above). The default is `0`. A negative, empty, or non-numeric value
