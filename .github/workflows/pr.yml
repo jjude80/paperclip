@@ -13,8 +13,8 @@ permissions:
 
 jobs:
   ci:
-    if: github.event.action != 'labeled' || github.event.label.name == 'profile-ci'
-    # Upstream master requires CODEOWNERS review for .github/**, so the ref that
+    if: github.event.action != 'labeled' || github.event.label.name == 'profile-ci' || github.event.label.name == 'full-ci'
+    if: github.event.action != 'labeled' || github.event.label.name == 'profile-ci' || github.event.label.name == 'full-ci'
     # judges this PR cannot be written by anyone who can push this fork. The
     # fork's own master has no review requirement; its active ruleset only
     # blocks deletion and non-fast-forward pushes (see .github/CODEOWNERS).
