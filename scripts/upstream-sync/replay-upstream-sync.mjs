@@ -442,10 +442,20 @@ function advanceStage(root, stage, state, stateDir) {
       runGit(root, ["commit", "--no-edit"]);
       console.log(`[upstream-sync] committed conflict resolution for ${stage.id}`);
     }
+    const head = gitText(root, ["rev-parse", "HEAD"]);
+    const parents = gitText(root, ["log", "-1", "--format=%P", head]).split(" ").filter(Boolean);
+    if (!parents.includes(stage.upstreamSha)) {
+      fail(
+        EXIT_USAGE,
+        `stage ${stage.id} is recorded as conflicted, but HEAD (${head.slice(0, 12)}) is not a ` +
+          `merge of upstream ${stage.upstreamSha.slice(0, 12)}. The merge was probably aborted; ` +
+          "remove the stage from .upstream-sync/state.json or re-run after resetting the branch.",
+      );
+    }
     stageState = {
       ...stageState,
       status: "merged",
-      mergeCommit: gitText(root, ["rev-parse", "HEAD"]),
+      mergeCommit: head,
     };
     state.stages[stage.id] = stageState;
     saveState(join(stateDir, "state.json"), state);

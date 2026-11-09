@@ -169,6 +169,29 @@ test("records conflicted paths and refuses to advance until they are resolved", 
   }
 });
 
+test("refuses to verify a conflicted stage whose merge was aborted", () => {
+  const fixture = createFixture([
+    { message: "upstream edits common", files: { "common.txt": "upstream\n" } },
+  ]);
+  try {
+    const config = writeConfig(fixture.root, {
+      stages: [{ id: "s1", upstream: fixture.stageShas[0], verify: ["true"] }],
+    });
+    const conflicted = runReplay(fixture.repo, config);
+    assert.equal(conflicted.status, 3, `${conflicted.stdout}\n${conflicted.stderr}`);
+    git(fixture.repo, ["merge", "--abort"]);
+    const afterAbort = runReplay(fixture.repo, config);
+    assert.equal(afterAbort.status, 2, `${afterAbort.stdout}\n${afterAbort.stderr}`);
+    assert.match(afterAbort.stderr, /merge was probably aborted/i);
+    assert.equal(
+      git(fixture.repo, ["rev-list", "--count", "--merges", "origin/master..HEAD"]).stdout,
+      "0",
+    );
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test("refuses to advance when a stage verification fails, and does not re-merge", () => {
   const fixture = createFixture([
     { message: "upstream stage 1", files: { "stage1.txt": "one\n" } },
