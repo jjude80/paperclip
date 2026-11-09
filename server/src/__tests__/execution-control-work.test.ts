@@ -3,8 +3,8 @@ import { reconcileSafeNativeReplacements } from "../services/native-runtime/nati
 import { localAiLoginService } from "../services/local-ai-login.js";
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { eq, sql } from "drizzle-orm";
-import { agents, agentWakeupRequests, companies, createDb, heartbeatRuns, issues, issueRecoveryActions, nativeRunFinalizations, applyPendingMigrations } from "@paperclipai/db";
+import { and, eq, sql } from "drizzle-orm";
+import { agents, agentWakeupRequests, companies, createDb, heartbeatRuns, issueRecoveryActions, issueRelations, issues, nativeRunFinalizations, applyPendingMigrations } from "@paperclipai/db";
 import { installDatabaseWorkSignals } from "../../../packages/db/src/work-signals.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { resolveExternalTestDatabaseUrl } from "./helpers/external-test-database.js";
@@ -15,7 +15,8 @@ import { deliverExecutionStatuses } from "../services/execution-status-delivery.
 import { terminalizeLegacyExecution } from "../services/legacy-execution-recovery.js";
 import { reconcileAbandonedExecutionControl } from "../services/execution-control-reconciliation.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
-import { markExecutionReconciliation, deliverReconciledExecutions, settleUnrecoverableExecutions } from "../services/execution-recovery-resolution.js";
+import { markExecutionReconciliation, deliverReconciledExecutions, releaseLegacyLeaseLostExecutions, settleUnrecoverableExecutions } from "../services/execution-recovery-resolution.js";
+import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { nextWorkspaceRecoveryAt } from "../services/system-recovery.js";
 import { createSystemRecovery } from "../services/system-recovery-state.js";
 import { retainedWorkspaceCandidates } from "../services/workspace-recovery.js";
@@ -156,6 +157,65 @@ describe.skipIf(!support.supported)("execution-control durable work", () => {
     const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId, status, runtimeMode: "legacy", contextSnapshot: { issueId: sourceIssueId } }).returning();
     return run!;
   }
+  async function leaseLostHold(input?: {
+    status?: "todo" | "in_progress";
+    blockerStatuses?: Array<"done" | "cancelled" | "in_progress">;
+    cause?: string;
+    cancellationSource?: string;
+  }) {
+    const source = await runRow("cancelled");
+    await db.update(heartbeatRuns).set({
+      resultJson: {
+        cancellation: {
+          source: input?.cancellationSource ?? "controller_lease",
+          expected: false,
+          initiator: { type: "system" },
+          reason: "Legacy controller lease lost (renewal_deadline)",
+          recordedAt: new Date().toISOString(),
+        },
+        executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+      },
+    }).where(eq(heartbeatRuns.id, source.id));
+    await db.update(issues).set({
+      status: input?.status ?? "todo", assigneeAgentId: agentId, responsibleUserId: "test-user",
+    }).where(eq(issues.id, issueId));
+    for (const status of (input?.blockerStatuses ?? ["done"]) as Array<"done" | "cancelled" | "in_progress">) {
+      const blockerId = randomUUID();
+      await db.insert(issues).values({
+        id: blockerId, companyId, title: "Blocker", status, assigneeAgentId: agentId,
+      });
+      await db.insert(issueRelations).values({
+        companyId, issueId: blockerId, relatedIssueId: issueId, type: "blocks",
+      });
+    }
+    const [action] = await db.insert(issueRecoveryActions).values({
+      companyId,
+      sourceIssueId: issueId,
+      kind: "active_run_watchdog",
+      ownerType: "board",
+      returnOwnerAgentId: agentId,
+      cause: input?.cause ?? "legacy_execution_requires_reconciliation",
+      fingerprint: `legacy-execution:${source.id}`,
+      status: "resolved",
+      outcome: "blocked",
+      nextAction: "Automatic recovery stopped.",
+      resolutionNote: "Automatic recovery stopped.",
+      resolvedAt: new Date(),
+      evidence: {
+        runId: source.id,
+        adapterRecovery: "unsupported_or_unknown",
+        automaticRecovery: {
+          policy: "preserve_without_replay_v1",
+          runId: source.id,
+          replay: "blocked",
+          actionOutcome: "unknown",
+          recordedAt: new Date().toISOString(),
+        },
+      },
+    }).returning();
+    return { source, action: action! };
+  }
+
   async function pausedRecoveredSource(actionId = randomUUID()) {
     const sourceIssueId = randomUUID();
     await db.insert(issues).values({ id: sourceIssueId, companyId, title: "Recovered execution",
@@ -409,6 +469,92 @@ describe.skipIf(!support.supported)("execution-control durable work", () => {
     await settle(); expect(wake).toHaveBeenCalledTimes(1); await quiet(c);
     const [saved] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, successor.id));
     expect(saved?.retryOfRunId).toBe(run.id);
+  });
+
+  it("releases a resolved legacy controller-lease hold as a new source execution once blockers close", async () => {
+    const { source, action } = await leaseLostHold();
+    expect(await getExecutionBlocker(db, companyId, issueId)).not.toBeNull();
+    const heartbeat = heartbeatService(db);
+    const wake = vi.fn(heartbeat.wakeup);
+
+    await releaseLegacyLeaseLostExecutions(db, wake);
+
+    expect(await getExecutionBlocker(db, companyId, issueId)).toBeNull();
+    const successors = await db.select().from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, companyId),
+      sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`,
+      sql`${heartbeatRuns.id} <> ${source.id}`,
+    ));
+    expect(successors).toHaveLength(1);
+    expect(["queued", "running", "scheduled_retry"]).toContain(successors[0]!.status);
+    expect(successors[0]).toMatchObject({
+      retryOfRunId: null,
+      runtimeMode: "legacy",
+      contextSnapshot: {
+        forceFreshSession: true,
+        releasedFromRunId: source.id,
+        wakeReason: "issue_legacy_execution_released",
+      },
+    });
+    const [released] = await db.select().from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(released).toMatchObject({
+      status: "resolved",
+      outcome: "restored",
+      resolutionNote: "new_source_execution_path",
+    });
+    expect(released!.evidence.automaticRecovery).toMatchObject({ replay: "allowed" });
+    expect(released!.evidence.legacyLeaseRelease).toMatchObject({
+      delivery: "delivered",
+      previousReplay: "blocked",
+      sourceRunId: source.id,
+    });
+
+    // A second sweep must not produce a second successor.
+    await releaseLegacyLeaseLostExecutions(db, wake);
+    expect(await db.select().from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, companyId),
+      sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`,
+      sql`${heartbeatRuns.id} <> ${source.id}`,
+    ))).toHaveLength(1);
+  });
+
+  it("keeps a replay-blocked hold that guards a genuine external action", async () => {
+    await leaseLostHold({ cause: "uncertain_external_action" });
+    const wake = vi.fn(async () => null);
+    expect(await getExecutionBlocker(db, companyId, issueId)).not.toBeNull();
+
+    await releaseLegacyLeaseLostExecutions(db, wake);
+
+    expect(wake).not.toHaveBeenCalled();
+    expect(await getExecutionBlocker(db, companyId, issueId)).not.toBeNull();
+    const runs = await db.select().from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, companyId),
+      sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`,
+    ));
+    expect(runs).toHaveLength(1);
+  });
+
+  it("keeps a legacy hold while any blocker is still open", async () => {
+    await leaseLostHold({ blockerStatuses: ["done", "in_progress"] });
+    const wake = vi.fn(async () => null);
+    expect(await getExecutionBlocker(db, companyId, issueId)).not.toBeNull();
+
+    await releaseLegacyLeaseLostExecutions(db, wake);
+
+    expect(wake).not.toHaveBeenCalled();
+    expect(await getExecutionBlocker(db, companyId, issueId)).not.toBeNull();
+  });
+
+  it("keeps a legacy hold whose run was not stopped by a controller lease loss", async () => {
+    await leaseLostHold({ cancellationSource: "operator" });
+    const wake = vi.fn(async () => null);
+    expect(await getExecutionBlocker(db, companyId, issueId)).not.toBeNull();
+
+    await releaseLegacyLeaseLostExecutions(db, wake);
+
+    expect(wake).not.toHaveBeenCalled();
+    expect(await getExecutionBlocker(db, companyId, issueId)).not.toBeNull();
   });
 
 });

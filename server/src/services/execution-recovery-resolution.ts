@@ -7,12 +7,14 @@ import { claimedAdapterType, conversationRecoveryActionPredicate, getConversatio
 import { persistActivity } from "./activity-log.js";
 import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import { logger } from "../middleware/logger.js";
-import { and, eq, exists, inArray, isNull, not, or, sql } from "drizzle-orm";
+import { and, asc, eq, exists, inArray, isNull, not, notExists, or, sql } from "drizzle-orm";
 import {
+  agentWakeupRequests,
   chatActions,
   environmentLeases,
   heartbeatRuns,
   issueRecoveryActions,
+  issueRelations,
   issues,
   nativeRunFinalizations,
   type Db,
@@ -28,6 +30,9 @@ import { isSupersededConversationRun } from "./agent-conversations.js";
 import { hasRequiredWorkspaceRecovery } from "./workspace-restore-recovery-state.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { readSystemRecovery } from "./system-recovery-state.js";
+import { LEGACY_RECOVERY_CAUSE } from "./legacy-execution-recovery.js";
+import { getExecutionBlocker } from "./execution-blocker.js";
+import { readRunCancellation } from "./run-cancellation.js";
 import { alias } from "drizzle-orm/pg-core";
 
 /** An operator records observed outcomes; this is not permission to blindly retry. */
@@ -247,6 +252,15 @@ export async function deliverReconciledExecutions(
   db: Db,
   wake: ReturnType<typeof import("./heartbeat.js").heartbeatService>["wakeup"],
 ) {
+  // Backfill stranded legacy controller-lease holds before delivering any
+  // operator-reconciled continuation. Both are continuation work, and a
+  // released hold no longer defers its task's queued wake. A release failure
+  // must not stop operator-reconciled delivery from making progress.
+  try {
+    await releaseLegacyLeaseLostExecutions(db, wake);
+  } catch (err) {
+    logger.warn({ err }, "Legacy controller lease release sweep remains pending");
+  }
   const pending = await db
     .select()
     .from(issueRecoveryActions)
@@ -343,6 +357,307 @@ export async function deliverReconciledExecutions(
       );
     }
   }
+}
+
+const legacyReleaseBlocker = alias(issues, "legacy_release_blocker");
+const legacyReleaseLiveRun = alias(heartbeatRuns, "legacy_release_live_run");
+
+/**
+ * A resolved `legacy_execution_requires_reconciliation` hold can outlive the
+ * board-side incident that created it. When the source run was cancelled by a
+ * controller lease loss (`cancellation.source === "controller_lease"`) and the
+ * adapter has no recovery path, the no-replay flag is bookkeeping rather than
+ * evidence that an external action is uncertain. Once every blocker is closed,
+ * the hold must be released as a NEW source execution: the cancelled run is
+ * never retried and its recorded tool calls are never replayed.
+ */
+export function legacyLeaseLostExecutionHolds(db: Db, limit: number) {
+  return db
+    .select({ action: issueRecoveryActions, task: issues, run: heartbeatRuns })
+    .from(issueRecoveryActions)
+    .innerJoin(issues, and(
+      eq(issues.companyId, issueRecoveryActions.companyId),
+      eq(issues.id, issueRecoveryActions.sourceIssueId),
+    ))
+    .innerJoin(heartbeatRuns, and(
+      eq(heartbeatRuns.companyId, issueRecoveryActions.companyId),
+      eq(heartbeatRuns.id, canonicalExecutionUuid(sql`${issueRecoveryActions.evidence}->>'runId'`)),
+    ))
+    .where(and(
+      eq(issueRecoveryActions.cause, LEGACY_RECOVERY_CAUSE),
+      eq(issueRecoveryActions.kind, "active_run_watchdog"),
+      eq(issueRecoveryActions.status, "resolved"),
+      or(
+        sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
+        sql`${issueRecoveryActions.evidence}->'legacyLeaseRelease'->>'delivery' = 'pending'`,
+      ),
+      sql`coalesce(${issueRecoveryActions.evidence}->'legacyLeaseRelease'->>'delivery', '') <> 'delivered'`,
+      sql`${issueRecoveryActions.evidence}->>'adapterRecovery' = 'unsupported_or_unknown'`,
+      eq(heartbeatRuns.status, "cancelled"),
+      sql`${heartbeatRuns.resultJson}->'cancellation'->>'source' = 'controller_lease'`,
+      inArray(issues.status, ["todo", "in_progress", "blocked"]),
+      sql`${issues.assigneeAgentId} is not null`,
+      eq(issues.assigneeAgentId, issueRecoveryActions.returnOwnerAgentId),
+      isNull(issues.executionRunId),
+      isNull(issues.checkoutRunId),
+      notExists(
+        db.select({ id: issueRelations.id })
+          .from(issueRelations)
+          .innerJoin(legacyReleaseBlocker, eq(issueRelations.issueId, legacyReleaseBlocker.id))
+          .where(and(
+            eq(issueRelations.companyId, issueRecoveryActions.companyId),
+            eq(issueRelations.relatedIssueId, issueRecoveryActions.sourceIssueId),
+            eq(issueRelations.type, "blocks"),
+            sql`${legacyReleaseBlocker.status} not in ('done', 'cancelled')`,
+          )),
+      ),
+      notExists(
+        db.select({ id: legacyReleaseLiveRun.id })
+          .from(legacyReleaseLiveRun)
+          .where(and(
+            eq(legacyReleaseLiveRun.companyId, issueRecoveryActions.companyId),
+            or(
+              eq(legacyReleaseLiveRun.nativeIssueId, issueRecoveryActions.sourceIssueId),
+              sql`${legacyReleaseLiveRun.contextSnapshot}->>'issueId' = ${issueRecoveryActions.sourceIssueId}::text`,
+            ),
+            inArray(legacyReleaseLiveRun.status, ["queued", "running", "scheduled_retry"]),
+          )),
+      ),
+    ))
+    .orderBy(asc(issueRecoveryActions.updatedAt))
+    .limit(limit);
+}
+
+async function legacyReleaseBlockersClosed(db: Db, companyId: string, issueId: string) {
+  const blockers = await db
+    .select({ status: legacyReleaseBlocker.status })
+    .from(issueRelations)
+    .innerJoin(legacyReleaseBlocker, eq(issueRelations.issueId, legacyReleaseBlocker.id))
+    .where(and(
+      eq(issueRelations.companyId, companyId),
+      eq(issueRelations.relatedIssueId, issueId),
+      eq(issueRelations.type, "blocks"),
+    ));
+  return blockers.every((blocker) => blocker.status === "done" || blocker.status === "cancelled");
+}
+
+/**
+ * Backfill/recovery sweep for issues stranded by NEXA-862's class of hold.
+ * Idempotent by construction: a release is recorded on the recovery action and
+ * a dispatched run (or an already-admitted successor) is stamped, so repeated
+ * sweeps neither release the hold again nor queue a second run.
+ */
+export async function releaseLegacyLeaseLostExecutions(
+  db: Db,
+  wake: ReturnType<typeof import("./heartbeat.js").heartbeatService>["wakeup"],
+  now = new Date(),
+) {
+  const candidates = await legacyLeaseLostExecutionHolds(db, 25);
+  const dispatched = new Set<string>();
+  let released = 0;
+  let dispatchedCount = 0;
+  for (const { action: candidate, task } of candidates) {
+    const runId = candidate.evidence.runId;
+    if (typeof runId !== "string") continue;
+    const releaseKey = `${candidate.sourceIssueId}:${runId}`;
+    try {
+      const prepared = await db.transaction(async (tx) => {
+        await tx.execute(
+          sql`select set_config('statement_timeout', '15000', true), set_config('lock_timeout', '1000', true)`,
+        );
+        // Same issue -> run -> action ordering as disposition settlement.
+        const [lockedTask] = await tx
+          .select()
+          .from(issues)
+          .where(and(eq(issues.companyId, candidate.companyId), eq(issues.id, candidate.sourceIssueId)))
+          .for("update");
+        const [run] = await tx
+          .select()
+          .from(heartbeatRuns)
+          .where(and(eq(heartbeatRuns.companyId, candidate.companyId), eq(heartbeatRuns.id, runId)))
+          .for("update");
+        const [action] = await tx
+          .select()
+          .from(issueRecoveryActions)
+          .where(eq(issueRecoveryActions.id, candidate.id))
+          .for("update");
+        if (
+          !lockedTask ||
+          !run ||
+          !action ||
+          action.status !== "resolved" ||
+          action.cause !== LEGACY_RECOVERY_CAUSE ||
+          action.kind !== "active_run_watchdog"
+        )
+          return null;
+        const evidence = action.evidence;
+        const automaticRecovery = (evidence.automaticRecovery ?? {}) as Record<string, unknown>;
+        const priorRelease = (evidence.legacyLeaseRelease ?? {}) as Record<string, unknown>;
+        if (priorRelease.delivery === "delivered") return null;
+        if (automaticRecovery.replay !== "blocked" && priorRelease.delivery !== "pending") return null;
+        if (evidence.adapterRecovery !== "unsupported_or_unknown") return null;
+        // Only a board-side lease loss is recoverable here. A genuine external
+        // action hold (`uncertain_external_action`, provider_*) stays gated.
+        if (run.status !== "cancelled" || readRunCancellation(run.resultJson)?.source !== "controller_lease")
+          return null;
+        if ((run.nativeIssueId ?? run.contextSnapshot?.issueId) !== lockedTask.id) return null;
+        if (!["todo", "in_progress", "blocked"].includes(lockedTask.status)) return null;
+        if (!lockedTask.assigneeAgentId || lockedTask.assigneeAgentId !== action.returnOwnerAgentId) return null;
+        if (lockedTask.executionRunId || lockedTask.checkoutRunId) return null;
+        if (!(await legacyReleaseBlockersClosed(tx as unknown as Db, lockedTask.companyId, lockedTask.id)))
+          return null;
+        // A successor may already be queued by a concurrent sweep or a prior
+        // pass whose delivery marker did not commit. Adopt it instead of
+        // releasing the same incident twice.
+        const [liveRun] = await tx
+          .select({ id: heartbeatRuns.id })
+          .from(heartbeatRuns)
+          .where(and(
+            eq(heartbeatRuns.companyId, lockedTask.companyId),
+            or(
+              eq(heartbeatRuns.nativeIssueId, lockedTask.id),
+              sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${lockedTask.id}::text`,
+            ),
+            inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
+          ))
+          .limit(1);
+        const priorWake = liveRun ? null : (await tx
+          .select({ runId: agentWakeupRequests.runId })
+          .from(agentWakeupRequests)
+          .where(and(
+            eq(agentWakeupRequests.companyId, lockedTask.companyId),
+            eq(agentWakeupRequests.idempotencyKey, `legacy-lease-release:${run.id}`),
+            sql`${agentWakeupRequests.runId} is not null`,
+          ))
+          .orderBy(asc(agentWakeupRequests.requestedAt))
+          .limit(1))[0] ?? null;
+        const release = {
+          delivery: "pending",
+          previousReplay: "blocked",
+          sourceRunId: run.id,
+          releasedAt: typeof priorRelease.releasedAt === "string" ? priorRelease.releasedAt : now.toISOString(),
+        };
+        const note =
+          "A board-side controller lease loss is not evidence of an uncertain external action. " +
+          "Every blocker is closed, so this hold is released as a new source execution. " +
+          "The cancelled run and its recorded tool calls are not replayed.";
+        // Release every bookkeeping row for this exact source run together.
+        await tx
+          .update(issueRecoveryActions)
+          .set({
+            status: "resolved",
+            outcome: "restored",
+            resolutionNote: "new_source_execution_path",
+            nextAction: note,
+            wakePolicy: null,
+            monitorPolicy: null,
+            resolvedAt: action.resolvedAt ?? now,
+            updatedAt: now,
+            evidence: sql`jsonb_set(${issueRecoveryActions.evidence}, '{automaticRecovery,replay}', '"allowed"'::jsonb, false)
+              || jsonb_build_object('legacyLeaseRelease',
+                coalesce(${issueRecoveryActions.evidence}->'legacyLeaseRelease', '{}'::jsonb) || ${JSON.stringify(release)}::jsonb)`,
+          })
+          .where(and(
+            eq(issueRecoveryActions.companyId, candidate.companyId),
+            eq(issueRecoveryActions.sourceIssueId, lockedTask.id),
+            eq(issueRecoveryActions.cause, LEGACY_RECOVERY_CAUSE),
+            eq(issueRecoveryActions.status, "resolved"),
+            sql`${issueRecoveryActions.evidence}->>'runId' = ${run.id}`,
+            sql`coalesce(${issueRecoveryActions.evidence}->'legacyLeaseRelease'->>'delivery', '') <> 'delivered'`,
+          ));
+        // Another, unrelated hold may still guard the issue. Release this
+        // incident's bookkeeping but never dispatch past a live hold, and do
+        // not rescan it on every sweep while that other hold owns admission.
+        const remaining = await getExecutionBlocker(tx as unknown as Db, lockedTask.companyId, lockedTask.id);
+        if (remaining !== null) {
+          await tx
+            .update(issueRecoveryActions)
+            .set({
+              updatedAt: now,
+              evidence: sql`jsonb_set(${issueRecoveryActions.evidence}, '{legacyLeaseRelease,delivery}', '"blocked_by_other_hold"'::jsonb, false)`,
+            })
+            .where(and(
+              eq(issueRecoveryActions.companyId, candidate.companyId),
+              eq(issueRecoveryActions.sourceIssueId, lockedTask.id),
+              eq(issueRecoveryActions.cause, LEGACY_RECOVERY_CAUSE),
+              sql`${issueRecoveryActions.evidence}->>'runId' = ${run.id}`,
+              sql`${issueRecoveryActions.evidence}->'legacyLeaseRelease'->>'delivery' = 'pending'`,
+            ));
+        }
+        return { task: lockedTask, run, clear: remaining === null,
+          existingRunId: liveRun?.id ?? priorWake?.runId ?? null };
+      });
+      if (!prepared) continue;
+      released += 1;
+      if (!prepared.clear) continue;
+      const markDelivered = async (continuationRunId: string) => {
+        await db
+          .update(issueRecoveryActions)
+          .set({
+            updatedAt: now,
+            evidence: sql`jsonb_set(${issueRecoveryActions.evidence}, '{legacyLeaseRelease,delivery}', '"delivered"'::jsonb, false)
+              || jsonb_build_object('legacyLeaseReleaseRunId', ${continuationRunId}::text)`,
+          })
+          .where(and(
+            eq(issueRecoveryActions.companyId, prepared.task.companyId),
+            eq(issueRecoveryActions.sourceIssueId, prepared.task.id),
+            eq(issueRecoveryActions.cause, LEGACY_RECOVERY_CAUSE),
+            sql`${issueRecoveryActions.evidence}->>'runId' = ${prepared.run.id}`,
+            sql`${issueRecoveryActions.evidence}->'legacyLeaseRelease'->>'delivery' = 'pending'`,
+          ));
+      };
+      if (prepared.existingRunId) {
+        await markDelivered(prepared.existingRunId);
+        continue;
+      }
+      if (dispatched.has(releaseKey)) continue;
+      dispatched.add(releaseKey);
+      const run = await wake(prepared.task.assigneeAgentId!, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_legacy_execution_released",
+        idempotencyKey: `legacy-lease-release:${prepared.run.id}`,
+        payload: { issueId: prepared.task.id, recoveryActionId: candidate.id },
+        requestedByActorType: "system",
+        requestedByActorId: "execution-recovery",
+        contextSnapshot: {
+          issueId: prepared.task.id,
+          taskId: prepared.task.id,
+          wakeReason: "issue_legacy_execution_released",
+          source: "execution.legacy_release",
+          forceFreshSession: true,
+          releasedRecoveryActionId: candidate.id,
+          releasedFromRunId: prepared.run.id,
+        },
+      });
+      if (!run) continue;
+      dispatchedCount += 1;
+      await markDelivered(run.id);
+      await persistActivity(db, {
+        companyId: prepared.task.companyId,
+        actorType: "system",
+        actorId: "execution-recovery",
+        action: "issue.execution_recovery_released",
+        entityType: "issue",
+        entityId: prepared.task.id,
+        agentId: prepared.task.assigneeAgentId,
+        runId: prepared.run.id,
+        details: {
+          recoveryActionId: candidate.id,
+          sourceRunId: prepared.run.id,
+          successorRunId: run.id,
+          reason: "legacy_controller_lease_loss",
+          replay: "new_source_execution",
+        },
+      });
+    } catch (err) {
+      logger.warn(
+        { err, recoveryActionId: candidate.id },
+        "Legacy controller lease release remains pending",
+      );
+    }
+  }
+  return { released, dispatched: dispatchedCount };
 }
 
 const supersedingWorkspaceHold = alias(issueRecoveryActions, "superseding_workspace_hold");
