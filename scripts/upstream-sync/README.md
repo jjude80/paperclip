@@ -161,6 +161,51 @@ exits 3, as does any path deleted on one side. It never commits and never
 guesses a deletion. This is staging help, not a resolution: the stage still has
 to be reviewed and its verification commands run before it can advance.
 
+### Semantic hunk decisions
+
+`resolve-semantic-hunks.mjs` applies the reviewed decision for every hunk the
+overlay leaves as a `.conflict`. The decision table is keyed by `server/` path
+and hunk order; a file it does not know, or a known file whose hunk count
+changed, is refused rather than guessed.
+
+```bash
+# classify only (no files written)
+node scripts/upstream-sync/resolve-semantic-hunks.mjs --conflicts .upstream-sync/port/<sha> --check --json
+
+# write resolved files at the same relative paths, without the .conflict suffix
+node scripts/upstream-sync/resolve-semantic-hunks.mjs --conflicts .upstream-sync/port/<sha> --out-dir /tmp/server-resolved
+```
+
+Exit codes: `0` every conflict file was resolved; `3` at least one file is
+unknown or its hunk count changed (nothing is guessed for that file); `2` usage.
+
+The table covers the 18 paths / 31 hunks measured on 2026-11-09 against upstream
+`3ef45fdd9`. Most are additive unions (both sides added a field, import, test or
+branch). Three are behaviour decisions and are called out in the tool:
+
+- `services/issues.ts` — take the fork's `buildInheritedExecutionWorkspaceSettings`
+  branch, which subsumes upstream's `mergeExplicitWorkspaceSettings` call for the
+  same "mode only" case.
+- `services/issue-thread-interactions.ts` — keep upstream's `qualityReview`
+  exclusion and tool-projection notification, but supersede only the fork's
+  same-subject confirmations (NEXA-773).
+- `__tests__/git-restore-point-expiration.test.ts` — keep both the fork's
+  "child never selects the parent's isolated worktree" test and upstream's
+  "older release's explicit reuse binding still protects it" test.
+
+`resolve-semantic-hunks.test.mjs` covers the union, decision, refusal and CLI
+paths with synthetic conflicts. Resolving the real 2026-11-09 collisions
+produces 18 files with no markers and is byte-identical to the reviewed set.
+
+This is still not verification. Against the merged fork+upstream tree the 18
+resolved files add no syntax errors and no *local* type errors, but a server
+typecheck cannot pass until the neighbouring areas land: the runner's acpx
+profile attestation is stale (NEXA-883) and the fork package surface differs
+from upstream's (`@paperclipai/shared`, `@paperclipai/plugin-sdk`,
+`@paperclipai/db` — NEXA-884). Measured 2026-11-09: 707 server `tsc` errors, all
+from those package surfaces, none from a resolution decision. So the server
+stage gate is real but cross-area; do not claim it from a server-only tree.
+
 
 ### Verification and resume
 
