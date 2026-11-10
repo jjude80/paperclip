@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { getTableName } from "drizzle-orm";
+import { createIssueThreadInteractionSchema } from "@paperclipai/shared";
 
 const mockCreateChild = vi.fn();
 
@@ -102,8 +103,13 @@ describe("issueThreadInteractionService", () => {
   it.each([
     ["ask_user_questions", undefined, {}, "anyone", "anyone", "inherited", "requested"],
     ["suggest_tasks", undefined, {}, "anyone", "anyone", "inherited", "requested"],
+    ["request_confirmation", undefined, {}, "human_only", "human_only", "inherited", "requested"],
+    ["request_confirmation", "human_only", {}, "human_only", "human_only", "explicit", "requested"],
+    ["request_confirmation", "anyone", {}, "anyone", "anyone", "explicit", "requested"],
+    ["request_confirmation", undefined, { request_confirmation: { defaultPolicy: "anyone" } }, "anyone", "anyone", "inherited", "requested"],
     ["request_confirmation", "board_or_agents", {}, "anyone", "anyone", "explicit", "requested"],
     ["request_confirmation", "board_only", {}, "human_only", "human_only", "explicit", "requested"],
+    ["request_checkbox_confirmation", undefined, {}, "human_only", "human_only", "inherited", "requested"],
     ["request_checkbox_confirmation", undefined, { request_checkbox_confirmation: { defaultPolicy: "not_creator" } }, "not_creator", "not_creator", "inherited", "requested"],
     ["request_item_verdicts", "anyone", { request_item_verdicts: { cap: "not_creator" } }, "anyone", "not_creator", "explicit", "company_cap"],
   ] as const)(
@@ -136,6 +142,28 @@ describe("issueThreadInteractionService", () => {
       effectiveResolverPolicy: "human_only",
       resolverPolicyProvenance: "explicit",
       effectiveResolverPolicySource: "governed_action",
+    });
+  });
+
+  it("resolves a requestedResolverPolicy alias as an explicit policy", async () => {
+    const { resolveInteractionPolicy } = await import("./issue-thread-interactions.js");
+    const parsed = createIssueThreadInteractionSchema.parse({
+      kind: "request_confirmation",
+      requestedResolverPolicy: "human_only",
+      payload: { version: 1, prompt: "Proceed?" },
+    });
+    expect(parsed.kind).toBe("request_confirmation");
+    expect(parsed.resolverPolicy).toBe("human_only");
+    expect(resolveInteractionPolicy({
+      kind: parsed.kind,
+      requested: parsed.resolverPolicy,
+      governance: {},
+      hasToolAction: false,
+    })).toEqual({
+      requestedResolverPolicy: "human_only",
+      effectiveResolverPolicy: "human_only",
+      resolverPolicyProvenance: "explicit",
+      effectiveResolverPolicySource: "requested",
     });
   });
 

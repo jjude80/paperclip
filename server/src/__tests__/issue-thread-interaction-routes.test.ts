@@ -741,6 +741,58 @@ describe("issue thread interaction routes", () => {
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
+  it("maps requestedResolverPolicy onto resolverPolicy before creating an interaction", async () => {
+    const app = await createApp();
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions")
+      .send({
+        kind: "request_confirmation",
+        requestedResolverPolicy: "human_only",
+        payload: { version: 1, prompt: "Publish this post?" },
+      });
+
+    expect(res.status).toBe(201);
+    expect(mockInteractionService.create).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        kind: "request_confirmation",
+        resolverPolicy: "human_only",
+      }),
+      expect.anything(),
+    );
+  });
+
+  it("leaves the resolver policy unset so a confirmation inherits the server default", async () => {
+    const app = await createApp();
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions")
+      .send({
+        kind: "request_confirmation",
+        payload: { version: 1, prompt: "Publish this post?" },
+      });
+
+    expect(res.status).toBe(201);
+    const [, body] = mockInteractionService.create.mock.calls[0] as [unknown, Record<string, unknown>];
+    expect(body.resolverPolicy).toBeUndefined();
+    expect(body.requestedResolverPolicy).toBeUndefined();
+  });
+
+  it("rejects a conflicting requestedResolverPolicy and resolverPolicy", async () => {
+    const app = await createApp();
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions")
+      .send({
+        kind: "request_confirmation",
+        resolverPolicy: "anyone",
+        requestedResolverPolicy: "human_only",
+        payload: { version: 1, prompt: "Publish this post?" },
+      });
+
+    expect(res.status).toBe(400);
+    expect(JSON.stringify(res.body)).toContain("requestedResolverPolicy");
+    expect(mockInteractionService.create).not.toHaveBeenCalled();
+  });
+
   it("returns 400 for agent-addressed tool-action confirmations", async () => {
     const app = await createApp();
     const res = await request(app)

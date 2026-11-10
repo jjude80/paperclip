@@ -1913,6 +1913,11 @@ export const requestItemVerdictsResultSchema = z
 
 const createIssueThreadInteractionCommon = {
   resolverPolicy: issueThreadInteractionResolverPolicySchema.optional(),
+  // Accepted alias for clients that send the policy under the name of the
+  // field the server snapshots (`requestedResolverPolicy`). It must not be
+  // silently dropped: the value is mapped onto `resolverPolicy` below, and a
+  // disagreement between the two spellings is rejected rather than guessed at.
+  requestedResolverPolicy: issueThreadInteractionResolverPolicySchema.optional(),
   addresseeAgentId: z.string().guid().nullable().optional(),
   addresseeUserId: z.string().trim().min(1).nullable().optional(),
 };
@@ -1970,7 +1975,7 @@ const createAskUserQuestionsPayloadSchema = z.union([
   })).pipe(createLegacyAskUserQuestionsPayloadSchema),
 ]);
 
-export const createIssueThreadInteractionSchema = z.discriminatedUnion("kind", [
+const createIssueThreadInteractionUnionSchema = z.discriminatedUnion("kind", [
   z.object({
     ...createIssueThreadInteractionCommon,
     kind: z.literal("suggest_tasks"),
@@ -2037,6 +2042,32 @@ export const createIssueThreadInteractionSchema = z.discriminatedUnion("kind", [
     payload: requestItemVerdictsPayloadSchema,
   }),
 ]);
+
+export const createIssueThreadInteractionSchema =
+  createIssueThreadInteractionUnionSchema
+    .superRefine((value, ctx) => {
+      if (value.requestedResolverPolicy === undefined) return;
+      if (
+        value.resolverPolicy !== undefined &&
+        value.resolverPolicy !== value.requestedResolverPolicy
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["requestedResolverPolicy"],
+          message:
+            "requestedResolverPolicy must match resolverPolicy when both are supplied",
+        });
+      }
+    })
+    .transform((value) => {
+      if (value.requestedResolverPolicy === undefined) return value;
+      // The alias is an input spelling only; the service reads resolverPolicy.
+      return {
+        ...value,
+        resolverPolicy:
+          value.resolverPolicy ?? value.requestedResolverPolicy,
+      };
+    });
 
 export type CreateIssueThreadInteraction = z.infer<
   typeof createIssueThreadInteractionSchema
