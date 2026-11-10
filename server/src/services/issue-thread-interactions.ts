@@ -390,8 +390,11 @@ export const DEFAULT_RESOLVER_POLICY_BY_KIND: Record<
 > = {
   suggest_tasks: "anyone",
   ask_user_questions: "anyone",
-  request_confirmation: "anyone",
-  request_checkbox_confirmation: "anyone",
+  // Confirmation gates fail closed. An agent deciding a confirmation its own
+  // run asked for is not a review, so `anyone` must be requested explicitly
+  // (or set by explicit company governance) before an agent may resolve one.
+  request_confirmation: "human_only",
+  request_checkbox_confirmation: "human_only",
   request_item_verdicts: "anyone",
   connection_intent: "human_only",
 };

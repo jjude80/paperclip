@@ -36,9 +36,12 @@ const support = await getEmbeddedPostgresTestSupport();
     await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, nativeIssueId: issueId, status: "running", runtimeMode: "native", contextSnapshot: { issueId, conversationSessionGeneration: 1 } });
     await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
     const svc = issueThreadInteractionService(db);
+    // This suite exercises agent-resolved conversational confirmations, so the
+    // cards must ask for an agent-resolvable audience explicitly. Confirmation
+    // kinds now fail closed to human_only when no policy is supplied.
     const card = await svc.create(issue, checkbox ? {
-      kind: "request_checkbox_confirmation", payload: { version: 1, prompt: "Approve selected work?", options: [{ id: "note", label: "Welcome note" }, { id: "poster", label: "Poster" }], minSelected: 1, defaultSelectedOptionIds: ["poster"] },
-    } : { kind: "request_confirmation", payload: { version: 1, prompt: "Approve the welcome note?" } }, { agentId });
+      kind: "request_checkbox_confirmation", resolverPolicy: "anyone", payload: { version: 1, prompt: "Approve selected work?", options: [{ id: "note", label: "Welcome note" }, { id: "poster", label: "Poster" }], minSelected: 1, defaultSelectedOptionIds: ["poster"] },
+    } : { kind: "request_confirmation", resolverPolicy: "anyone", payload: { version: 1, prompt: "Approve the welcome note?" } }, { agentId });
     const [comment] = await db.insert(issueComments).values({ companyId, issueId, authorUserId: "operator", authorType: "user", body: "Yes, write the welcome note." }).returning();
     const args = { companyId, issueId, interactionId: card.id, actor: { agentId, runId }, input: { commentId: comment.id, decision: "accept" as const, ...(checkbox ? { selectedOptionIds: ["note"] } : {}) } };
     return { args, card, issue, comment, svc, companyId, issueId, agentId, runId };

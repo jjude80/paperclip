@@ -15,7 +15,10 @@ describe("confirmation reply through the native API tool", () => {
   async function seed(mode: "standard" | "planning" | "ask" = "standard") {
     const f = await server.fixture({ conversation: true, disableWakeOnDemand: true, mode });
     const [issue] = await server.db.select().from(issues).where(eq(issues.id, f.issueId));
-    const card = await issueThreadInteractionService(server.db).create(issue!, createIssueThreadInteractionSchema.parse({ kind: "request_confirmation", payload: { version: 1, prompt: "Write the welcome note?" } }), { agentId: f.agentId });
+    // This suite proves an agent can accept a conversational confirmation
+    // through the native tool, so the card must opt into an agent-resolvable
+    // audience explicitly: confirmations now fail closed to human_only.
+    const card = await issueThreadInteractionService(server.db).create(issue!, createIssueThreadInteractionSchema.parse({ kind: "request_confirmation", resolverPolicy: "anyone", payload: { version: 1, prompt: "Write the welcome note?" } }), { agentId: f.agentId });
     const [comment] = await server.db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "user", authorUserId: f.userId, body: "Yes, write it." }).returning();
     const call = { tool: "call_api", callId: randomUUID(), arguments: { operationId: "POST /api/issues/{id}/interactions/{interactionId}/resolve-from-comment", pathParams: { id: f.issueId, interactionId: card.id }, body: { commentId: comment!.id, decision: "accept" } } };
     return { f, card, comment: comment!, call };
