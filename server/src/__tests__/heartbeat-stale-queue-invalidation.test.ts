@@ -84,6 +84,45 @@ async function ensureIssueRelationsTable(db: ReturnType<typeof createDb>) {
   `));
 }
 
+/**
+ * Adapter dispatch, and the run-state transition that follows it, happen
+ * asynchronously after `resumeQueuedRuns()` / `wakeup()` resolves. On a loaded
+ * host that handoff routinely takes several seconds: the run row is claimed,
+ * the issue is locked, then the adapter is entered. The 3s default below is
+ * only enough for a condition that should already be true, so anything waiting
+ * on dispatch or on the resulting run status needs this bound instead.
+ *
+ * 20s is more than six times the 3s default that failed at load average 14.
+ * Under load average 12-36 no wait using this bound timed out; the failures
+ * that remained there were the drain default below and the per-test budget.
+ * A genuine regression therefore still fails, but at the wait, with the
+ * message the wait was given — not two lines later against a stale status.
+ *
+ * The same bound is handed to `waitForRunExecutionDrain`, whose 5s production
+ * default is this defect one layer in: the adapter returns, then the run keeps
+ * writing bookkeeping while the fixture's database is starved of CPU.
+ */
+const DISPATCH_WAIT_MS = readPositiveInteger(process.env.PAPERCLIP_TEST_DISPATCH_WAIT_MS, 20_000);
+
+// `DISPATCH_WAIT_MS` must be able to elapse inside a test's own budget,
+// otherwise an overdue transition is reported as a harness timeout instead of
+// the assertion below. The extra headroom covers the work around the wait:
+// seeding a company, two gated dispatches and a drain measured over 30s for a
+// single case at load average 24 (server/vitest.config.ts sets 15s globally).
+//
+// The teardown hook needs the same headroom. Its drain plus TRUNCATE is real
+// database work, and at load average 53 the fixture's afterEach tripped the
+// 30s hook default while the test bodies around it passed — another red run
+// that names nothing about the change under test. A genuinely hung hook still
+// fails, at this bound instead of silently hanging.
+vi.setConfig({ testTimeout: DISPATCH_WAIT_MS + 60_000, hookTimeout: DISPATCH_WAIT_MS + 60_000 });
+
+function readPositiveInteger(raw: string | undefined, fallback: number) {
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
 async function waitForCondition(fn: () => Promise<boolean>, timeoutMs = 3_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -91,6 +130,22 @@ async function waitForCondition(fn: () => Promise<boolean>, timeoutMs = 3_000) {
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   return fn();
+}
+
+/**
+ * Wait for a dispatch or a run-state transition, and fail here — naming what
+ * was expected — when it does not arrive. Without the explicit assertion a
+ * timed-out wait is silent and the following `expect` blames the wrong thing.
+ */
+async function waitForTransition(
+  description: string,
+  fn: () => Promise<boolean>,
+  timeoutMs = DISPATCH_WAIT_MS,
+) {
+  expect(
+    await waitForCondition(fn, timeoutMs),
+    `timed out after ${timeoutMs}ms waiting for ${description}`,
+  ).toBe(true);
 }
 
 async function cleanupHeartbeatInvalidationFixture(db: ReturnType<typeof createDb>) {
@@ -257,7 +312,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     await heartbeat.resumeQueuedRuns();
     const [delivered] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wake.id));
     expect(delivered.runId).toBeTruthy();
-    await heartbeat.waitForRunExecutionDrain(delivered.runId!);
+    await heartbeat.waitForRunExecutionDrain(delivered.runId!, { timeoutMs: DISPATCH_WAIT_MS });
     expect(countExecuteCallsForRun(delivered.runId!)).toBe(1);
     expect((await heartbeat.getRun(delivered.runId!))?.contextSnapshot).toMatchObject({ wakeCommentIds: [comment.id] });
     await heartbeat.resumeQueuedRuns();
@@ -281,8 +336,8 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     await db.update(agents).set({ status: "idle", lifecycleState: "ready" }).where(eq(agents.id, agentId));
     const recovered = heartbeatService(db, { runtimeEnv: { ...process.env, PAPERCLIP_IN_WORKTREE: "false" } });
     await recovered.resumeQueuedRuns();
-    expect(await waitForCondition(async () => countExecuteCallsForRun(run!.id) === 1)).toBe(true);
-    await recovered.waitForRunExecutionDrain(run!.id);
+    await waitForTransition("the recovered run to reach its adapter once", async () => countExecuteCallsForRun(run!.id) === 1);
+    await recovered.waitForRunExecutionDrain(run!.id, { timeoutMs: DISPATCH_WAIT_MS });
     expect(countExecuteCallsForRun(run!.id)).toBe(1);
   });
 
@@ -403,7 +458,10 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     });
     try {
       await heartbeat.resumeQueuedRuns();
-      expect(await waitForCondition(() => Promise.resolve(mockAdapterExecute.mock.calls.length > 0))).toBe(true);
+      await waitForTransition(
+        "the first queued run to reach its adapter",
+        () => Promise.resolve(mockAdapterExecute.mock.calls.length > 0),
+      );
       const runs = await db.select().from(heartbeatRuns);
       const running = runs.filter((run) => run.status === "running");
       expect(running).toHaveLength(sameIssue ? 1 : 2);
@@ -591,7 +649,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       requestedByActorId: otherOperatorId,
     });
     expect(second).not.toBeNull();
-    await heartbeat.waitForRunExecutionDrain(second!.id);
+    await heartbeat.waitForRunExecutionDrain(second!.id, { timeoutMs: DISPATCH_WAIT_MS });
   });
 
   it("never suppresses a repeated service-level invoke with no requester", async () => {
@@ -602,7 +660,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
 
     const second = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
     expect(second).not.toBeNull();
-    await heartbeat.waitForRunExecutionDrain(second!.id);
+    await heartbeat.waitForRunExecutionDrain(second!.id, { timeoutMs: DISPATCH_WAIT_MS });
   });
 
   it("still starts a repeated contentless wake once the agent has actionable work", async () => {
@@ -948,7 +1006,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     `));
 
     await heartbeat.resumeQueuedRuns();
-    await waitForCondition(async () => {
+    await waitForTransition("the run to be cancelled and its wake request skipped", async () => {
       const [run, wakeup] = await Promise.all([
         db.select({ status: heartbeatRuns.status })
           .from(heartbeatRuns)
@@ -1045,7 +1103,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       };
 
       await heartbeat.resumeQueuedRuns();
-      await waitForCondition(async () => {
+      await waitForTransition("the run to be cancelled and its wake request skipped", async () => {
         const [run, wakeup] = await Promise.all([
           db.select({ status: heartbeatRuns.status })
             .from(heartbeatRuns)
@@ -1139,7 +1197,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       expect(ordering).toEqual(["validated", "parked"]);
     };
     await heartbeat.resumeQueuedRuns();
-    await waitForCondition(async () => {
+    await waitForTransition("the run to be cancelled after the pre-dispatch park", async () => {
       const run = await db
         .select({ status: heartbeatRuns.status })
         .from(heartbeatRuns)
@@ -1259,7 +1317,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     });
 
     expect(run).not.toBeNull();
-    await waitForCondition(async () => countExecuteCallsForRun(run!.id) > 0);
+    await waitForTransition("the timer wake to reach its adapter", async () => countExecuteCallsForRun(run!.id) > 0);
 
     expect(countExecuteCallsForRun(run!.id)).toBe(1);
   });
@@ -1277,7 +1335,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     });
 
     expect(run).not.toBeNull();
-    await waitForCondition(async () => countExecuteCallsForRun(run!.id) > 0);
+    await waitForTransition("the timer wake to reach its adapter", async () => countExecuteCallsForRun(run!.id) > 0);
     expect(countExecuteCallsForRun(run!.id)).toBe(1);
   });
 
@@ -1295,7 +1353,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     });
 
     expect(run).not.toBeNull();
-    await waitForCondition(async () => countExecuteCallsForRun(run!.id) > 0);
+    await waitForTransition("the timer wake to reach its adapter", async () => countExecuteCallsForRun(run!.id) > 0);
     expect(countExecuteCallsForRun(run!.id)).toBe(1);
   });
 
@@ -1538,7 +1596,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     });
     const run = await heartbeat.wakeup(agentId, { source: "on_demand", triggerDetail: "manual" });
     expect(run).not.toBeNull();
-    expect(await waitForCondition(() => Promise.resolve(countExecuteCallsForRun(run!.id) === 1))).toBe(true);
+    await waitForTransition("the session-rotation wake to reach its adapter once", () => Promise.resolve(countExecuteCallsForRun(run!.id) === 1));
     const [context] = mockAdapterExecute.mock.calls.find(([context]) => context?.runId === run!.id)!;
     expect(context.runtime.sessionId).toBe(rotate ? null : sessionId);
     if (rotate) {
@@ -1887,7 +1945,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       .where(eq(agentWakeupRequests.id, wakeupRequestId));
 
     await heartbeat.resumeQueuedRuns();
-    await waitForCondition(async () => {
+    await waitForTransition("the deferred wake request to be promoted onto a run", async () => {
       const [deferred] = await db
         .select({ status: agentWakeupRequests.status, runId: agentWakeupRequests.runId })
         .from(agentWakeupRequests)
@@ -1958,7 +2016,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
 
     await heartbeat.resumeQueuedRuns();
 
-    await waitForCondition(async () => {
+    await waitForTransition("the duplicate max-turn continuation to be cancelled", async () => {
       const run = await db
         .select({ status: heartbeatRuns.status })
         .from(heartbeatRuns)
@@ -2044,12 +2102,15 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
         originCommentIds: [wakeCommentId],
         interactionResolvedAt: new Date().toISOString(), mutation: "interaction", source: `${interactionKind}.resolved`, forceFreshSession: true } });
     await heartbeat.resumeQueuedRuns();
-    expect(await waitForCondition(async () => (await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0]?.status === "succeeded")).toBe(true);
+    await waitForTransition(
+      "the resumed continuation run to succeed",
+      async () => (await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0]?.status === "succeeded",
+    );
     // Terminal status precedes completion bookkeeping. Drain those writes before
     // afterEach truncates the fixture, otherwise PostgreSQL can deadlock.
-    await heartbeat.waitForRunExecutionDrain(runId);
+    await heartbeat.waitForRunExecutionDrain(runId, { timeoutMs: DISPATCH_WAIT_MS });
     expect(countExecuteCallsForRun(runId)).toBe(1);
-    await waitForCondition(async () => claimedIssue !== null);
+    await waitForTransition("the dispatch check to observe the claimed issue", async () => claimedIssue !== null, 3_000);
     expect(claimedIssue).toEqual({ status: "in_progress", executionRunId: runId });
   });
 });
