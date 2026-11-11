@@ -72,6 +72,13 @@ describe("git worktree sharing", () => {
     // The server writes with `umask 0077`; reproduce that for the creation so
     // the precondition is the real defect and not this test runner's umask.
     await run("sh", ["-c", `umask 077; git worktree add -q -b ${branchName} '${worktreePath}' HEAD`], repoRoot);
+    // Directories that already exist when the sharing step runs. A default ACL
+    // is only inherited by entries created afterwards, so these keep the writer's
+    // umask unless the sharing step walks them: `refs/heads/<namespace>/` is
+    // where the rewrite after the first commit lands, and `objects/??` is where
+    // every loose object lands.
+    await fs.mkdir(path.join(repoRoot, ".git", "refs", "heads", "nexa"), { recursive: true });
+    await fs.mkdir(path.join(repoRoot, ".git", "objects", "ab"), { recursive: true });
   }, 120_000);
 
   afterAll(async () => {
@@ -96,7 +103,7 @@ describe("git worktree sharing", () => {
     const commonStat = await fs.stat(commonDir);
     const ref = path.join(commonDir, "refs", "heads", branchName);
 
-    const result = await shareGitWorktreeWithGroup({ worktreePath, branchName });
+    const result = await shareGitWorktreeWithGroup({ worktreePath, branchName, shareOwnGroup: true });
 
     expect(result.status).toBe("shared");
     expect(result.sharedGroupId).toBe(commonStat.gid);
@@ -151,14 +158,57 @@ describe("git worktree sharing", () => {
     expect(await aclOf(later)).toMatch(/^group::r-x\s+#effective:r--$/m);
   });
 
+  it("installs inheritance on pre-existing ref namespaces and object fan-out dirs", async () => {
+    if (!aclTools) return;
+    const commonDir = path.resolve(repoRoot, (await git(repoRoot, ["rev-parse", "--git-common-dir"])).trim());
+    const group = (await fs.stat(commonDir)).gid;
+
+    // These existed before the sharing step, so a default on `refs/heads` and
+    // `objects` was not inherited by them. Without the walk they stay bare.
+    for (const relative of ["refs/heads/nexa", "objects/ab"]) {
+      const directory = path.join(commonDir, relative);
+      expect((await fs.stat(directory)).gid, `${directory} group`).toBe(group);
+      expect(await aclOf(directory), `${directory} default group`).toContain("default:group::r-x");
+    }
+
+    const head = await git(repoRoot, ["rev-parse", "HEAD"]);
+    // A ref written into the pre-existing namespace after the fix: this is what
+    // the first commit in a workspace does.
+    const namespacedRef = path.join(commonDir, "refs", "heads", "nexa", "later-ref");
+    await run("sh", ["-c", `umask 077; printf '%s\\n' '${head}' > '${namespacedRef}'`]);
+    const refStat = await fs.stat(namespacedRef);
+    expect(refStat.gid).toBe(group);
+    expect(refStat.mode & 0o040).not.toBe(0);
+
+    // A loose object written into the pre-existing fan-out dir.
+    const looseObject = path.join(commonDir, "objects", "ab", "later-object");
+    await run("sh", ["-c", `umask 077; printf 'fixture\\n' > '${looseObject}'`]);
+    const objectStat = await fs.stat(looseObject);
+    expect(objectStat.gid).toBe(group);
+    expect(objectStat.mode & 0o040).not.toBe(0);
+  });
+
   it("skips without POSIX ACLs instead of failing workspace creation", async () => {
-    const result = await shareGitWorktreeWithGroup({ worktreePath });
+    const result = await shareGitWorktreeWithGroup({ worktreePath, shareOwnGroup: true });
     if (aclTools) {
       expect(result.status).toBe("shared");
       return;
     }
     expect(result.status).toBe("unsupported");
     expect(result.warnings).toEqual([]);
+  });
+
+  it("leaves a single-user checkout alone", async () => {
+    const commonDir = path.resolve(repoRoot, (await git(repoRoot, ["rev-parse", "--git-common-dir"])).trim());
+    const result = await shareGitWorktreeWithGroup({ worktreePath });
+    if ((await fs.stat(commonDir)).gid === process.getegid?.()) {
+      // No second seat to share with; do not strip group write for a colleague.
+      expect(result.status).toBe("not_shared");
+      expect(result.directories).toEqual([]);
+      expect(result.files).toEqual([]);
+    } else {
+      expect(result.status).toBe("shared");
+    }
   });
 
   // The acceptance property: a second uid that is a member of the git

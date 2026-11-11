@@ -21,6 +21,13 @@ const execFileAsync = promisify(execFile);
  * group already names every seat, and a list goes stale the moment a seat
  * cycles.
  *
+ * A default entry only applies to directories created *after* it is installed,
+ * so installing it on `refs/heads` and `objects` is not enough: the ref
+ * namespaces (`refs/heads/nexa/`, `refs/heads/qa/`, …) and the `objects/??`
+ * fan-out directories already exist, and a file written into one of them keeps
+ * the writer's umask. Those pre-existing directories are walked and given the
+ * same default, once, at realization — after that new ones inherit on their own.
+ *
  * Read-only by design. The default entry gives the group `r-x` (traverse for
  * directories, read for files); write access, where a seat needs it, stays a
  * named entry so this function never widens it.
@@ -47,11 +54,27 @@ const WORKTREE_ADMIN_FILES = ["HEAD", "index", "gitdir", "commondir", "ORIG_HEAD
 /** Bounded walk of `refs/`: refs trees are small, but never scan unbounded. */
 const MAX_REF_FILES = 2_000;
 
+/**
+ * Bound for the pre-existing directory walk (`refs/**` and the 256 `objects/??`
+ * fan-out dirs). Generous next to a real git dir, small enough that a corrupt
+ * tree cannot turn workspace creation into a full-filesystem scan.
+ */
+const MAX_METADATA_DIRECTORIES = 4_096;
+
+/** `setfacl` takes many paths per call; keep the argument list well under ARG_MAX. */
+const SETFACL_BATCH_SIZE = 64;
+
 export type GitWorktreeSharingStatus =
   /** Default ACLs and readable metadata are in place. */
   | "shared"
   /** Not a git worktree we could resolve; nothing to do. */
   | "not_a_worktree"
+  /**
+   * The git dir's group is this process's own group, so there is no second seat
+   * to share with. Left untouched: installing `g::r-x` on a private checkout
+   * would strip group write a developer may legitimately use.
+   */
+  | "not_shared"
   /** `setfacl` is not installed on this host; no ACLs to inherit. */
   | "unsupported"
   /** The attempt ran but at least one operation failed; see `warnings`. */
@@ -72,6 +95,11 @@ export interface GitWorktreeSharingInput {
   worktreePath: string;
   /** Branch whose ref file should be made readable. Optional. */
   branchName?: string | null;
+  /**
+   * Run even when the git dir's group is this process's own group. Test seam:
+   * the fixture is a single-user checkout, but the mechanics still need proof.
+   */
+  shareOwnGroup?: boolean;
   /** Test seam. Defaults to `execFile`. */
   runCommand?: (command: string, args: string[], options: { cwd?: string }) => Promise<{ stdout: string; stderr: string }>;
 }
@@ -132,6 +160,35 @@ async function collectRefFiles(commonDir: string): Promise<string[]> {
   return files;
 }
 
+/**
+ * Directories under `refs/` and `objects/` that already exist. A default ACL is
+ * only inherited by entries created after it is installed, so these are the
+ * ones that would otherwise keep writing unreadable refs and loose objects:
+ * `refs/heads/<namespace>/` and the `objects/??` fan-out dirs. New children
+ * inherit from their parent, which is why this is a one-time walk.
+ */
+async function collectMetadataDirectories(commonDir: string): Promise<string[]> {
+  const directories: string[] = [];
+  const queue = [path.join(commonDir, "refs"), path.join(commonDir, "objects")];
+  while (queue.length > 0 && directories.length < MAX_METADATA_DIRECTORIES) {
+    const current = queue.shift()!;
+    let entries;
+    try {
+      entries = await fs.readdir(current, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const target = path.join(current, entry.name);
+      directories.push(target);
+      if (directories.length >= MAX_METADATA_DIRECTORIES) break;
+      queue.push(target);
+    }
+  }
+  return directories;
+}
+
 async function hasSetfacl(
   run: NonNullable<GitWorktreeSharingInput["runCommand"]>,
 ): Promise<boolean> {
@@ -143,8 +200,14 @@ async function hasSetfacl(
   }
 }
 
-async function shareDirectory(
-  run: NonNullable<GitWorktreeSharingInput["runCommand"]>,
+/**
+ * Put a directory in the shared group and set setgid so entries created in it
+ * inherit that group. The ACL itself is installed in batches below: `setfacl`
+ * accepts many paths per call, and the walk can cover ~270 directories (the
+ * `objects/??` fan-out), so one spawn per directory would add seconds to every
+ * workspace realization.
+ */
+async function prepareDirectory(
   directory: string,
   gid: number,
   warnings: string[],
@@ -177,22 +240,49 @@ async function shareDirectory(
   } catch (error) {
     warnings.push(`could not set setgid on ${directory}: ${(error as Error).message}`);
   }
-  try {
-    await run("setfacl", [
-      "-m", "g::r-x",
-      "-m", "d:u::rwx",
-      "-m", "d:g::r-x",
-      "-m", "d:m::rwx",
-      "-m", "d:o::---",
-      directory,
-    ], {});
-    return true;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-      warnings.push(`could not install read inheritance on ${directory}: ${(error as Error).message}`);
+  return true;
+}
+
+const DEFAULT_ACL_ARGS = [
+  "-m", "g::r-x",
+  "-m", "d:u::rwx",
+  "-m", "d:g::r-x",
+  "-m", "d:m::rwx",
+  "-m", "d:o::---",
+] as const;
+
+/**
+ * Install read inheritance on prepared directories. Returns the directories the
+ * ACLs were actually applied to. A failed batch is retried path by path so one
+ * unreadable directory cannot silently skip the other 63.
+ */
+async function installDefaultAcls(
+  run: NonNullable<GitWorktreeSharingInput["runCommand"]>,
+  directories: string[],
+  warnings: string[],
+): Promise<string[]> {
+  const applied: string[] = [];
+  for (let start = 0; start < directories.length; start += SETFACL_BATCH_SIZE) {
+    const batch = directories.slice(start, start + SETFACL_BATCH_SIZE);
+    try {
+      await run("setfacl", [...DEFAULT_ACL_ARGS, ...batch], {});
+      applied.push(...batch);
+      continue;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return applied;
     }
-    return false;
+    for (const directory of batch) {
+      try {
+        await run("setfacl", [...DEFAULT_ACL_ARGS, directory], {});
+        applied.push(directory);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+          warnings.push(`could not install read inheritance on ${directory}: ${(error as Error).message}`);
+        }
+      }
+    }
   }
+  return applied;
 }
 
 async function shareFile(
@@ -274,6 +364,16 @@ export async function shareGitWorktreeWithGroup(
   result.sharedGroupName = await readGroupName(gid);
   result.status = "shared";
 
+  // A single-user checkout (`jjude:jjude`) has no second seat to share with, and
+  // `g::r-x` there would remove group write from a directory the developer may
+  // share with a colleague. The host this defect is about runs the server as
+  // uid 1000 in group 1000 while the shared `.git` is `jjude:pcagents`, so the
+  // real case still proceeds.
+  if (!input.shareOwnGroup && typeof process.getegid === "function" && gid === process.getegid()) {
+    result.status = "not_shared";
+    return result;
+  }
+
   const worktreeGitDirRaw = await resolveGitPath(run, worktreePath, ["rev-parse", "--git-dir"]);
   const worktreeGitDir = worktreeGitDirRaw
     ? resolveInCommonDir(commonDir, worktreeGitDirRaw)
@@ -285,16 +385,24 @@ export async function shareGitWorktreeWithGroup(
     return result;
   }
 
+  const directories = new Set<string>();
   for (const relative of GIT_METADATA_DIRECTORIES) {
     const directory = relative ? path.join(commonDir, relative) : commonDir;
-    if (await shareDirectory(run, directory, gid, result.warnings)) result.directories.push(directory);
+    directories.add(directory);
   }
   // The per-worktree admin dir holds `index`, which git rewrites on the first
   // command after creation, so it needs the default entries too.
-  if (worktreeGitDir && worktreeGitDir !== commonDir
-    && await shareDirectory(run, worktreeGitDir, gid, result.warnings)) {
-    result.directories.push(worktreeGitDir);
+  if (worktreeGitDir && worktreeGitDir !== commonDir) directories.add(worktreeGitDir);
+  // Pre-existing ref namespaces and object fan-out dirs do not inherit from
+  // their parent retroactively; walk them once so refs and loose objects
+  // written into them after this point are readable too.
+  for (const directory of await collectMetadataDirectories(commonDir)) directories.add(directory);
+
+  const prepared: string[] = [];
+  for (const directory of directories) {
+    if (await prepareDirectory(directory, gid, result.warnings)) prepared.push(directory);
   }
+  result.directories.push(...await installDefaultAcls(run, prepared, result.warnings));
 
   const files = new Set<string>();
   for (const relative of GIT_METADATA_FILES) files.add(path.join(commonDir, relative));
