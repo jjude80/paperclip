@@ -45,7 +45,7 @@ describeEmbeddedPostgres("cross-issue interaction resolution cap (routes + postg
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-interaction-cap-");
     db = createDb(tempDb.connectionString);
-  }, 30_000);
+  }, 90_000);
 
   // An allowed resolution wakes the assignee, and that wake can land a heartbeat
   // run row just after the response, so teardown is best-effort in foreign-key

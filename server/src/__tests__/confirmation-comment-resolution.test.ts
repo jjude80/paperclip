@@ -21,7 +21,7 @@ const support = await getEmbeddedPostgresTestSupport();
 (support.supported ? describe : describe.skip)("conversational confirmation resolution", () => {
   let temporary: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   let db: ReturnType<typeof createDb>;
-  beforeAll(async () => { temporary = await startEmbeddedPostgresTestDatabase("confirmation-replies-"); db = createDb(temporary.connectionString); }, 30_000);
+  beforeAll(async () => { temporary = await startEmbeddedPostgresTestDatabase("confirmation-replies-"); db = createDb(temporary.connectionString); }, 90_000);
   afterAll(async () => { await temporary?.cleanup(); });
   async function seed(checkbox = false, conversation = false) {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), runId = randomUUID();

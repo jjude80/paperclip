@@ -61,7 +61,7 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-queued-comments-");
     db = createDb(tempDb.connectionString);
-  }, 30_000);
+  }, 90_000);
 
   const testProcesses = new Map<string, ChildProcess>();
 

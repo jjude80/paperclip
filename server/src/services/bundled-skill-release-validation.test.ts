@@ -15,7 +15,7 @@ const hashInventory = (files: Array<{ path: string; content: string }>) => creat
   beforeAll(async () => {
     temporary = await startEmbeddedPostgresTestDatabase("bundled-release-validation-");
     db = createDb(temporary.connectionString);
-  }, 30_000);
+  }, 90_000);
   afterAll(async () => { await db?.$client.end(); await temporary?.cleanup(); });
 
   async function seed(content = "saved release content") {

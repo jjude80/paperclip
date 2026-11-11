@@ -207,7 +207,7 @@ describe("P6-16/P6-25/P6-28 native finalization recovery", () => {
       phase: "workspace_finalize",
       status: "succeeded",
     });
-  }, 30_000);
+  }, 90_000);
 
   afterAll(async () => {
     await temporary.cleanup();

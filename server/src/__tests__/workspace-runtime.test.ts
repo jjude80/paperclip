@@ -6035,7 +6035,7 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-workspace-dirty-quarantine-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+  }, 90_000);
 
   afterAll(async () => {
     await tempDb?.cleanup();
@@ -6678,7 +6678,7 @@ describeEmbeddedPostgres("workspace runtime service control persistence", () => 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-workspace-runtime-control-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+  }, 90_000);
 
   afterAll(async () => {
     await tempDb?.cleanup();
@@ -7743,7 +7743,7 @@ describeEmbeddedPostgres("workspace runtime startup reconciliation", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-workspace-runtime-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+  }, 90_000);
 
   afterAll(async () => {
     await tempDb?.cleanup();

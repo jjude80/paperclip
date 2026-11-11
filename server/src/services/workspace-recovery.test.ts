@@ -66,7 +66,7 @@ describe("automatic retained workspace recovery", () => {
     } else temporary = await startEmbeddedPostgresTestDatabase("workspace-recovery-");
     db = createDb(temporary.connectionString);
     if (external) await db.execute(sql`TRUNCATE TABLE companies CASCADE`);
-  }, 30_000);
+  }, 90_000);
   afterAll(async () => {
     await db?.$client.end(); await temporary?.cleanup(); await rm(root, { recursive: true, force: true });
     if (priorHome === undefined) delete process.env.PAPERCLIP_HOME; else process.env.PAPERCLIP_HOME = priorHome;

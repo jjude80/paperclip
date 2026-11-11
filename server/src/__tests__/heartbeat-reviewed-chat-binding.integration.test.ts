@@ -264,7 +264,7 @@ describe.each(["slack", "discord"] as const)("reviewed %s execution binding", (p
         providerMessageId: "review-message",
         direction: "inbound",
       });
-  }, 30_000);
+  }, 90_000);
   afterAll(async () => {
     await temporary?.cleanup();
   });

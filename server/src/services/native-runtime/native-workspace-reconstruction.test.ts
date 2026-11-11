@@ -33,7 +33,7 @@ describe("reconstruction after confirmed native workspace loss", () => {
   beforeAll(async () => {
     temporary = await startEmbeddedPostgresTestDatabase("workspace-reconstruction-");
     db = createDb(temporary.connectionString);
-  }, 30_000);
+  }, 90_000);
   afterAll(async () => { await temporary.cleanup(); });
   afterEach(async () => {
     if (runningHeartbeat) await drainHeartbeatRunsToQuiescence(db, runningHeartbeat);

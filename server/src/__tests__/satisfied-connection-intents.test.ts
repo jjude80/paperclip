@@ -30,7 +30,7 @@ describePostgres("already available connection requests", () => {
     temp = await startEmbeddedPostgresTestDatabase("paperclip-satisfied-connections-");
     db = createDb(temp.connectionString);
     await db.insert(authUsers).values({ id: "connection-owner", name: "Owner", email: "owner@example.test", createdAt: new Date(), updatedAt: new Date() });
-  }, 20_000);
+  }, 90_000);
   beforeEach(async () => { await db.execute(sql`truncate table companies cascade`); });
   afterAll(async () => { await db.$client.end({ timeout: 1 }); await temp?.cleanup(); });
 

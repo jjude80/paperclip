@@ -22,7 +22,7 @@ describe("board retry of accepted workspace export", () => {
     await db.insert(companies).values({ id: companyId, name: "Export repair", issuePrefix: "EXP" });
     await db.insert(agents).values({ id: agentId, companyId, name: "Exporter", adapterType: "paperclip_runner" });
     await db.insert(environments).values({ id: environmentId, name: `Retained ${environmentId}`, driver: "sandbox" });
-  }, 30_000);
+  }, 90_000);
   afterAll(async () => { await temporary.cleanup(); });
   async function seed(cause = "native_workspace_sync_out_retry_exhausted") {
     probe.mockReset().mockResolvedValue({ exitCode: 0, timedOut: false });

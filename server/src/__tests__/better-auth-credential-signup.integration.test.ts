@@ -80,7 +80,7 @@ describeEmbeddedPostgres("Better Auth credential sign-up against the real schema
     // Mounted exactly as `createApp` mounts it, and with no body parser in
     // front of it: Better Auth reads the raw request body itself.
     app.all("/api/auth/{*authPath}", createBetterAuthHandler(auth));
-  }, 30_000);
+  }, 90_000);
 
   afterAll(async () => {
     await database?.cleanup();

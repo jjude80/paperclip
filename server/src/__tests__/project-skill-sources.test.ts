@@ -46,7 +46,7 @@ describe.skipIf(!support.supported)('automatic project skill sources', () => {
     home = await fs.mkdtemp(path.join(os.tmpdir(), 'paperclip-project-skills-home-'));
     process.env.PAPERCLIP_HOME = home;
     await db.insert(companies).values({ id: companyId, name: 'Project skills', issuePrefix: 'PSK' });
-  }, 30000);
+  }, 90_000);
   it('rechecks the locked source ref when branch repair races with project attachment', async () => {
     const companyId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: 'Branch repair race', issuePrefix: 'RCE' });

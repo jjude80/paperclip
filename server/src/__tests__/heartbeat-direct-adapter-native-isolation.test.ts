@@ -89,7 +89,7 @@ describeEmbeddedPostgres("direct adapter native-runner isolation", () => {
         }),
       });
     }
-  }, 20_000);
+  }, 90_000);
 
   afterEach(async () => {
     await drainHeartbeatRunsToQuiescence(db, heartbeat);

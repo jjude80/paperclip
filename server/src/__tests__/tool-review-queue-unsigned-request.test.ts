@@ -37,7 +37,7 @@ describeEmbeddedPostgres("tool review queue vs unsigned ask-first request", () =
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-review-queue-unsigned-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+  }, 90_000);
 
   afterAll(async () => {
     await tempDb?.cleanup();

@@ -21,7 +21,7 @@ const initialTools = [
 (support.supported ? describe : describe.skip)("Railway connection lifecycle and gateway", () => {
   let db: ReturnType<typeof createDb>;
   let temp: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
-  beforeAll(async () => { temp = await startEmbeddedPostgresTestDatabase("paperclip-railway-"); db = createDb(temp.connectionString); }, 20000);
+  beforeAll(async () => { temp = await startEmbeddedPostgresTestDatabase("paperclip-railway-"); db = createDb(temp.connectionString); }, 90_000);
   afterAll(async () => { await temp?.cleanup(); });
 
   async function fixture() {

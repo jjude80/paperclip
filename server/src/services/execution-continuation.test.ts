@@ -132,7 +132,7 @@ const support = await getEmbeddedPostgresTestSupport();
             connectionId: randomUUID(),
           },
         });
-    }, 30_000);
+    }, 90_000);
     afterAll(async () => {
       await database?.cleanup();
     });

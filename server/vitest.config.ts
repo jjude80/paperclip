@@ -23,14 +23,17 @@ export default defineConfig({
     environment: "node",
     include: ["src/**/*.test.ts", "scripts/**/*.test.mjs"],
     // Each server suite boots + tears down its own embedded Postgres in
-    // beforeAll/afterAll. Under the loaded serial shard (maxWorkers=1) the
-    // graceful shutdown can occasionally cross vitest's default 10s hookTimeout,
-    // producing flaky "Hook timed out in 10000ms" afterAll failures on CI. Give
-    // the boot/teardown hooks generous headroom; 30s is far above the observed
-    // worst-case teardown yet still catches a genuinely hung hook. teardownTimeout
-    // mirrors it for the same reason.
-    hookTimeout: 30000,
-    teardownTimeout: 30000,
+    // beforeAll/afterAll. The first start on a cold host (fresh embedded-PG
+    // install, cold page cache) was measured at 36s here; 20s and 30s budgets
+    // made a healthy suite report "Hook timed out in 20000ms" with every test
+    // skipped (NEXA-788). Give the boot/teardown hooks the same 90s budget that
+    // packages/db already uses for its embedded-Postgres cost class
+    // (EMBEDDED_POSTGRES_TEST_TIMEOUT_MS) -- ample even for a cold, contended
+    // runner, while a genuinely hung hook still fails well inside the job limit.
+    // Suites that pass an explicit timeout to beforeAll/afterAll override this,
+    // so those literals were raised to 90_000 too.
+    hookTimeout: 90_000,
+    teardownTimeout: 90_000,
     // The route/authz suites import very large modules (for example
     // src/routes/issues.ts and its dependency graph). The first test in each
     // file pays the one-time transform cost inside its own timeout budget. On

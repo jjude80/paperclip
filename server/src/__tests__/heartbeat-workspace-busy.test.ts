@@ -141,7 +141,7 @@ describeEmbeddedPostgres("shared-workspace run serialization", () => {
         testedAt: new Date().toISOString(),
       }),
     });
-  }, 20_000);
+  }, 90_000);
 
   afterEach(async () => {
     // Seeded holder runs are synthetic "running" rows with no real execution

@@ -202,7 +202,7 @@ describe("P6-19 native interaction bridge", () => {
         },
       },
     ]);
-  }, 30_000);
+  }, 90_000);
 
   afterAll(async () => temporary?.cleanup());
 

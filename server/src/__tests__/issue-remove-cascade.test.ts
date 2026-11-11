@@ -41,7 +41,7 @@ describeEmbeddedPostgres("issueService.remove referential integrity", () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issue-remove-cascade-");
     db = createDb(tempDb.connectionString);
     svc = issueService(db);
-  }, 20_000);
+  }, 90_000);
 
   afterEach(async () => {
     await db.delete(decisions);

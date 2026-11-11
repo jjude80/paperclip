@@ -23,7 +23,7 @@ const support = await getEmbeddedPostgresTestSupport();
   beforeAll(async () => {
     temporary = await startEmbeddedPostgresTestDatabase("chat-completion-"); db = createDb(temporary.connectionString);
     await instanceSettingsService(db).updateExperimental({ enableAgentChat: true });
-  }, 30_000);
+  }, 90_000);
   afterAll(async () => { await temporary?.cleanup(); });
   beforeEach(async () => { await db.update(deliveries).set({ status: "exhausted" }); });
   async function seed() {

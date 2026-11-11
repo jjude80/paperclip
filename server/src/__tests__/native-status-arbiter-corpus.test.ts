@@ -409,7 +409,7 @@ describe("P6-31 Section 18.13 executable status-authority corpus", () => {
         status: "idle",
       },
     ]);
-  }, 30_000);
+  }, 90_000);
 
   afterAll(async () => temporary?.cleanup());
 

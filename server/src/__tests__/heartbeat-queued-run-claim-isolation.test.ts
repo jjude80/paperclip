@@ -57,7 +57,7 @@ describeEmbeddedPostgres("heartbeat queued-run claim isolation", () => {
     tempDb = await startEmbeddedPostgresTestDatabase("heartbeat-queued-run-claim-isolation-");
     db = createDb(tempDb.connectionString);
     heartbeat = heartbeatService(db);
-  }, 20_000);
+  }, 90_000);
 
   afterEach(async () => {
     await heartbeat.drainActiveRunExecutions();

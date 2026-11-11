@@ -21,7 +21,7 @@ const support = await getEmbeddedPostgresTestSupport();
     temp = await startEmbeddedPostgresTestDatabase("paperclip-repositories-");
     db = createDb(temp.connectionString);
     [companyId] = (await db.insert(companies).values({ name: "Repositories", issuePrefix: "REPO" }).returning()).map((company) => company.id);
-  }, 20_000);
+  }, 90_000);
   afterAll(async () => { await temp?.cleanup(); });
   afterEach(() => { vi.unstubAllGlobals(); personalTokens.clear(); });
 

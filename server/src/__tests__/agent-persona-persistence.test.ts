@@ -17,7 +17,7 @@ describe("persisted agent personas", () => {
     db = createDb(database.connectionString);
     companyId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Persona test", issuePrefix: "CAP" });
-  }, 30_000);
+  }, 90_000);
   afterAll(async () => { await database?.cleanup(); });
   it("randomizes once, accepts a saved draft and preserves identity across edits and revision rollback", async () => {
     const service = agentService(db);

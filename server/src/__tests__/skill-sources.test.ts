@@ -37,7 +37,7 @@ describe.skipIf(!support.supported)('skill source persistence', () => {
     db = createDb(externalUrl ?? testDb.connectionString);
     home = await fs.mkdtemp(path.join(os.tmpdir(), 'paperclip-source-test-')); process.env.PAPERCLIP_HOME = home;
     await db.insert(companies).values({ id: companyId, name: 'Skills', issuePrefix: 'SKL' });
-  }, 30000);
+  }, 90_000);
   afterAll(async () => {
     if (originalHome === undefined) delete process.env.PAPERCLIP_HOME; else process.env.PAPERCLIP_HOME = originalHome;
     await db?.$client.end({ timeout: 1 });

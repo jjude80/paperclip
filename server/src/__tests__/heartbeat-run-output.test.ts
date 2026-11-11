@@ -34,7 +34,7 @@ describePostgres("heartbeat output through adapter dispatch and finalization", (
       },
       testEnvironment: async () => ({ adapterType, status: "pass", checks: [], testedAt: new Date().toISOString() }),
     });
-  }, 30_000);
+  }, 90_000);
   afterEach(() => vi.restoreAllMocks());
   afterAll(async () => {
     await heartbeat?.drainActiveRunExecutions();

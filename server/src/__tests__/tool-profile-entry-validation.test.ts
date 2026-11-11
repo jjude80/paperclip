@@ -18,7 +18,7 @@ describeDatabase("tool profile entry validation", () => {
   beforeAll(async () => {
     database = await startEmbeddedPostgresTestDatabase("paperclip-profile-entry-validation-");
     db = createDb(database.connectionString);
-  }, 20_000);
+  }, 90_000);
 
   afterEach(async () => {
     for (const id of companyIds.splice(0)) await db.delete(companies).where(eq(companies.id, id));

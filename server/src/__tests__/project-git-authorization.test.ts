@@ -30,7 +30,7 @@ const support = await getEmbeddedPostgresTestSupport();
     await db.insert(authUsers).values(["A", "B"].map(id => ({
       id, name: id, email: `${id}@example.invalid`, createdAt: new Date(), updatedAt: new Date(),
     })));
-  }, 30_000);
+  }, 90_000);
   afterAll(async () => { await database?.cleanup(); }, 60_000);
     async function projectAuthorizationFixture() {
       const input = await seed();

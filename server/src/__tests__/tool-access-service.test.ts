@@ -931,7 +931,7 @@ describeEmbeddedPostgres("tool access service", () => {
     );
     db = createDb(tempDb.connectionString);
     await instanceSettingsService(db).updateExperimental({ enableMemoryConnectors: true });
-  }, 20_000);
+  }, 90_000);
 
   afterEach(async () => {
     vi.restoreAllMocks();

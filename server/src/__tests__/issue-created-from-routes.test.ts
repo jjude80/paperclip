@@ -83,7 +83,7 @@ describePostgres("tasks created from an issue", () => {
       { companyId, actorType: "agent", actorId: agentId, runId: legacyRunId, action: "issue.child_created", entityType: "issue", entityId: historicalId },
       { companyId, actorType: "agent", actorId: agentId, runId: legacyRunId, action: "issue.comment_added", entityType: "issue", entityId: commentedId },
     ]);
-  }, 30_000);
+  }, 90_000);
   afterAll(async () => { await database?.cleanup(); });
 
   function app() {

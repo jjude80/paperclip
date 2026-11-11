@@ -246,7 +246,7 @@ describeEmbeddedPostgres("agent service Claude OAuth binding claim", () => {
     stopDb = started.cleanup;
     connectionString = started.connectionString;
     db = createDb(connectionString);
-  }, 20_000);
+  }, 90_000);
 
   afterEach(async () => {
     await db.delete(activityLog);

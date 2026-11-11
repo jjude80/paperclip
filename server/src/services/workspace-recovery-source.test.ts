@@ -24,7 +24,7 @@ describe("workspace source verification diagnostics", () => {
     } else temporary = await startEmbeddedPostgresTestDatabase("source-verification-");
     db = createDb(temporary.connectionString);
     if (external) await db.execute(sql`TRUNCATE TABLE companies CASCADE`);
-  }, 30_000);
+  }, 90_000);
   afterAll(async () => { await db?.$client.end(); await temporary?.cleanup(); });
 
   async function seed() {

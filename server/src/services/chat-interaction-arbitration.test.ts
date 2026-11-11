@@ -26,7 +26,7 @@ describe("provider-owned interaction arbitration", () => {
       "chat-interaction-owner-",
     );
     db = createDb(temporary.connectionString);
-  }, 30_000);
+  }, 90_000);
   afterAll(async () => {
     await temporary?.cleanup();
   });
