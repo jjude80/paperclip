@@ -916,7 +916,6 @@ describe("agent issue mutation checkout ownership", () => {
 
   it.each([
     ["patch", (app: express.Express) => request(app).patch(`/api/issues/${issueId}`).send({ title: "Blocked" })],
-    ["delete", (app: express.Express) => request(app).delete(`/api/issues/${issueId}`)],
     [
       "document upsert",
       (app: express.Express) =>
@@ -958,6 +957,18 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockWorkProductService.update).not.toHaveBeenCalled();
     expect(mockStorageService.putFile).not.toHaveBeenCalled();
     expect(mockStorageService.deleteObject).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["the assignee", ownerActor()],
+    ["a peer", peerActor()],
+  ])("refuses issue deletion by %s: hard delete is board-only", async (_who, actor) => {
+    const res = await request(await createApp(actor)).delete(`/api/issues/${issueId}`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toBe("Board access required");
+    expect(mockIssueService.remove).not.toHaveBeenCalled();
+    expect(mockAccessService.decide).not.toHaveBeenCalled();
   });
 
   it("allows mentioned peer agents to post comments without ownership of an active checkout", async () => {

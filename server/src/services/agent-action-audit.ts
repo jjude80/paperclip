@@ -50,6 +50,20 @@ function excerpt(value: string, maxLength = 280) {
   return normalized.length <= maxLength ? normalized : `${normalized.slice(0, maxLength - 1)}…`;
 }
 
+/**
+ * A deleted issue has no row left to join, but the `issue.deleted` event carries
+ * the identifier and title it wrote before the delete. Prefer that snapshot over
+ * reporting the entity as unknown. NEXA-984.
+ */
+function deletedIssueSnippet(entityId: string, action: string, details: unknown) {
+  if (action !== "issue.deleted" || !details || typeof details !== "object") return null;
+  const snapshot = details as Record<string, unknown>;
+  const identifier = typeof snapshot.identifier === "string" ? snapshot.identifier : null;
+  const title = typeof snapshot.title === "string" ? snapshot.title : null;
+  if (!identifier && !title) return null;
+  return { id: entityId, identifier, title };
+}
+
 export function agentActionAuditService(db: Db) {
   return {
     list: async (filters: AgentActionAuditFilters) => {
@@ -170,7 +184,8 @@ export function agentActionAuditService(db: Db) {
           ? { id: comment.issueId, identifier: comment.identifier, title: comment.title }
           : document
             ? { id: document.issueId, identifier: document.identifier, title: document.title }
-            : issue ? { id: issue.id, identifier: issue.identifier, title: issue.title } : null;
+            : issue ? { id: issue.id, identifier: issue.identifier, title: issue.title }
+              : deletedIssueSnippet(row.entityId, row.action, row.details);
         const isIssueDerived = row.entityType === "issue"
           || row.entityType === "issue_comment"
           || row.entityType === "issue_document";

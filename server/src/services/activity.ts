@@ -32,6 +32,13 @@ export interface ActivityFilters {
   limit?: number;
   readCondition?: SQL<boolean>;
   caseReadCondition?: SQL<boolean>;
+  /**
+   * Board readers only: include `issue.deleted` events whose issue row is gone.
+   * The privacy join cannot authorize a row that no longer exists, so without
+   * this exemption a deletion is invisible to the humans who need to attribute
+   * it. Scoped by the route to board actors so agents gain no new visibility.
+   */
+  includeDeletedIssueEvents?: boolean;
 }
 
 const DEFAULT_ACTIVITY_LIMIT = 100;
@@ -388,6 +395,12 @@ export function activityService(db: Db) {
             or(
               sql`${activityLog.entityType} != 'issue'`,
               and(visibleIssueCondition(), filters.readCondition ?? sql<boolean>`true`),
+              // The issue row is gone, so there is nothing for the privacy join
+              // above to authorize. Keep the deletion record readable to the
+              // board instead of losing the only attribution there is. NEXA-984.
+              ...(filters.includeDeletedIssueEvents
+                ? [sql<boolean>`${activityLog.action} = 'issue.deleted'`]
+                : []),
             ),
           ),
         )
