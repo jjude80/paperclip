@@ -121,10 +121,15 @@ describe("paperclip MCP tools", () => {
       "http://localhost:3100/api/companies/11111111-1111-1111-1111-111111111111/issues",
     );
     expect(init.method).toBe("POST");
+    // `visibility` and `allowDuplicate` are defaults applied by the shared
+    // create-issue schema, so the parsed body carries them. `status` stays
+    // absent on purpose: the API resolves it from the assignee.
     expect(JSON.parse(String(init.body))).toEqual({
       title: "Assigned follow-up",
       workMode: "standard",
       priority: "medium",
+      visibility: "open",
+      allowDuplicate: false,
       assigneeAgentId: "22222222-2222-2222-2222-222222222222",
       requestDepth: 0,
     });
