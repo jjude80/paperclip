@@ -444,6 +444,25 @@ export const issueExecutionMonitorPolicySchema = z.object({
     .default(null),
 });
 
+/**
+ * PATCH form of {@link issueExecutionMonitorPolicySchema}: every field is
+ * optional and carries no default, so a key the caller did not send stays
+ * absent after parsing instead of turning into `null`. The route relies on
+ * that to merge a partial monitor with the stored one (NEXA-690); a `.partial()`
+ * alone would still apply the field defaults and null the untouched keys.
+ */
+export const issueExecutionMonitorPolicyPatchSchema = z.object(
+  Object.fromEntries(
+    Object.entries(issueExecutionMonitorPolicySchema.shape).map(([key, field]) => {
+      const withoutDefault =
+        typeof (field as { removeDefault?: unknown }).removeDefault === "function"
+          ? (field as unknown as { removeDefault: () => z.ZodTypeAny }).removeDefault()
+          : field;
+      return [key, withoutDefault.optional()];
+    }),
+  ),
+);
+
 export const issueExecutionPolicySchema = z.object({
   mode: z.enum(ISSUE_EXECUTION_POLICY_MODES).optional().default("normal"),
   commentRequired: z.boolean().optional().default(true),

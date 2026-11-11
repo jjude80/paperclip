@@ -1,7 +1,7 @@
 import { taskInterruptionPresentation, taskInterruptionPresentations } from "../services/task-interruption-presentation.js";
 import { parseObject } from "../adapters/utils.js";
 import { prepareRestrictedWorkspaceRetry } from "../services/restricted-workspace-retry.js";
-import { issueSummariesQuerySchema, type IssueSummary } from "@paperclipai/shared";
+import { issueSummariesQuerySchema, issueExecutionMonitorPolicyPatchSchema, issueExecutionPolicySchema, type IssueSummary } from "@paperclipai/shared";
 import { listIssueSummaries } from "../services/issue-summaries.js";
 import { assertNoCaseHandoffMutation } from "../services/heartbeat/case-handoff-lifecycle.js";
 import { assertLegacyRunTaskOwnership } from "../legacy-run-task-ownership.js";
@@ -329,6 +329,7 @@ import {
 } from "../services/company-search-rate-limit.js";
 import {
   applyIssueExecutionPolicyTransition,
+  mergeRequestedExecutionMonitor,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
   redactIssueMonitorExternalRef,
@@ -384,6 +385,16 @@ import {
 const MAX_ISSUE_COMMENT_LIMIT = 500;
 const updateIssueRouteSchema = updateIssueSchema.extend({
   interrupt: z.boolean().optional(),
+  // A PATCH may carry only the monitor fields it changes. The patch form keeps
+  // absent monitor keys absent (no `null` defaults), so the handler can merge
+  // them with the stored monitor instead of nulling kind/serviceName/maxAttempts
+  // (NEXA-690). Everything outside `monitor` keeps replace semantics.
+  executionPolicy: issueExecutionPolicySchema
+    .extend({
+      monitor: issueExecutionMonitorPolicyPatchSchema.optional().nullable(),
+    })
+    .optional()
+    .nullable(),
 });
 const queuedCommentMutationTargetSchema = z.object({
   queueId: z.string().min(1),
@@ -14239,7 +14250,12 @@ export function issueRoutes(
       }
       if (req.body.executionPolicy !== undefined) {
         updateFields.executionPolicy = applyActorMonitorScheduledBy(
-          normalizeIssueExecutionPolicy(req.body.executionPolicy),
+          normalizeIssueExecutionPolicy(
+            mergeRequestedExecutionMonitor(
+              req.body.executionPolicy,
+              existing.executionPolicy ?? null,
+            ),
+          ),
           actor.actorType,
         );
       }

@@ -411,6 +411,44 @@ export function normalizeIssueExecutionPolicy(input: unknown): IssueExecutionPol
   };
 }
 
+function asPlainRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+/**
+ * PATCH semantics for `executionPolicy.monitor`.
+ *
+ * The monitor is an object inside the policy, so a caller updating one field
+ * sends a monitor that carries only that field. Replacing the monitor wholesale
+ * would null the keys the caller did not send (`kind`, `serviceName`,
+ * `maxAttempts`, `timeoutAt`, `recoveryPolicy`), which turns an external-service
+ * check into a monitor that verifies nothing while still reporting a future
+ * `nextCheckAt` (NEXA-690). Merge field by field instead: absent keys keep their
+ * stored values, and an explicit `null` clears a key.
+ *
+ * A missing or `null` `monitor` is passed through unchanged: removing a monitor
+ * and replacing the whole policy keep their existing meanings.
+ */
+export function mergeRequestedExecutionMonitor(
+  requestedPolicy: unknown,
+  storedPolicy: unknown,
+): unknown {
+  const requested = asPlainRecord(requestedPolicy);
+  if (!requested || !Object.prototype.hasOwnProperty.call(requested, "monitor")) {
+    return requestedPolicy;
+  }
+  const requestedMonitor = asPlainRecord(requested.monitor);
+  if (!requestedMonitor) return requestedPolicy;
+  const storedMonitor = asPlainRecord(asPlainRecord(storedPolicy)?.monitor);
+  if (!storedMonitor) return requestedPolicy;
+  return {
+    ...requested,
+    monitor: { ...storedMonitor, ...requestedMonitor },
+  };
+}
+
 export function parseIssueExecutionState(input: unknown): IssueExecutionState | null {
   if (input == null) return null;
   const parsed = issueExecutionStateSchema.safeParse(input);
