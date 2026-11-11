@@ -21,17 +21,30 @@ async function main() {
   let env = { ...process.env };
   const diagnostic = (code) => process.stderr.write('Paperclip: GitHub ' + code + '; continuing without managed credentials.\n');
   const configRoot = env.GH_CONFIG_DIR || os.tmpdir();
-  // A missing/unwritable scratch directory must not break local Git. The
-  // fallback deliberately cannot load the host's gh authentication files.
+  // GH_CONFIG_DIR is only scratch space for this operation. When the run user
+  // cannot write it -- a read-only per-run directory is the common case -- the
+  // broker's identity is still usable: retry once with a fresh, empty 0700
+  // directory under the OS temp root instead of discarding the credential
+  // (NEXA-953). The fallback deliberately cannot load the host's gh auth files.
+  const createConfigDirectory = (root) => {
+    fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+    const created = fs.mkdtempSync(path.join(root, 'paperclip-github-operation-'));
+    fs.chmodSync(created, 0o700);
+    return created;
+  };
   let configDirectory = path.join(directory, 'unavailable-gh-config');
   let configReady = false;
-  try {
-    fs.mkdirSync(configRoot, { recursive: true, mode: 0o700 });
-    configDirectory = fs.mkdtempSync(path.join(configRoot, 'paperclip-github-operation-'));
-    fs.chmodSync(configDirectory, 0o700);
-    configReady = true;
-    process.once('exit', () => { try { fs.rmSync(configDirectory, { recursive: true, force: true }); } catch {} });
-  } catch { diagnostic('configuration_directory_unavailable'); }
+  const configRoots = [configRoot, os.tmpdir()].filter((root, index, all) =>
+    all.findIndex(other => path.resolve(other) === path.resolve(root)) === index);
+  for (const root of configRoots) {
+    try {
+      configDirectory = createConfigDirectory(root);
+      configReady = true;
+      process.once('exit', () => { try { fs.rmSync(configDirectory, { recursive: true, force: true }); } catch {} });
+      break;
+    } catch { /* a missing or unwritable scratch root must not break local Git */ }
+  }
+  if (!configReady) diagnostic('configuration_directory_unavailable');
   {
     for (const key of Object.keys(env)) {
       if (/^(GH_TOKEN|GITHUB_TOKEN|GH_ENTERPRISE_TOKEN|GITHUB_ENTERPRISE_TOKEN|PAPERCLIP_GIT_TOKEN|GIT_AUTHOR_.*|GIT_COMMITTER_.*|GIT_CONFIG_.*|GIT_ASKPASS|SSH_ASKPASS|SSH_AUTH_SOCK|GIT_SSH.*)$/.test(key)) delete env[key];

@@ -35,7 +35,7 @@ describe("managed GitHub launchers", () => {
       .toBe("Local Author <local@example.test>|Local Author <local@example.test>");
   });
 
-  it.each(["broker-offline", "config-unwritable", "capability-rejected"])("keeps real local Git usable when %s", async (failure) => {
+  it.each(["broker-offline", "capability-rejected"])("keeps real local Git usable when %s", async (failure) => {
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-failure-"));
     cleanups.push(() => rm(root, { recursive: true, force: true }));
     const bin = path.join(root, "managed");
@@ -50,18 +50,78 @@ describe("managed GitHub launchers", () => {
     if (failure === "broker-offline") await new Promise<void>(resolve => server.close(() => resolve()));
     else cleanups.push(() => new Promise<void>(resolve => server.close(() => resolve())));
     const configRoot = path.join(root, "config");
-    if (failure === "config-unwritable") await writeFile(configRoot, "not a directory");
     const result = await exec(path.join(bin, "git"), ["status", "--porcelain"], { cwd: root, env: {
       ...process.env, ...githubBrokerEnvironment({ GH_TOKEN: "host-must-not-leak" }, { url: `http://127.0.0.1:${port}`, token: "private-capability" }),
       GH_CONFIG_DIR: configRoot, PATH: `${bin}:${process.env.PATH}`,
     } });
-    expect(result.stderr).toContain(failure === "broker-offline" ? "broker_transport_unavailable" : failure === "config-unwritable" ? "configuration_directory_unavailable" : "capability_rejected");
+    expect(result.stderr).toContain(failure === "broker-offline" ? "broker_transport_unavailable" : "capability_rejected");
     expect(result.stderr).not.toMatch(/host-must-not-leak|private-capability/);
     await exec(path.join(bin, "git"), ["commit", "--allow-empty", "-m", "Offline work"], { cwd: root, env: {
       ...process.env, ...githubBrokerEnvironment({}, { url: `http://127.0.0.1:${port}`, token: "private-capability" }),
       GH_CONFIG_DIR: configRoot, PATH: `${bin}:${process.env.PATH}`,
     } });
   }, 15_000); // broker-offline retries the transport twice per command before it falls back
+
+  // NEXA-953: a GH_CONFIG_DIR the run user cannot write is scratch-space
+  // trouble, not missing access. The broker identity must still be applied.
+  it("falls back to a writable scratch directory and applies the broker credential when GH_CONFIG_DIR is not writable", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-config-fallback-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const bin = path.join(root, "managed"), realBin = path.join(root, "real");
+    await mkdir(bin); await mkdir(realBin);
+    await writeFile(path.join(bin, "gh"), githubLauncherSource(), { mode: 0o700 });
+    await writeFile(path.join(realBin, "gh"), '#!/usr/bin/env node\nprocess.stdout.write(JSON.stringify({token:process.env.GH_TOKEN ?? null}));', { mode: 0o700 });
+    const configRoot = path.join(root, "config");
+    await writeFile(configRoot, "not a directory");
+    const server = createServer((_req, res) => {
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ status: "available", env: { GH_TOKEN: "managed-token" } }));
+    });
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    cleanups.push(() => new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())));
+    const { port } = server.address() as { port: number };
+    const result = await exec(path.join(bin, "gh"), [], { env: {
+      ...process.env, ...githubBrokerEnvironment({ GH_TOKEN: "host-token" }, { url: `http://127.0.0.1:${port}`, token: "run-capability" }),
+      GH_CONFIG_DIR: configRoot, PATH: `${bin}:${realBin}:${process.env.PATH}`,
+    } });
+    expect(JSON.parse(result.stdout)).toEqual({ token: "managed-token" });
+    expect(result.stderr).not.toContain("configuration_directory_unavailable");
+    expect(result.stderr).not.toMatch(/host-token|managed-token|run-capability/);
+  });
+
+  it("reports configuration_directory_unavailable only when every scratch root is unusable", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-config-blocked-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const bin = path.join(root, "managed"), realBin = path.join(root, "real");
+    await mkdir(bin); await mkdir(realBin);
+    await exec("git", ["init", root]);
+    await exec("git", ["-C", root, "config", "user.name", "Local Author"]);
+    await exec("git", ["-C", root, "config", "user.email", "local@example.test"]);
+    await writeFile(path.join(bin, "git"), githubLauncherSource(), { mode: 0o700 });
+    await writeFile(path.join(bin, "gh"), githubLauncherSource(), { mode: 0o700 });
+    await writeFile(path.join(realBin, "gh"), '#!/usr/bin/env node\nprocess.stdout.write(JSON.stringify({token:process.env.GH_TOKEN ?? null}));', { mode: 0o700 });
+    // Neither the configured root nor os.tmpdir() (TMPDIR) is a directory.
+    const configRoot = path.join(root, "config"), tmpRoot = path.join(root, "tmp");
+    await writeFile(configRoot, "not a directory");
+    await writeFile(tmpRoot, "not a directory");
+    const server = createServer((_req, res) => {
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ status: "available", env: { GH_TOKEN: "managed-token" } }));
+    });
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    cleanups.push(() => new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())));
+    const { port } = server.address() as { port: number };
+    const env: NodeJS.ProcessEnv = {
+      ...process.env, ...githubBrokerEnvironment({ GH_TOKEN: "host-token" }, { url: `http://127.0.0.1:${port}`, token: "run-capability" }),
+      GH_CONFIG_DIR: configRoot, TMPDIR: tmpRoot, PATH: `${bin}:${realBin}:${process.env.PATH}`,
+    };
+    const gh = await exec(path.join(bin, "gh"), [], { env });
+    expect(JSON.parse(gh.stdout)).toEqual({ token: null }); // no credential taken
+    expect(gh.stderr).toContain("configuration_directory_unavailable");
+    expect(gh.stderr).not.toMatch(/host-token|managed-token|run-capability/);
+    // Local Git still works without a config directory.
+    await exec(path.join(bin, "git"), ["commit", "--allow-empty", "-m", "Local work"], { cwd: root, env });
+  });
 
   it("explains unavailable access while allowing local work without credentials", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-diagnostic-"));
