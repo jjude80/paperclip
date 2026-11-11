@@ -1963,6 +1963,7 @@ export {
   stalledReviewDecisionSchema,
   issueExecutionPolicySchema,
   issueExecutionMonitorPolicySchema,
+  issueExecutionMonitorPolicyPatchSchema,
   issueExecutionStateSchema,
   resolveIssueRecoveryActionSchema,
   isValidExistingBranchName,

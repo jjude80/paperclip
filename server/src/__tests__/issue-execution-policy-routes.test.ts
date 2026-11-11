@@ -864,6 +864,172 @@ describe("issue execution policy routes", () => {
     );
   });
 
+  it("preserves monitor kind, serviceName and bounds when a PATCH only updates notes", async () => {
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_progress",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1008",
+      title: "External deploy monitor",
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [],
+        monitor: {
+          nextCheckAt: "2026-12-01T12:00:00.000Z",
+          notes: "Check the systemd unit.",
+          scheduledBy: "assignee",
+          kind: "external_service",
+          serviceName: "nexa643-union-deploy.service",
+          externalRef: "[redacted]",
+          timeoutAt: "2026-12-02T12:00:00.000Z",
+          maxAttempts: 9,
+          recoveryPolicy: "wake_owner",
+        },
+      },
+      executionState: null,
+      monitorAttemptCount: 3,
+      monitorNextCheckAt: new Date("2026-12-01T12:00:00.000Z"),
+      monitorLastTriggeredAt: null,
+      monitorNotes: "Check the systemd unit.",
+      monitorScheduledBy: "assignee",
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      companyId: "company-1",
+      runId: "55555555-5555-4555-8555-555555555555",
+    }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({
+        executionPolicy: {
+          monitor: { notes: "Check the unit again after the release." },
+        },
+      });
+
+    expect(res.status).toBe(200);
+    const patch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, any>;
+    expect(patch.executionPolicy.monitor).toMatchObject({
+      nextCheckAt: "2026-12-01T12:00:00.000Z",
+      notes: "Check the unit again after the release.",
+      scheduledBy: "assignee",
+      kind: "external_service",
+      serviceName: "nexa643-union-deploy.service",
+      timeoutAt: "2026-12-02T12:00:00.000Z",
+      maxAttempts: 9,
+      recoveryPolicy: "wake_owner",
+    });
+    expect(patch.monitorNextCheckAt).toEqual(new Date("2026-12-01T12:00:00.000Z"));
+  });
+
+  it("keeps monitor fields the PATCH sends explicitly as null cleared", async () => {
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_progress",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1009",
+      title: "External deploy monitor",
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [],
+        monitor: {
+          nextCheckAt: "2026-12-01T12:00:00.000Z",
+          notes: null,
+          scheduledBy: "assignee",
+          kind: "external_service",
+          serviceName: "nexa643-union-deploy.service",
+          timeoutAt: "2026-12-02T12:00:00.000Z",
+          maxAttempts: 9,
+          recoveryPolicy: "wake_owner",
+        },
+      },
+      executionState: null,
+      monitorAttemptCount: 1,
+      monitorNextCheckAt: new Date("2026-12-01T12:00:00.000Z"),
+      monitorLastTriggeredAt: null,
+      monitorNotes: null,
+      monitorScheduledBy: "assignee",
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      companyId: "company-1",
+      runId: "55555555-5555-4555-8555-555555555555",
+    }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({
+        executionPolicy: {
+          monitor: {
+            nextCheckAt: "2026-12-01T13:00:00.000Z",
+            serviceName: null,
+          },
+        },
+      });
+
+    expect(res.status).toBe(200);
+    const patch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, any>;
+    expect(patch.executionPolicy.monitor).toMatchObject({
+      nextCheckAt: "2026-12-01T13:00:00.000Z",
+      kind: "external_service",
+      serviceName: null,
+      maxAttempts: 9,
+    });
+  });
+
+  it("rejects a monitor PATCH that would create a schedule without nextCheckAt", async () => {
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_progress",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1010",
+      title: "No monitor yet",
+      executionPolicy: null,
+      executionState: null,
+      monitorAttemptCount: 0,
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: null,
+      monitorNotes: null,
+      monitorScheduledBy: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      companyId: "company-1",
+      runId: "55555555-5555-4555-8555-555555555555",
+    }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ executionPolicy: { monitor: { notes: "Watch the deploy." } } });
+
+    expect(res.status).toBe(422);
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
   it("allows an agent-authored in_review transition with a scheduled monitor", async () => {
     const issue = {
       id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
