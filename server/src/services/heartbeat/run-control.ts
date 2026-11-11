@@ -62,6 +62,7 @@ import {
 } from "../adapter-execution-control.js";
 import { AdapterStopTimeoutError } from "../adapter-stop-timeout.js";
 import { budgetCancellationScopePredicate, pendingBudgetRunCancellationPredicate } from "./budget-cancellation.js";
+import { retryTransaction } from "../retryable-transaction.js";
 import { withBudgetSpan } from "../budget-tracing.js";
 import { captureException } from "../../sentry.js";
 import { randomUUID } from "node:crypto";
@@ -1134,7 +1135,17 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     let caseHandoffRetryClaimed = false;
     if (handoffIssueId && supersedesCaseHandoff && options.resultJson?.caseHandoffYieldStop !== true) {
       const publications: ActivityPublication[] = [];
-      const supersessionApplied = await db.transaction(async tx => {
+      // This transaction takes the issue lock before the run lock. A handoff
+      // acceptance that holds the run row and then asks for the issue can form
+      // a lock cycle, and PostgreSQL aborts this side of it with 40P01 (run
+      // 40546257151, e2e agent-chat-projects). The aborted attempt wrote
+      // nothing, so replay it; only the staged activity publications and the
+      // claim flags belong to a single attempt and are reset here.
+      const supersessionApplied = await retryTransaction(async () => {
+        publications.length = 0;
+        cancellationClaimed = false;
+        caseHandoffRetryClaimed = false;
+        return db.transaction(async tx => {
         const [issue] = await tx.select({ id: issues.id, executionRunId: issues.executionRunId, checkoutRunId: issues.checkoutRunId,
           assigneeAgentId: issues.assigneeAgentId, assigneeUserId: issues.assigneeUserId }).from(issues)
           .where(and(eq(issues.companyId, run!.companyId), eq(issues.id, handoffIssueId))).for("update");
@@ -1189,7 +1200,8 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         await cancelCaseHandoffsForIssue(tx as unknown as Db, { companyId: run!.companyId, issueId: handoffIssueId,
           sourceRunId: runId, includeUnboundTerminalIntent: Boolean(fenced && ownsTask), reason, publications });
         return true;
-      }).catch(rethrowNativeCancellationLockConflict);
+        }).catch(rethrowNativeCancellationLockConflict);
+      });
       publications.forEach(publishActivity);
       if (!supersessionApplied) return null;
     }

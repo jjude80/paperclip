@@ -147,9 +147,19 @@ const allowedGeneralGroupNames = [
   generalChatGroupName,
   generalServerNativeRunnerGroupName,
 ];
+// Route/authz suites boot their own embedded Postgres and pay a one-time
+// module transform in their first test. On the Ubuntu 26.04 runner image a
+// contended shard stretched that past vitest's 15s test / 30s hook defaults
+// while the same suites passed on a --failed rerun (run 40546257151, shard 7/9:
+// four suites timed out at 15000ms and the shard took 14m38s against 3m22s).
+// These lanes are DB-heavy only in the serialized pass, so widen the budget
+// here instead of weakening the defaults for every suite; a genuinely hung
+// suite still fails well inside the job's 20 minute limit.
 const serializedServerVitestArgs = [
   "--no-file-parallelism",
   "--maxWorkers=1",
+  "--testTimeout=30000",
+  "--hookTimeout=60000",
 ];
 const sourceOnlyVitestArgs = ["--exclude", "**/dist/**"];
 

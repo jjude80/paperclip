@@ -8,7 +8,7 @@ import { resolveExternalTestDatabaseUrl } from "./helpers/external-test-database
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "../services/delivery-work-notifications.js";
 import { registerLoginCleanupWork } from "../services/login-cleanup-work.js";
-import { loginCleanupSchedule, orphanLoginLeases } from "../services/login-cleanup-state.js";
+import { LOGIN_CLEANUP_RETRY_MS, loginCleanupSchedule, orphanLoginLeases } from "../services/login-cleanup-state.js";
 import { createDbAdapterAuthSessionStore, LOGIN_LEASE_SESSION_TAG_KEY } from "../services/device-login-service.js";
 import { createDeviceLoginReaper, createProductionLoginSessionReaperRuntime } from "../services/device-login-reaper.js";
 import { createDbSetupTokenCleanupStore, transitionSetupTokenSessionToStored } from "../services/setup-token-session.js";
@@ -114,9 +114,26 @@ describe.skipIf(!support.supported)("durable login cleanup", () => {
     runtime = createProductionLoginSessionReaperRuntime({ db: observed, environmentRuntime: { getDriver: () => driver } as any });
     vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"], shouldAdvanceTime: true });
   });
+  // Real database I/O does not advance with the fake clock, and a fake-timer
+  // advance only fires the coordinator's timer callbacks -- it returns before
+  // the Postgres work those callbacks started has finished. Jumping the whole
+  // window at once therefore let a sweep finish *after* the window and arm its
+  // 30s retry outside it, where vi.waitFor's ~5s advance could not reach it; the
+  // intent it held kept active at 1 and failed the test on a loaded runner.
+  // Step the clock and yield to real time between steps so a sweep that crosses
+  // the window still arms its retry inside it.
+  const settleStepMs = 1_000;
   async function settle(ms = 30_000) {
-    await vi.advanceTimersByTimeAsync(ms);
-    await vi.waitFor(() => expect(idleWorkSnapshot().active).toBe(0), { timeout: 5000 });
+    for (let elapsed = 0; elapsed < ms; elapsed += settleStepMs) {
+      await vi.advanceTimersByTimeAsync(Math.min(settleStepMs, ms - elapsed));
+      await new Promise<void>(resolve => setTimeout(resolve, 5));
+    }
+    // A sweep can still be in flight when the last step lands. Its retry is one
+    // interval away, so advance that interval once rather than waiting forever.
+    if (idleWorkSnapshot().active > 0) {
+      await vi.advanceTimersByTimeAsync(LOGIN_CLEANUP_RETRY_MS);
+      await new Promise<void>(resolve => setTimeout(resolve, 5));
+    }
     await vi.advanceTimersByTimeAsync(1);
     await vi.waitFor(() => expect(idleWorkSnapshot().active).toBe(0), { timeout: 5000 });
     expect(errors).toEqual([]);
