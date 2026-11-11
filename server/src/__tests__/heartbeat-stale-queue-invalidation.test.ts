@@ -109,7 +109,13 @@ const DISPATCH_WAIT_MS = readPositiveInteger(process.env.PAPERCLIP_TEST_DISPATCH
 // the assertion below. The extra headroom covers the work around the wait:
 // seeding a company, two gated dispatches and a drain measured over 30s for a
 // single case at load average 24 (server/vitest.config.ts sets 15s globally).
-vi.setConfig({ testTimeout: DISPATCH_WAIT_MS + 60_000 });
+//
+// The teardown hook needs the same headroom. Its drain plus TRUNCATE is real
+// database work, and at load average 53 the fixture's afterEach tripped the
+// 30s hook default while the test bodies around it passed — another red run
+// that names nothing about the change under test. A genuinely hung hook still
+// fails, at this bound instead of silently hanging.
+vi.setConfig({ testTimeout: DISPATCH_WAIT_MS + 60_000, hookTimeout: DISPATCH_WAIT_MS + 60_000 });
 
 function readPositiveInteger(raw: string | undefined, fallback: number) {
   if (!raw) return fallback;
