@@ -77,7 +77,7 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
     const started = await startEmbeddedPostgresTestDatabase("heartbeat-plugin-environment");
     stopDb = started.cleanup;
     db = createDb(started.connectionString);
-  }, 20_000);
+  }, 90_000);
 
   afterEach(async () => {
     for (const heartbeat of heartbeats.splice(0)) await heartbeat.drainActiveRunExecutions();

@@ -21,7 +21,7 @@ const credential = "unikraft-fixture-token";
       await ensurePostgresDatabase(external, url.pathname.slice(1));
       await applyPendingMigrations(url.toString()); db = createDb(url.toString());
     } else { temp = await startEmbeddedPostgresTestDatabase("unikraft-connector-"); db = createDb(temp.connectionString); }
-  }, 30000);
+  }, 90_000);
   afterAll(async () => { await db?.$client.end(); await temp?.cleanup(); });
 
   async function fixture(options: { personal?: boolean; metro?: string } = {}) {

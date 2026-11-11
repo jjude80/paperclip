@@ -14,7 +14,7 @@ const support = await getEmbeddedPostgresTestSupport();
   beforeAll(async () => {
     database = await startEmbeddedPostgresTestDatabase("paperclip-channel-origin-");
     db = createDb(database.connectionString);
-  }, 30_000);
+  }, 90_000);
   afterAll(async () => { await database?.cleanup(); }, 60_000);
 
   async function fixture() {

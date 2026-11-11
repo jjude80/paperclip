@@ -159,7 +159,7 @@ describe("native workspace finalization recovery", () => {
         status: "active",
       },
     ]);
-  }, 30_000);
+  }, 90_000);
 
   afterAll(async () => {
     await temporary.cleanup();

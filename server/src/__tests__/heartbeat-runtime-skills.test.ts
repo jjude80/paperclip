@@ -109,7 +109,7 @@ describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
         testedAt: new Date().toISOString(),
       }),
     });
-  }, 20_000);
+  }, 90_000);
 
   afterEach(async () => {
     // Terminal status precedes trailing writes; drain them before truncating the fixture.

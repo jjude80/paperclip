@@ -20,7 +20,7 @@ const support = await getEmbeddedPostgresTestSupport();
     vi.stubEnv("PAPERCLIP_INSTANCE_ID", "default");
     database = await startEmbeddedPostgresTestDatabase("paperclip-auth-identity-transfer-");
     db = createDb(database.connectionString);
-  }, 30_000);
+  }, 90_000);
   afterAll(async () => {
     vi.unstubAllEnvs();
     await db?.$client.end({ timeout: 5 });

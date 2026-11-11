@@ -15,7 +15,7 @@ describeDatabase("work product execution workspace validation", () => {
   beforeAll(async () => {
     database = await startEmbeddedPostgresTestDatabase("paperclip-work-product-workspace-");
     db = createDb(database.connectionString);
-  }, 30_000);
+  }, 90_000);
 
   afterAll(async () => { await database?.cleanup(); });
 

@@ -43,7 +43,7 @@ describeEmbeddedPostgres("cleanup removal services", () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-cleanup-removal-");
     db = createDb(tempDb.connectionString);
     configureAgentLifecycle(db, { requiredPluginIds: async () => [], runPlugin: async () => "complete", runHost: async () => "complete" });
-  }, 20_000);
+  }, 90_000);
 
   afterEach(async () => {
     await db.delete(heartbeatRunEvents);

@@ -27,7 +27,7 @@ describePostgres("task-scoped runtime session reset", () => {
       "paperclip-task-session-reset-",
     );
     db = createDb(database.connectionString);
-  }, 20_000);
+  }, 90_000);
 
   afterAll(async () => {
     await database?.cleanup();

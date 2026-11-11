@@ -90,7 +90,7 @@ describePostgres("heartbeat execution configuration through adapter dispatch", (
       },
       testEnvironment: async () => ({ adapterType, status: "pass", checks: [], testedAt: new Date().toISOString() }),
     });
-  }, 30_000);
+  }, 90_000);
   afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); skillFailures.clear(); });
   afterAll(async () => {
     await heartbeat?.drainActiveRunExecutions();

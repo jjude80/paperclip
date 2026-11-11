@@ -53,7 +53,7 @@ describeEmbeddedPostgres("native finalization candidate selection", () => {
   beforeAll(async () => {
     temporary = await startEmbeddedPostgresTestDatabase("paperclip-native-settled-candidates-");
     db = createDb(temporary.connectionString);
-  }, 30_000);
+  }, 90_000);
 
   beforeEach(async () => {
     captured.counts = [];

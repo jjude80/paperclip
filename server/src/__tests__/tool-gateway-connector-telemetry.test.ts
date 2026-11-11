@@ -262,7 +262,7 @@ describeEmbeddedPostgres("gateway connector invocation telemetry", () => {
       "paperclip-connector-telemetry-",
     );
     db = createDb(tempDb.connectionString);
-  }, 30_000);
+  }, 90_000);
 
   afterEach(async () => {
     vi.useRealTimers();

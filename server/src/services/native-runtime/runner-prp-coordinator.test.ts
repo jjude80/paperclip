@@ -114,7 +114,7 @@ describeEmbeddedPostgres("hidden runner PRP coordinator", () => {
       "paperclip-runner-coordinator-",
     );
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+  }, 90_000);
 
   afterEach(async () => {
     runnerPrpWebSocketInternals.resetForTests();

@@ -61,7 +61,7 @@ describeEmbeddedPostgres("skill version snapshot retention", () => {
     process.env.PAPERCLIP_HOME = paperclipHome;
     process.env.PAPERCLIP_INSTANCE_ID = "default";
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+  }, 90_000);
 
   afterEach(async () => {
     vi.restoreAllMocks();

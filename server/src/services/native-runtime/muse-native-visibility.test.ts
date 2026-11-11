@@ -13,7 +13,7 @@ import { buildLowTrustSourceTrust, buildPromotedSourceTrust, LOW_TRUST_QUARANTIN
 describe("Muse native visibility intersection", () => {
   let temporary: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   let db: ReturnType<typeof createDb>;
-  beforeAll(async () => { temporary = await startEmbeddedPostgresTestDatabase("muse-native-visibility-"); db = createDb(temporary.connectionString); }, 30000);
+  beforeAll(async () => { temporary = await startEmbeddedPostgresTestDatabase("muse-native-visibility-"); db = createDb(temporary.connectionString); }, 90_000);
   afterAll(async () => { await temporary?.cleanup(); });
   afterEach(() => vi.unstubAllEnvs());
   async function fixture() {

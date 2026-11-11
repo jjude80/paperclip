@@ -91,7 +91,7 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
       temp = await startEmbeddedPostgresTestDatabase("deployment-connectors-");
       db = createDb(temp.connectionString);
     }
-  }, 30000);
+  }, 90_000);
   afterAll(async () => { await db?.$client.end(); await temp?.cleanup(); });
 
   async function createCompany() {

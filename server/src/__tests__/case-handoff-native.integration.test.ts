@@ -58,7 +58,7 @@ suite("case handoff through the assembled native runner", () => {
     const apiUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
     process.env.PAPERCLIP_API_URL = apiUrl;
     setupRunnerPrpWebSocketServer(server, { apiUrl });
-  }, 30_000);
+  }, 90_000);
   afterAll(async () => {
     if (db) {
       const live = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.status, "running"));

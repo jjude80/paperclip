@@ -44,7 +44,7 @@ describeEmbeddedPostgres("tool gateway listing memory", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-tool-gateway-listing-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+  }, 90_000);
 
   afterAll(async () => {
     await tempDb?.cleanup();

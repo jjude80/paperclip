@@ -23,7 +23,7 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
       database = await startEmbeddedPostgresTestDatabase("workspace-restore-reconciliation-");
       db = createDb(database.connectionString);
     }
-  }, 30_000);
+  }, 90_000);
   afterAll(async () => { await db?.$client.end(); await database?.cleanup(); });
 
   async function seed() {

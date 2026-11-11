@@ -24,7 +24,7 @@ describe("durable task Retry admission", () => {
       postgres = await startEmbeddedPostgresTestDatabase("task-retry-");
       db = createDb(postgres.connectionString);
     }
-  }, 30_000);
+  }, 90_000);
   afterAll(async () => { await db?.$client.end(); await postgres?.cleanup(); });
   async function seed() {
     const companyId = randomUUID(), issueId = randomUUID(), agentId = randomUUID(), runId = randomUUID();

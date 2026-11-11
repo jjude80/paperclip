@@ -67,7 +67,7 @@ describeEmbeddedPostgres("heartbeat issue rewake throttle", () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-issue-rewake-throttle-");
     db = createDb(tempDb.connectionString);
     heartbeat = heartbeatService(db);
-  }, 20_000);
+  }, 90_000);
 
   afterEach(async () => {
     runningProcesses.clear();

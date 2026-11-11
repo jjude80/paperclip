@@ -894,10 +894,18 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
       GROUP BY c.conname, srcn.nspname, src.relname, tgtn.nspname, tgt.relname, c.confupdtype, c.confdeltype
       ORDER BY srcn.nspname, src.relname, c.conname
     `;
-    const fks = allForeignKeys.filter(
-      (fk) => includedTableNames.has(tableKey(fk.source_schema, fk.source_table))
-        && includedTableNames.has(tableKey(fk.target_schema, fk.target_table)),
-    );
+    // A table whose data is excluded still gets its DDL, but not its rows. A
+    // foreign key cannot be validated across a side that intentionally has no
+    // data (for example the minimal worktree seed excludes heartbeat_runs while
+    // keeping budget_reservations), so emit only constraints whose two tables
+    // both carry their data. Restoring the constraint anyway would reject the
+    // whole backup after the data section (NEXA-873 follow-up).
+    const fks = allForeignKeys.filter((fk) => {
+      const source = tableKey(fk.source_schema, fk.source_table);
+      const target = tableKey(fk.target_schema, fk.target_table);
+      return includedTableNames.has(source) && includedTableNames.has(target)
+        && !excludedTableNames.has(source) && !excludedTableNames.has(target);
+    });
 
     // JavaScript backups are used when a worktree seed filters or transforms
     // table data. Preserve user-defined routines before indexes because an

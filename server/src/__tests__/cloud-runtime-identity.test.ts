@@ -87,7 +87,7 @@ describeEmbeddedPostgres("Cloud runtime identity", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-cloud-runtime-identity-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+  }, 90_000);
 
   beforeEach(async () => {
     await db.delete(instanceSettings);

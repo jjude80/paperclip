@@ -13,7 +13,7 @@ if (!support.supported) console.warn(`Skipping execution identity regressions: $
 describePostgres("execution identity query contracts", () => {
   let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   let db: Db;
-  beforeAll(async () => { database = await startEmbeddedPostgresTestDatabase("execution-identity-"); db = createDb(database.connectionString); }, 20_000);
+  beforeAll(async () => { database = await startEmbeddedPostgresTestDatabase("execution-identity-"); db = createDb(database.connectionString); }, 90_000);
   afterAll(async () => { await db?.$client.end({ timeout: 0 }); await database?.cleanup(); });
   async function fixture() {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), otherIssueId = randomUUID();

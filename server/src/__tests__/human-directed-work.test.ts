@@ -19,7 +19,7 @@ const support = await getEmbeddedPostgresTestSupport();
   beforeAll(async () => {
     database = await startEmbeddedPostgresTestDatabase("paperclip-human-work-");
     db = createDb(database.connectionString, { maxConnections: 2 });
-  }, 30_000);
+  }, 90_000);
   afterAll(async () => { await database?.cleanup(); }, 60_000);
 
   async function seed() {

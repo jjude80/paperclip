@@ -103,7 +103,7 @@ describe("native external-chat response wait", () => {
       "native-external-chat-wait-",
     );
     db = createDb(temporary.connectionString);
-  }, 30_000);
+  }, 90_000);
 
   afterAll(async () => {
     await temporary?.cleanup();

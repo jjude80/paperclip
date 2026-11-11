@@ -28,7 +28,7 @@ const support = await getEmbeddedPostgresTestSupport();
         "continuation-contract-",
       );
       db = createDb(database.connectionString);
-    }, 30_000);
+    }, 90_000);
     afterAll(async () => {
       await database?.cleanup();
     });

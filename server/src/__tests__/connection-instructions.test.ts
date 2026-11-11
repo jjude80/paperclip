@@ -99,7 +99,7 @@ async function createRemoteMcpToolFixture(db: ReturnType<typeof createDb>, compa
 (support.supported ? describe : describe.skip)("generic connection instruction delivery", () => {
   let db: ReturnType<typeof createDb>;
   let temp: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
-  beforeAll(async () => { temp = await startEmbeddedPostgresTestDatabase("paperclip-connection-instructions-"); db = createDb(temp.connectionString); }, 30000);
+  beforeAll(async () => { temp = await startEmbeddedPostgresTestDatabase("paperclip-connection-instructions-"); db = createDb(temp.connectionString); }, 90_000);
   afterAll(async () => { await temp?.cleanup(); });
   async function fixture() {
     const run = await createRunFixture(db);

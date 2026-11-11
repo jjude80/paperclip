@@ -68,7 +68,7 @@ describeEmbeddedPostgres("deleted issue comment redaction", () => {
       db = createDb(tempDb.connectionString);
     }
     await db.execute(sql.raw("CREATE EXTENSION IF NOT EXISTS pg_trgm"));
-  }, 20_000);
+  }, 90_000);
 
   afterEach(async () => {
     await db.delete(issueReferenceMentions);

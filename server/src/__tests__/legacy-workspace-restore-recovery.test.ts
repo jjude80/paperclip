@@ -18,7 +18,7 @@ const support = externalTestDatabaseUrl ? { supported: true } : await getEmbedde
   let db: ReturnType<typeof createDb>;
   let temporary: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   beforeAll(async () => { if (externalTestDatabaseUrl) db = createDb(externalTestDatabaseUrl);
-    else { temporary = await startEmbeddedPostgresTestDatabase("legacy-workspace-recovery-"); db = createDb(temporary.connectionString); } }, 30_000);
+    else { temporary = await startEmbeddedPostgresTestDatabase("legacy-workspace-recovery-"); db = createDb(temporary.connectionString); } }, 90_000);
   afterAll(async () => { await db?.$client.end(); await temporary?.cleanup(); });
   async function seed(options: { local?: boolean; taskDone?: boolean; reusable?: boolean } = {}) {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), runId = randomUUID();

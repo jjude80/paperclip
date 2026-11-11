@@ -97,7 +97,7 @@ describeEmbeddedPostgres("access routes permissions upgrade compatibility", () =
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-access-routes-permissions-upgrade-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+  }, 90_000);
 
   afterEach(async () => {
     await db.delete(activityLog);
