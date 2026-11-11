@@ -214,6 +214,13 @@ This starts:
 - API server: `http://localhost:3100`
 - UI: served by the API server in dev middleware mode (same origin as API)
 
+If this checkout is a fresh `git worktree add` tree (or any tree without a
+previous install), run `scripts/worktree-bootstrap.sh` instead of a bare
+`pnpm install`. It installs dependencies and builds the workspace packages that
+resolve into `dist/`; without that build, server suites fail before running with
+`Failed to resolve entry for package "@paperclipai/plugin-sdk"`, which reads like
+a broken exports map but means the package was never built (NEXA-722).
+
 `pnpm dev` runs the server in watch mode and restarts on changes from workspace packages (including adapter packages). Use `pnpm dev:once` to run without file watching.
 
 `pnpm dev:once` auto-applies pending local migrations by default before starting the dev server.
@@ -1443,6 +1450,11 @@ paperclipai worktree init
 # or create the git worktree and initialize it in one step:
 npx paperclipai worktree:make paperclip-pr-432
 ```
+
+Whichever way the worktree was created, run `scripts/worktree-bootstrap.sh` in
+it before running tests: a plain `git worktree add` tree has no dependency
+install at all, and no tree gets the workspace packages' gitignored `dist/`
+output from `pnpm install` alone (NEXA-722).
 
 This command:
 

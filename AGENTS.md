@@ -86,6 +86,30 @@ rm -rf data/pglite
 pnpm dev
 ```
 
+### Fresh worktree or new checkout
+
+`pnpm install` links `node_modules` but does not build the workspace packages
+whose exports resolve into `dist/` (`@paperclipai/shared` and
+`@paperclipai/plugin-sdk`; every `dist/` is gitignored). A tree created with
+`git worktree add` therefore fails before any test runs, with a message that
+names the package's `package.json` and reads like a broken exports map:
+
+```
+Error: Failed to resolve entry for package "@paperclipai/plugin-sdk".
+The package may have incorrect main/module/exports specified in its package.json.
+```
+
+That is a missing build, not a bad export. Build it once with:
+
+```sh
+scripts/worktree-bootstrap.sh          # add --offline on a warm pnpm store
+```
+
+It installs dependencies when the tree has none and runs the same
+fingerprint-cached `ensure-build-deps` build that `pnpm test` already runs, so a
+second run takes about a second. Managed worktrees get the same step from
+`scripts/provision-worktree.sh`.
+
 ## 5. Core Engineering Rules
 
 1. Keep changes company-scoped.
