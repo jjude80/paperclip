@@ -61,6 +61,7 @@ jobs:
           if git diff --quiet -- pnpm-lock.yaml; then
             echo "Lockfile unchanged, nothing to do."
             echo "pr_url=" >> "$GITHUB_OUTPUT"
+            echo "head_sha=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -89,10 +90,31 @@ jobs:
             echo "PR already exists: $pr_url"
           fi
           echo "pr_url=$pr_url" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-      - name: Enable auto-merge for lockfile PR
+      # The fork's master has no required branch rules -- its ruleset only blocks
+      # deletion and non-fast-forward pushes -- so `gh pr merge --auto` fails with
+      # "Branch does not have required protected branch rules" and turns every
+      # lockfile refresh red. With nothing to wait for, auto-merge would have
+      # landed the PR immediately anyway, so merge directly instead. Pin the merge
+      # to the commit this job pushed: anyone with write access can push to
+      # chore/refresh-lockfile. See NEXA-874 (follow-up to NEXA-661).
+      - name: Merge lockfile PR
         if: steps.upsert-pr.outputs.pr_url != ''
         env:
           GH_TOKEN: ${{ github.token }}
+          PR_URL: ${{ steps.upsert-pr.outputs.pr_url }}
+          HEAD_SHA: ${{ steps.upsert-pr.outputs.head_sha }}
         run: |
-          gh pr merge --auto --squash --delete-branch "${{ steps.upsert-pr.outputs.pr_url }}"
+          # A PR created seconds ago reports mergeable=UNKNOWN until GitHub
+          # computes it, and merging in that window fails with "Pull request is
+          # not mergeable". Ask until it settles, then merge.
+          for attempt in 1 2 3 4 5 6; do
+            state="$(gh pr view "$PR_URL" --json mergeable --jq .mergeable)"
+            if [ "$state" = "MERGEABLE" ]; then
+              break
+            fi
+            echo "attempt $attempt: mergeable=$state"
+            sleep 5
+          done
+          gh pr merge "$PR_URL" --squash --delete-branch --match-head-commit "$HEAD_SHA"
