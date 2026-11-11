@@ -528,6 +528,13 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     });
     expect(first).not.toBeNull();
 
+    // Move the accepted wake outside the burst-coalescing window so this case
+    // still exercises the longer no-actionable-work repeat rule.
+    await db
+      .update(agentWakeupRequests)
+      .set({ requestedAt: new Date(Date.now() - 5 * 60 * 1000) })
+      .where(eq(agentWakeupRequests.agentId, agentId));
+
     const second = await heartbeat.wakeup(agentId, {
       ...requester,
       source: "on_demand",
@@ -605,7 +612,69 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     await heartbeat.waitForRunExecutionDrain(second!.id);
   });
 
-  it("still starts a repeated contentless wake once the agent has actionable work", async () => {
+  it("coalesces a repeated contentless wake within the burst window even when the agent has actionable work", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const requester = { requestedByActorType: "user" as const, requestedByActorId: "responsible-user" };
+    await db.insert(issues).values({
+      companyId,
+      title: "Work the agent has not started yet",
+      status: "todo" as const,
+      assigneeAgentId: agentId,
+    });
+
+    const first = await heartbeat.wakeup(agentId, {
+      ...requester,
+      source: "on_demand",
+      triggerDetail: "manual",
+    });
+    expect(first).not.toBeNull();
+
+    // Reproduces the reported burst: the same empty wake requested again
+    // seconds later while the agent already holds todo work.
+    const second = await heartbeat.wakeup(agentId, {
+      ...requester,
+      source: "on_demand",
+      triggerDetail: "manual",
+    });
+    expect(second).toBeNull();
+    const third = await heartbeat.wakeup(agentId, {
+      ...requester,
+      source: "on_demand",
+      triggerDetail: "manual",
+    });
+    expect(third).toBeNull();
+
+    const wakeups = await db
+      .select({
+        status: agentWakeupRequests.status,
+        reason: agentWakeupRequests.reason,
+        payload: agentWakeupRequests.payload,
+      })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .orderBy(agentWakeupRequests.requestedAt, agentWakeupRequests.createdAt);
+    expect(wakeups).toHaveLength(3);
+    expect(wakeups[0]?.status).not.toBe("skipped");
+    expect(wakeups.slice(1)).toEqual([
+      expect.objectContaining({
+        status: "skipped",
+        reason: "heartbeat.wakeup.duplicate_contentless",
+      }),
+      expect.objectContaining({
+        status: "skipped",
+        reason: "heartbeat.wakeup.duplicate_contentless",
+      }),
+    ]);
+    expect(wakeups[1]?.payload).toMatchObject({
+      heartbeatSkip: {
+        reason: expect.stringContaining("Coalesced a repeated contentless wake"),
+      },
+    });
+    expect(await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)).toHaveLength(1);
+    await heartbeat.waitForRunExecutionDrain(first!.id);
+  });
+
+  it("still starts a repeated contentless wake once the agent has actionable work outside the burst window", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent({
       heartbeatConfig: { maxConcurrentRuns: 2 },
     });
@@ -624,6 +693,10 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       status: "todo" as const,
       assigneeAgentId: agentId,
     });
+    await db
+      .update(agentWakeupRequests)
+      .set({ requestedAt: new Date(Date.now() - 5 * 60 * 1000) })
+      .where(eq(agentWakeupRequests.agentId, agentId));
 
     const second = await heartbeat.wakeup(agentId, {
       ...requester,

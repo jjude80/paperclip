@@ -245,6 +245,16 @@ export const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = [
 
 const TIMER_ACTIONABLE_ISSUE_STATUSES = ["todo", "in_progress"] as const;
 
+// One empty, unbound wake is often requested several times in the same burst:
+// retries, reconnects and rotation hand-offs arrive within seconds of each
+// other. Those copies carry no new admission signal, so coalesce them whether
+// or not the agent already has work. Without this, an agent holding a
+// todo/in_progress card admitted every copy and started a fresh session each
+// time; the longer repeat window below still requires no actionable work so a
+// busy agent keeps its periodic heartbeat.
+const CONTENTLESS_UNBOUND_WAKE_COALESCE_WINDOW_MS = 60 * 1000;
+const CONTENTLESS_UNBOUND_WAKE_REPEAT_WINDOW_MS = 60 * 60 * 1000;
+
 export class ChatControlRecoveryUnresolvedError extends Error {
   constructor() {
     super(
@@ -2833,21 +2843,37 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       const previousWasSameRequester =
         previous?.requestedByActorType === wakeRequesterType &&
         previous?.requestedByActorId === wakeRequesterId;
-      const repeatWindowMs = 60 * 60 * 1000;
+      const previousAgeMs =
+        previous?.requestedAt instanceof Date
+          ? Date.now() - previous.requestedAt.getTime()
+          : Number.POSITIVE_INFINITY;
       const previousIsRecent =
-        previous?.requestedAt instanceof Date &&
-        Date.now() - previous.requestedAt.getTime() < repeatWindowMs;
+        previousAgeMs < CONTENTLESS_UNBOUND_WAKE_REPEAT_WINDOW_MS;
+      const previousIsCoalescingBurst =
+        previousAgeMs < CONTENTLESS_UNBOUND_WAKE_COALESCE_WINDOW_MS;
       if (
         previousWasContentless &&
         previousWasSameRequester &&
-        previousIsRecent &&
-        !(await hasActionableTimerWork(agent))
+        previousIsRecent
       ) {
-        await writeSkippedHeartbeatRequest("heartbeat.wakeup.no_actionable_work", {
-          reason:
-            "Repeated a contentless wake from the same requester: no issue, comment, task, reason or payload, and no assigned todo or in_progress issue since the previous one.",
-        });
-        return null;
+        if (previousIsCoalescingBurst) {
+          await writeSkippedHeartbeatRequest(
+            "heartbeat.wakeup.duplicate_contentless",
+            {
+              reason:
+                "Coalesced a repeated contentless wake from the same requester into the wake already accepted moments earlier.",
+              coalesceWindowMs: CONTENTLESS_UNBOUND_WAKE_COALESCE_WINDOW_MS,
+            },
+          );
+          return null;
+        }
+        if (!(await hasActionableTimerWork(agent))) {
+          await writeSkippedHeartbeatRequest("heartbeat.wakeup.no_actionable_work", {
+            reason:
+              "Repeated a contentless wake from the same requester: no issue, comment, task, reason or payload, and no assigned todo or in_progress issue since the previous one.",
+          });
+          return null;
+        }
       }
     }
 
