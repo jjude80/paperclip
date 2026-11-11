@@ -779,6 +779,34 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     await request(client).post(`/api/issues/${seeded.issueId}/queued-comments/interrupt`).send(body).expect(409);
   });
 
+  it("cancels a saved comment interrupt instead of re-enqueueing it forever for a done task", async () => {
+    const seeded = await seedQueue();
+    await db.update(agents).set({ adapterType: "claude_local",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } },
+    }).where(eq(agents.id, seeded.agentId));
+    await db.update(heartbeatRuns).set({ runtimeMode: "legacy", status: "succeeded",
+      finishedAt: new Date("2026-08-22T15:03:00.000Z"),
+    }).where(eq(heartbeatRuns.id, seeded.runId));
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, seeded.wakeId));
+    await db.update(agentWakeupRequests).set({ payload: { ...wake.payload,
+      queuedCommentInterrupt: { actorId: "other-operator", requestedAt: new Date().toISOString() },
+    } }).where(eq(agentWakeupRequests.id, seeded.wakeId));
+    // The task completed before the saved interrupt could be delivered. The
+    // guard rejects every retry, so the retry receipt itself must become
+    // terminal instead of writing one skipped row per sweep.
+    await db.update(issues).set({ status: "done", executionRunId: null }).where(eq(issues.id, seeded.issueId));
+
+    await heartbeatService(db).resumeQueuedCommentInterrupt(seeded.companyId, seeded.wakeId);
+    await heartbeatService(db).resumeQueuedCommentInterrupt(seeded.companyId, seeded.wakeId);
+
+    const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, seeded.companyId));
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0]).toMatchObject({ id: seeded.wakeId, status: "cancelled", runId: null });
+    expect(wakes[0]!.error).toContain("cannot accept it");
+    expect(await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+      .where(eq(heartbeatRuns.companyId, seeded.companyId))).toHaveLength(1);
+  });
+
   it.each([
     ["other", "running"], ["other", "queued"], ["other", "scheduled_retry"],
     ["same", "running"], ["same", "queued"], ["same", "scheduled_retry"],

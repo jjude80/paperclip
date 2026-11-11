@@ -3243,6 +3243,43 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             // A deferred monitor retains its schedule; do not create a receipt
             // that could suppress its next admission attempt.
             if (issueStateGuard.monitorNextCheckAt !== undefined) return { kind: "skipped" as const };
+            // A retry re-admits the deferred receipt it came from. Settle that
+            // receipt instead of writing a new skipped row on every sweep: a
+            // terminal task can never accept the retry, and a non-terminal
+            // mismatch keeps the same receipt waiting for an actionable state.
+            if (executionWaitRequestId) {
+              const now = new Date();
+              if (["done", "cancelled"].includes(issue.status)) {
+                await tx.update(agentWakeupRequests).set({
+                  status: "cancelled",
+                  error: `Saved wake cancelled because the task is ${issue.status} and cannot accept it.`,
+                  finishedAt: now,
+                  updatedAt: now,
+                }).where(and(
+                  eq(agentWakeupRequests.id, executionWaitRequestId),
+                  eq(agentWakeupRequests.companyId, agent.companyId),
+                  eq(agentWakeupRequests.agentId, agentId),
+                  eq(agentWakeupRequests.status, "deferred_issue_execution"),
+                ));
+                return { kind: "skipped" as const };
+              }
+              await tx.update(agentWakeupRequests).set({
+                payload: sql`jsonb_set(coalesce(${agentWakeupRequests.payload}, '{}'::jsonb), '{executionWait}',
+                  coalesce(${agentWakeupRequests.payload}->'executionWait', '{}'::jsonb) || ${JSON.stringify({
+                    reason: "issue_state_guard_mismatch",
+                    message: "The task status or assignee changed before this saved wake could be delivered. It resumes when the task is actionable again.",
+                    actualStatus: issue.status,
+                    expectedStatuses: issueStateGuard.statuses,
+                  })}::jsonb)`,
+                updatedAt: now,
+              }).where(and(
+                eq(agentWakeupRequests.id, executionWaitRequestId),
+                eq(agentWakeupRequests.companyId, agent.companyId),
+                eq(agentWakeupRequests.agentId, agentId),
+                eq(agentWakeupRequests.status, "deferred_issue_execution"),
+              ));
+              return { kind: "skipped" as const };
+            }
             await tx.insert(agentWakeupRequests).values({
               ...durableReceiptFields,
               companyId: agent.companyId,
