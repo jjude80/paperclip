@@ -540,11 +540,163 @@ describe("worktree helpers", () => {
     expect(minimal.excludedTables).toContain("heartbeat_run_events");
     expect(minimal.excludedTables).toContain("workspace_runtime_services");
     expect(minimal.excludedTables).toContain("agent_task_sessions");
+    // A reservation is only meaningful next to the run it was held for, and
+    // its exclusive-source CHECK means nulling run_id is not an option.
+    expect(minimal.excludedTables).toContain("budget_reservations");
     expect(minimal.nullifyColumns.issues).toEqual(["checkout_run_id", "execution_run_id"]);
 
+    // `backup` is the unfiltered path: the agent-identity test passes no
+    // exclude list at all, so both `backup` and `full` must keep reservations.
     expect(full.excludedTables).toEqual(["agent_identity_keys"]);
+    expect(full.excludedTables).not.toContain("budget_reservations");
     expect(minimal.excludedTables).toContain("agent_identity_keys");
     expect(full.nullifyColumns).toEqual({});
+  });
+
+  // Retained -> excluded foreign-key edges that have been reviewed and are
+  // tracked separately (NEXA-961; the remaining edges are NEXA-964). Each entry
+  // is a table the minimal seed keeps whose non-nullified rows can reference a
+  // table the seed drops. The backup
+  // writer now omits those unverifiable constraints instead of aborting the
+  // restore, so they are not failures -- but each one is a constraint a seeded
+  // database silently loses, and that needs an explicit decision. This is an
+  // audited baseline, not the source of truth: the test re-reads the edges from
+  // pg_constraint, so a migration that adds one more edge fails here and gets
+  // reviewed instead of disappearing from every seed. Nullified columns
+  // (issues' run ids) are not gaps and are filtered out before comparison.
+  const REVIEWED_MINIMAL_SEED_FK_GAPS = new Set([
+    "agent_commentary.agent_commentary_run_id_heartbeat_runs_id_fk",
+    "agent_instruction_working_copies.agent_instruction_working_copies_run_id_heartbeat_runs_id_fk",
+    "agent_session_goal_actions.agent_session_goal_actions_session_id_agent_task_sessions_id_fk",
+    "billing_invoice_lines.billing_invoice_lines_cost_event_id_cost_events_id_fk",
+    "browser_use_runs.browser_use_runs_heartbeat_run_id_heartbeat_runs_id_fk",
+    "chat_completion_deliveries.chat_completion_deliveries_target_run_id_heartbeat_runs_id_fk",
+    "chat_github_reviews.chat_github_reviews_run_id_heartbeat_runs_id_fk",
+    "company_secret_proposals.company_secret_proposals_origin_run_id_heartbeat_runs_id_fk",
+    "connection_token_issuances.connection_token_issuances_run_id_heartbeat_runs_id_fk",
+    "cost_adjustments.cost_adjustments_cost_event_id_cost_events_id_fk",
+    "decision_bundles.decision_bundles_origin_run_id_heartbeat_runs_id_fk",
+    "decision_effect_executions.decision_effect_executions_activity_log_id_activity_log_id_fk",
+    "decision_invocations.decision_invocations_cost_event_id_cost_events_id_fk",
+    "decision_queue_items.decision_queue_items_added_by_run_id_heartbeat_runs_id_fk",
+    "decision_queues.decision_queues_created_by_run_id_heartbeat_runs_id_fk",
+    "decision_retention.decision_retention_archived_by_run_id_heartbeat_runs_id_fk",
+    "decision_triage_events.decision_triage_events_actor_run_id_heartbeat_runs_id_fk",
+    "decision_triage.decision_triage_set_by_run_id_heartbeat_runs_id_fk",
+    "decisions.decisions_origin_run_id_heartbeat_runs_id_fk",
+    "document_annotation_comments.document_annotation_comments_created_by_run_id_heartbeat_runs_i",
+    "document_revisions.document_revisions_created_by_run_id_heartbeat_runs_id_fk",
+    "dot_runner_assignments.dot_runner_assignments_run_id_heartbeat_runs_id_fk",
+    "environment_leases.environment_leases_heartbeat_run_id_heartbeat_runs_id_fk",
+    "execution_workspace_runtime_leases.execution_workspace_runtime_leases_owner_run_id_heartbeat_runs_",
+    "fast_response_requests.fast_response_requests_cost_event_id_cost_events_id_fk",
+    "finance_events.finance_events_cost_event_id_cost_events_id_fk",
+    "finance_events.finance_events_heartbeat_run_id_heartbeat_runs_id_fk",
+    "heartbeat_run_watchdog_decisions.heartbeat_run_watchdog_decisions_created_by_run_id_heartbeat_ru",
+    "heartbeat_run_watchdog_decisions.heartbeat_run_watchdog_decisions_run_id_heartbeat_runs_id_fk",
+    "issue_attachments.issue_attachments_originating_run_id_heartbeat_runs_id_fk",
+    "issue_comments.issue_comments_created_by_run_id_heartbeat_runs_id_fk",
+    "issue_comments.issue_comments_deleted_by_run_id_heartbeat_runs_id_fk",
+    "issue_comments.issue_comments_derived_created_by_run_id_heartbeat_runs_id_fk",
+    "issue_execution_decisions.issue_execution_decisions_created_by_run_id_heartbeat_runs_id_f",
+    "issue_inbox_archives.issue_inbox_archives_archived_by_run_id_heartbeat_runs_id_fk",
+    "issue_plan_decompositions.issue_plan_decompositions_owner_run_id_heartbeat_runs_id_fk",
+    "issue_question_response_deliveries.issue_question_response_deliveries_source_run_id_heartbeat_runs",
+    "issue_question_response_deliveries.issue_question_response_deliveries_target_run_id_heartbeat_runs",
+    "issue_thread_interactions.issue_thread_interactions_resolved_by_run_id_heartbeat_runs_id_",
+    "issue_thread_interactions.issue_thread_interactions_source_run_id_heartbeat_runs_id_fk",
+    "issue_tree_hold_members.issue_tree_hold_members_active_run_id_heartbeat_runs_id_fk",
+    "issue_tree_holds.issue_tree_holds_created_by_run_id_heartbeat_runs_id_fk",
+    "issue_tree_holds.issue_tree_holds_released_by_run_id_heartbeat_runs_id_fk",
+    "issue_watchdogs.issue_watchdogs_created_by_run_id_heartbeat_runs_id_fk",
+    "issue_watchdogs.issue_watchdogs_updated_by_run_id_heartbeat_runs_id_fk",
+    "issue_work_products.issue_work_products_created_by_run_id_heartbeat_runs_id_fk",
+    "issue_work_products.issue_work_products_runtime_service_id_workspace_runtime_servic",
+    "muse_runner_assignments.muse_runner_assignments_run_id_heartbeat_runs_id_fk",
+    "native_run_finalizations.native_run_finalizations_run_id_heartbeat_runs_id_fk",
+    "native_run_finalizations.native_run_finalizations_run_owner_fk",
+    "native_run_results.native_run_results_run_contract_owner_fk",
+    "native_run_results.native_run_results_run_id_heartbeat_runs_id_fk",
+    "prompt_injection_invocations.prompt_injection_invocations_cost_event_id_cost_events_id_fk",
+    "provider_trace_records.provider_trace_records_run_id_heartbeat_runs_id_fk",
+    "routine_revisions.routine_revisions_created_by_run_id_heartbeat_runs_id_fk",
+    "run_usage_receipts.run_usage_receipts_run_id_heartbeat_runs_id_fk",
+    "runner_api_response_reservations.runner_api_response_reservations_run_id_heartbeat_runs_id_fk",
+    "secret_access_events.secret_access_events_heartbeat_run_id_heartbeat_runs_id_fk",
+    "status_card_updates.status_card_updates_run_id_heartbeat_runs_id_fk",
+    "tool_call_events.tool_call_events_run_id_heartbeat_runs_id_fk",
+    "tool_gateway_sessions.tool_gateway_sessions_run_id_heartbeat_runs_id_fk",
+    "tool_invocations.tool_invocations_run_id_heartbeat_runs_id_fk",
+    "work_assessments.work_assessments_run_id_heartbeat_runs_id_fk",
+    "work_assessments.work_assessments_run_owner_fk",
+    "workspace_operations.workspace_operations_heartbeat_run_id_heartbeat_runs_id_fk",
+  ]);
+
+  itEmbeddedPostgres("minimal seed plan never adds an unaudited FK into an excluded table", async () => {
+    const tempDb = await startEmbeddedPostgresTestDatabase("paperclip-worktree-minimal-fk-audit-");
+    onTestFinished(() => tempDb.cleanup());
+    const db = createDb(tempDb.connectionString);
+    try {
+      // Read the edges from the migrated schema, not from a list that would
+      // drift on the next migration.
+      const edges = await db.$client.unsafe<Array<{
+        source_table: string;
+        target_table: string;
+        constraint_name: string;
+        source_columns: string[];
+      }>>(`
+        SELECT
+          src.relname AS source_table,
+          tgt.relname AS target_table,
+          c.conname AS constraint_name,
+          array_agg(sa.attname ORDER BY key_columns.ordinality) AS source_columns
+        FROM pg_constraint c
+        JOIN pg_class src ON src.oid = c.conrelid
+        JOIN pg_namespace srcn ON srcn.oid = src.relnamespace
+        JOIN pg_class tgt ON tgt.oid = c.confrelid
+        JOIN pg_namespace tgtn ON tgtn.oid = tgt.relnamespace
+        JOIN LATERAL unnest(c.conkey) WITH ORDINALITY AS key_columns(attnum, ordinality) ON true
+        JOIN pg_attribute sa ON sa.attrelid = src.oid AND sa.attnum = key_columns.attnum
+        WHERE c.contype = 'f'
+          AND srcn.nspname = 'public'
+          AND tgtn.nspname = 'public'
+        GROUP BY src.relname, tgt.relname, c.conname
+        ORDER BY src.relname, c.conname
+      `);
+
+      const plan = resolveWorktreeSeedPlan("minimal");
+      const excluded = new Set(plan.excludedTables);
+      const nullified = new Map(
+        Object.entries(plan.nullifyColumns).map(([table, columns]) => [table, new Set(columns)] as const),
+      );
+      const offending = edges
+        .filter((edge) => !excluded.has(edge.source_table) && excluded.has(edge.target_table))
+        .filter((edge) => {
+          const columns = nullified.get(edge.source_table);
+          return columns === undefined || !edge.source_columns.every((column) => columns.has(column));
+        })
+        .map((edge) => `${edge.source_table}.${edge.constraint_name}`)
+        .sort();
+
+      // The row this card exists for: a reservation is only meaningful beside
+      // its run, so the whole table is dropped rather than orphaning run_id.
+      expect(offending).not.toContain(
+        "budget_reservations.budget_reservations_run_id_heartbeat_runs_id_fk",
+      );
+
+      const unaudited = offending.filter((edge) => !REVIEWED_MINIMAL_SEED_FK_GAPS.has(edge));
+      expect(
+        unaudited,
+        `unaudited retained -> excluded FK edges:\n${unaudited.join("\n")}\n\nall retained -> excluded edges:\n${offending.join("\n")}`,
+      ).toEqual([]);
+
+      const stale = [...REVIEWED_MINIMAL_SEED_FK_GAPS]
+        .filter((edge) => !offending.includes(edge))
+        .sort();
+      expect(stale, "reviewed gaps that no longer exist; remove them from the baseline").toEqual([]);
+    } finally {
+      await closeRegisteredClients(tempDb.connectionString);
+    }
   });
 
   it("requires the seed process to own the target embedded Postgres lifecycle", async () => {

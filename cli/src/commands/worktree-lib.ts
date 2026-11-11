@@ -64,6 +64,7 @@ const MINIMAL_WORKTREE_EXCLUDED_TABLES = [
   "agent_runtime_state",
   "agent_task_sessions",
   "agent_wakeup_requests",
+  "budget_reservations",
   "cost_events",
   "heartbeat_run_events",
   "heartbeat_runs",
