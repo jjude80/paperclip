@@ -16098,6 +16098,11 @@ export function issueRoutes(
   );
 
   router.delete("/issues/:id", async (req, res) => {
+    // svc.remove is a hard DELETE: no soft delete, no tombstone, no undo. An
+    // agent mutation grant covers editing an issue, not destroying the row
+    // (and the audit trail that pointed at it), so the destructive path stays
+    // board-only. Agents keep every non-destructive mutation. NEXA-984.
+    assertBoard(req);
     const id = req.params.id as string;
     const existing = await getAccessibleResource(
       req,
@@ -16137,6 +16142,16 @@ export function issueRoutes(
       action: "issue.deleted",
       entityType: "issue",
       entityId: issue.id,
+      // The issues row is gone by the time anyone reads this event, so the
+      // record has to be renderable on its own. Actor, run id and company are
+      // already columns on the activity row; identifier and title are
+      // snapshotted here instead of being joined later. NEXA-984.
+      details: {
+        identifier: issue.identifier,
+        title: issue.title,
+        status: issue.status,
+        projectId: issue.projectId,
+      },
     });
 
     await queueTaskWatchdogEvaluation(existing, actor.runId);

@@ -288,6 +288,7 @@ describe("activity routes", () => {
       limit: 100,
       readCondition: expect.anything(),
       caseReadCondition,
+      includeDeletedIssueEvents: true,
     });
   });
 
@@ -308,6 +309,7 @@ describe("activity routes", () => {
       limit: 500,
       readCondition: expect.anything(),
       caseReadCondition,
+      includeDeletedIssueEvents: true,
     });
   });
 

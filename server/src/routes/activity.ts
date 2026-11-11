@@ -239,6 +239,9 @@ export function activityRoutes(db: Db) {
       limit: normalizeActivityLimit(Number(req.query.limit)),
       readCondition: await issueReadSqlCondition(db, req.actor),
       caseReadCondition: await caseActivityReadSqlCondition(db, req.actor),
+      // A deleted issue's own deletion record must remain readable to the board;
+      // agents get no exemption, so this widens nothing for them. NEXA-984.
+      includeDeletedIssueEvents: req.actor.type === "board",
     };
     const result = await svc.list(filters);
     res.json(result);
