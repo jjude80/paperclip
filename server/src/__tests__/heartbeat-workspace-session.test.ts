@@ -1531,6 +1531,33 @@ describe("mergeExecutionWorkspaceMetadataForPersistence", () => {
       },
     });
   });
+
+  it("records the base commit date and integration-line behind count (NEXA-942)", () => {
+    expect(mergeExecutionWorkspaceMetadataForPersistence({
+      existingMetadata: null,
+      source: "task_session",
+      createdByRuntime: true,
+      strategyType: "git_worktree",
+      configSnapshot: null,
+      shouldReuseExisting: false,
+      baseRef: "origin/NEXA-553-feature-chain",
+      baseRefSha: "ad4643562f5ecd22100f5e03c28ed3558c958b06",
+      baseRefCommitDate: "2026-10-24T09:39:34-04:00",
+      behindOriginMain: 184,
+      originMainRef: "origin/main",
+    })).toEqual({
+      source: "task_session",
+      createdByRuntime: true,
+      gitBranchOwnershipVersion: 1,
+      baseRefSnapshot: {
+        baseRef: "origin/NEXA-553-feature-chain",
+        resolvedSha: "ad4643562f5ecd22100f5e03c28ed3558c958b06",
+        baseCommitDate: "2026-10-24T09:39:34-04:00",
+        behindOriginMain: 184,
+        originMainRef: "origin/main",
+      },
+    });
+  });
 });
 
 type WorkspaceConfigMetadata = ReturnType<typeof buildEffectiveRunWorkspaceConfigMetadata>;

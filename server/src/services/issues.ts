@@ -10234,6 +10234,11 @@ export function issueService(db: Db) {
                   sourceWorkspaceBranchIsTransient: isRuntimeOwnedGitBranch(
                     sourceWorkspace.metadata as Record<string, unknown> | null,
                   ),
+                  sourceIssueDeclaresIntegrationBranch:
+                    parseObject(
+                      workspaceSource.executionWorkspaceSettings as
+                        Record<string, unknown> | null,
+                    ).integrationBranch === true,
                   bindSourceWorkspace: inheritance.bindSourceWorkspace,
                 });
               }

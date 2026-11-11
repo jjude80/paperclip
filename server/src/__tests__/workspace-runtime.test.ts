@@ -1149,6 +1149,28 @@ describe("realizeExecutionWorkspace", () => {
     expect(await readGit(workspace.cwd, ["rev-parse", "HEAD"])).toBe(originHead);
   });
 
+  it("records the base commit date and warns with a numeric behind count for a stale base (NEXA-942)", async () => {
+    const { sourceRepo, remotePath, repoRoot } = await createClonedRepoWithRemote();
+    const staleBaseSha = await pushRemoteOnlyBranch(
+      sourceRepo,
+      remotePath,
+      "feature/stale-base",
+      "stale-base.txt",
+    );
+    const integrationHead = await advanceRemoteMaster(sourceRepo, remotePath, "after-stale-base.txt");
+    expect(integrationHead).not.toBe(staleBaseSha);
+
+    const workspace = await realizeWorktreeForTest(repoRoot, "origin/feature/stale-base");
+
+    expect(workspace.baseRefSha).toBe(staleBaseSha);
+    expect(workspace.baseRefCommitDate).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    expect(workspace.behindOriginMain).toBe(1);
+    expect(workspace.originMainRef).toBe("origin/master");
+    expect(workspace.warnings).toHaveLength(1);
+    expect(workspace.warnings[0]).toContain("is 1 commit behind origin/master as of");
+    expect(workspace.warnings[0]).toContain("Refresh or rebase");
+  });
+
   it("maps a configured local branch base ref to origin/<branch> for fresh worktrees", async () => {
     const { repoRoot } = await createClonedRepoWithRemote();
     const originHead = await readGit(repoRoot, ["rev-parse", "origin/master"]);

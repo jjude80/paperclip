@@ -189,6 +189,13 @@ export interface ProjectExecutionWorkspacePolicy {
 export interface IssueExecutionWorkspaceSettings {
   mode?: ExecutionWorkspaceMode;
   sharedWorkspaceConcurrency?: SharedWorkspaceConcurrency;
+  /**
+   * Explicit marker that this issue's workspace branch is a long-lived
+   * integration branch. Only a child whose parent carries this marker may
+   * inherit the parent's branch as its base ref (NEXA-942). A branch merely
+   * still existing on origin is not enough.
+   */
+  integrationBranch?: boolean;
   environmentId?: string | null;
   workspaceStrategy?: ExecutionWorkspaceStrategy | null;
   workspaceRuntime?: Record<string, unknown> | null;
