@@ -2320,6 +2320,7 @@ async function startRuntime(input: {
     authHeader,
     bridge.secret,
     assignedMcp?.token,
+    input.options.environment?.PAPERCLIP_API_KEY,
     input.options.environment?.OPENROUTER_API_KEY,
     input.options.environment?.PAPERCLIP_AI_PROVIDER_KEY,
   ].filter((value): value is string => Boolean(value));
@@ -2926,6 +2927,10 @@ function sanitizedEnvironment(
 ): NodeJS.ProcessEnv {
   const allowed = [
     "PAPERCLIP_AGENT_KEY_ID", "PAPERCLIP_AGENT_PUBLIC_KEY", "PAPERCLIP_AGENT_PRIVATE_KEY",
+    // Run-scoped board identity. The provider shell runs in this process, so
+    // these must name the current heartbeat run rather than a previous one.
+    "PAPERCLIP_API_KEY", "PAPERCLIP_API_URL", "PAPERCLIP_AGENT_ID",
+    "PAPERCLIP_COMPANY_ID", "PAPERCLIP_RUN_ID", "PAPERCLIP_TASK_ID",
     "PATH",
     "LANG",
     "LC_ALL",
@@ -2948,6 +2953,8 @@ function sanitizedEnvironment(
 
 function sanitizedEnvironmentKeys(): string[] {
   return [
+    "PAPERCLIP_API_KEY", "PAPERCLIP_API_URL", "PAPERCLIP_AGENT_ID",
+    "PAPERCLIP_COMPANY_ID", "PAPERCLIP_RUN_ID", "PAPERCLIP_TASK_ID",
     "PATH",
     "LANG",
     "LC_ALL",

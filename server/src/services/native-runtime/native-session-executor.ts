@@ -208,6 +208,7 @@ import {
   type NativeRunSpanScope,
   type NativeRunTrace,
 } from "./native-run-trace.js";
+import { nativeRunIdentityEnvironmentDigest } from "./native-run-identity.js";
 import { createNativeHarnessBackupStamp } from "./native-harness-backup-stamp.js";
 import { noteNativeRunnerEvidence } from "./native-runner-evidence-signal.js";
 import { removeNativeHarnessBackup } from "./native-harness-backup-cleanup.js";
@@ -533,6 +534,9 @@ type WarmNativeSession = {
   pluginTaskId?: string;
   observabilityCompatibilityKey?: string;
   runId: string;
+  /** Identity the provider process actually launched with. Never overwritten
+   * on reuse: a changed digest requires a replacement process. */
+  runIdentityDigest: string;
   instructionWorkingCopy?: NativeInstructionWorkingCopy;
   // Keep the admitted physical root independent of the per-run collection
   // capability, which instruction preparation adopts before final admission.
@@ -8811,6 +8815,13 @@ async function executePaperclipNativeSessionWithinScope(
   const configuredEnvironmentDigest = createHash("sha256")
     .update(JSON.stringify(configuredEnvironment(input.runnerEnvironment)))
     .digest("hex");
+  // Run-scoped identity cannot be rebound inside a running provider process.
+  // Rotate the provider when this run's identity differs from the one the
+  // process launched with, so a resumed conversation never writes as the
+  // previous (possibly terminal) run.
+  const runIdentityDigest = nativeRunIdentityEnvironmentDigest(
+    input.runnerEnvironment,
+  );
   const warmSessionOwnerToken = Symbol(
     `native-warm-session:${input.execution.binding.runId}`,
   );
@@ -8848,6 +8859,7 @@ async function executePaperclipNativeSessionWithinScope(
         entry.configDigest !== warmConfigDigest ||
         entry.observabilityCompatibilityKey !== input.observability?.compatibilityKey ||
         entry.configuredEnvironmentDigest !== configuredEnvironmentDigest ||
+        entry.runIdentityDigest !== runIdentityDigest ||
         entry.instructionRoot !== input.instructionWorkingCopy?.root ||
         entry.managedAiCredentialIdentity !== input.managedAiCredentialIdentity ||
         credentialRunChanged ||
@@ -9312,6 +9324,7 @@ async function executePaperclipNativeSessionWithinScope(
                     configDigest: warmConfigDigest,
                     observabilityCompatibilityKey: input.observability?.compatibilityKey,
                     configuredEnvironmentDigest,
+                    runIdentityDigest,
                     ownerScope: nativeSessionOwnerScope(
                       input.execution, input.runnerExecutionTarget?.environmentId ?? null,
                     ),

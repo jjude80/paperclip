@@ -6989,6 +6989,62 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
     });
   });
 
+  it("lets the interrupted run reconcile a wake that left its issue parked blocked", async () => {
+    const seeded = await seedOwnershipIssue({ checkoutStatus: "failed", actorRunStatus: "succeeded" });
+    await db.update(heartbeatRuns).set({
+      status: "interrupted",
+      issueId: seeded.issueId,
+    }).where(eq(heartbeatRuns.id, seeded.actorRunId));
+    await db.update(issues).set({
+      status: "blocked",
+      checkoutRunId: null,
+      executionRunId: null,
+      executionLockedAt: null,
+      executionAgentNameKey: null,
+    }).where(eq(issues.id, seeded.issueId));
+
+    const ownership = await svc.assertCheckoutOwner(
+      seeded.issueId,
+      seeded.actorAgentId,
+      seeded.actorRunId,
+    );
+    expect(ownership).toMatchObject({
+      id: seeded.issueId,
+      status: "blocked",
+      adoptedFromRunId: null,
+    });
+  });
+
+  it("does not let an interrupted run bypass a newer live run on the same issue", async () => {
+    const seeded = await seedOwnershipIssue({ checkoutStatus: "failed", actorRunStatus: "succeeded" });
+    await db.update(heartbeatRuns).set({
+      status: "interrupted",
+      issueId: seeded.issueId,
+    }).where(eq(heartbeatRuns.id, seeded.actorRunId));
+    await db.update(issues).set({
+      status: "blocked",
+      checkoutRunId: null,
+      executionRunId: null,
+      executionLockedAt: null,
+      executionAgentNameKey: null,
+    }).where(eq(issues.id, seeded.issueId));
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId: (await svc.getById(seeded.issueId))!.companyId,
+      agentId: seeded.actorAgentId,
+      issueId: seeded.issueId,
+      status: "running",
+      invocationSource: "automation",
+      startedAt: new Date(),
+    });
+
+    await expect(svc.assertCheckoutOwner(
+      seeded.issueId,
+      seeded.actorAgentId,
+      seeded.actorRunId,
+    )).rejects.toMatchObject({ status: 409 });
+  });
+
 });
 
 describeEmbeddedPostgres("issueService.addComment createdByRunId", () => {

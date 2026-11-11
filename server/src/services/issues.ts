@@ -12105,6 +12105,7 @@ export function issueService(db: Db) {
         db
           .select({
             id: issues.id,
+            companyId: issues.companyId,
             status: issues.status,
             assigneeAgentId: issues.assigneeAgentId,
             checkoutRunId: issues.checkoutRunId,
@@ -12116,6 +12117,47 @@ export function issueService(db: Db) {
       const current = await loadCurrent();
 
       if (!current) throw notFound("Issue not found");
+
+      // A wake can outlive the run that claimed it. When that run is an
+      // interrupted run and the issue is parked with no live execution, the
+      // resumed conversation still has to land the disposition its wake
+      // contract requires. This is reconciliation of an already-claimed wake,
+      // not authority to start new work: only the interrupted run that owned
+      // this issue, with no newer run behind it, may reconcile the parked row.
+      if (
+        actorRunId &&
+        current.status === "blocked" &&
+        current.assigneeAgentId === actorAgentId &&
+        !current.checkoutRunId &&
+        !current.executionRunId
+      ) {
+        const actorRun = await db
+          .select({ status: heartbeatRuns.status, issueId: heartbeatRuns.issueId, agentId: heartbeatRuns.agentId })
+          .from(heartbeatRuns)
+          .where(and(eq(heartbeatRuns.id, actorRunId), eq(heartbeatRuns.companyId, current.companyId)))
+          .then((rows) => rows[0] ?? null);
+        if (
+          actorRun?.status === "interrupted" &&
+          actorRun.issueId === id &&
+          actorRun.agentId === actorAgentId
+        ) {
+          const newerLiveRun = await db
+            .select({ id: heartbeatRuns.id })
+            .from(heartbeatRuns)
+            .where(and(
+              eq(heartbeatRuns.companyId, current.companyId),
+              eq(heartbeatRuns.issueId, id),
+              eq(heartbeatRuns.agentId, actorAgentId),
+              notInArray(heartbeatRuns.status, [...TERMINAL_HEARTBEAT_RUN_STATUSES]),
+              ne(heartbeatRuns.id, actorRunId),
+            ))
+            .limit(1)
+            .then((rows) => rows[0] ?? null);
+          if (!newerLiveRun) {
+            return { ...current, adoptedFromRunId: null as string | null };
+          }
+        }
+      }
 
       const resolveSameRunOwnership = (candidate: {
         id: string;

@@ -767,7 +767,12 @@ describe("OpenCodeServerDriver", () => {
       environment: {
         PATH: process.env.PATH,
         OPENROUTER_API_KEY: "test-openrouter-key",
-        PAPERCLIP_API_KEY: "must-not-leak",
+        PAPERCLIP_API_KEY: "run-scoped-test-key",
+        PAPERCLIP_API_URL: "http://127.0.0.1:3100",
+        PAPERCLIP_AGENT_ID: "agent-run-scope",
+        PAPERCLIP_COMPANY_ID: "company-run-scope",
+        PAPERCLIP_RUN_ID: "run-1",
+        PAPERCLIP_TASK_ID: "issue-run-scope",
         UNRELATED_SECRET: "must-not-leak",
         PAPERCLIP_PROVIDER_TRACE_PATH: tracePath,
         PAPERCLIP_PROVIDER_TRACE_MAX_BYTES: String(64 * 1024 * 1024),
@@ -911,7 +916,18 @@ describe("OpenCodeServerDriver", () => {
       ),
     );
     expect(environment.keys).toContain("OPENROUTER_API_KEY");
-    expect(environment.keys).not.toContain("PAPERCLIP_API_KEY");
+    // A service-hosted provider's shell needs the current run identity. The
+    // server supplies a short-lived run-scoped token, never a board key.
+    expect(environment.keys).toEqual(
+      expect.arrayContaining([
+        "PAPERCLIP_API_KEY",
+        "PAPERCLIP_API_URL",
+        "PAPERCLIP_AGENT_ID",
+        "PAPERCLIP_COMPANY_ID",
+        "PAPERCLIP_RUN_ID",
+        "PAPERCLIP_TASK_ID",
+      ]),
+    );
     expect(environment.keys).not.toContain("UNRELATED_SECRET");
     expect(environment.keys).not.toContain("PAPERCLIP_PROVIDER_TRACE_PATH");
     expect(environment.projectConfigDisabled).toBe("true");

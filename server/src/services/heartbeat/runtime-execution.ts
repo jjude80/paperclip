@@ -60,6 +60,7 @@ import {
   buildNativeHeartbeatPreparationSpans,
   buildNativeWakeIngressSpan,
 } from "../native-runtime/native-run-trace.js";
+import { buildNativeRunIdentityEnvironment } from "../native-runtime/native-run-identity.js";
 import { PROVIDER_TRACE_MAX_BYTES } from "../provider-trace-store.js";
 import type { AdapterExecutionResult } from "../../adapters/index.js";
 import { createLocalAgentJwt } from "../../agent-auth-jwt.js";
@@ -246,6 +247,22 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
     issueRef?.workMode === "skill_test"
       ? { kind: "skill_test" as const, issueId: issueRef.id }
       : { kind: "standard" as const };
+  // A service-hosted native provider keeps its launch environment for the
+  // whole provider session. Mint a short-lived, run-scoped local agent JWT so
+  // a resumed conversation has the credential of the run it is serving, never
+  // the terminal run that originally started the process. This is never a
+  // long-lived board key and it is not read from the service environment.
+  const nativeRunAuthToken =
+    nativeRuntimeResolution.kind !== "legacy"
+      ? createLocalAgentJwt(
+          agent.id,
+          agent.companyId,
+          agent.adapterType,
+          run.id,
+          run.responsibleUserId,
+          localAgentJwtScope,
+        )
+      : null;
   const authToken =
     nativeRuntimeResolution.kind === "legacy" &&
     adapter.supportsLocalAgentJwt
@@ -651,6 +668,14 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
                   executionWorkspace.cwd,
                 ),
                 ...buildAgentIdentityEnv(agentIdentity),
+                ...buildNativeRunIdentityEnvironment({
+                  apiKey: nativeRunAuthToken,
+                  apiUrl: configuredPaperclipApiBaseUrl(),
+                  agentId: agent.id,
+                  companyId: agent.companyId,
+                  runId: run.id,
+                  taskId: issueRef?.id ?? null,
+                }),
                 ...(input.instructions.instructionCopy && isAgentDirectoryCopy(input.instructions.instructionCopy) ? { AGENT_HOME: input.instructions.instructionCopy.executionRoot } : {}),
                 ...(nativeMcpServer
                   ? {
