@@ -4,7 +4,11 @@ import { adapterAuthSessions, heartbeatRuns, issueRecoveryActions, nativeRunFina
 import type { createDeliveryWorkCoordinator } from "./delivery-work-coordinator.js";
 import { type DeliveryQueue } from "./delivery-work-notifications.js";
 import { EXECUTION_RECONCILIATION_INTERVAL_MS } from "./execution-control-deadline.js";
-import { obsoleteExecutionConversationHold, unresolvedExecutionDispositions } from "./execution-recovery-resolution.js";
+import {
+  legacyLeaseLostExecutionHolds,
+  obsoleteExecutionConversationHold,
+  unresolvedExecutionDispositions,
+} from "./execution-recovery-resolution.js";
 import { nativeReplacementPending } from "./native-runtime/native-safe-replacement.js";
 
 export function registerExecutionControlWork(
@@ -81,7 +85,8 @@ export function executionControlSchedule(db: Db) {
         eq(issueRecoveryActions.status, "resolved"),
         sql`${issueRecoveryActions.evidence}->>'continuationDelivery' = 'pending'`,
       )).limit(1);
-      return rows.length ? retry() : null;
+      const legacyRelease = rows.length ? [] : await legacyLeaseLostExecutionHolds(db, 1);
+      return rows.length || legacyRelease.length ? retry() : null;
     },
     async status() {
       const rows = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)

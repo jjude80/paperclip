@@ -438,6 +438,66 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
   );
 
   it(
+    "does not restore a foreign key whose referenced table's data was excluded",
+    async () => {
+      const sourceConnectionString = await createTempDatabase();
+      const restoreConnectionString = await createSiblingDatabase(
+        sourceConnectionString,
+        "paperclip_excluded_parent_fk_restore_target",
+      );
+      const backupDir = createTempDir("paperclip-db-excluded-parent-fk-backup-");
+      const sourceSql = postgres(sourceConnectionString, { max: 1, onnotice: () => {} });
+      const restoreSql = postgres(restoreConnectionString, { max: 1, onnotice: () => {} });
+
+      try {
+        await sourceSql.unsafe(`
+          CREATE TABLE "public"."backup_excluded_parent" (
+            "id" uuid PRIMARY KEY
+          );
+          CREATE TABLE "public"."backup_child_rows" (
+            "id" serial PRIMARY KEY,
+            "parent_id" uuid NOT NULL REFERENCES "public"."backup_excluded_parent"("id") ON DELETE CASCADE
+          );
+          INSERT INTO "public"."backup_excluded_parent" ("id")
+          VALUES ('22222222-2222-4222-8222-222222222222');
+          INSERT INTO "public"."backup_child_rows" ("parent_id")
+          VALUES ('22222222-2222-4222-8222-222222222222');
+        `);
+
+        const result = await runDatabaseBackup({
+          connectionString: sourceConnectionString,
+          backupDir,
+          retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+          filenamePrefix: "paperclip-excluded-parent-fk-test",
+          backupEngine: "javascript",
+          excludeTables: ["backup_excluded_parent"],
+        });
+
+        await runDatabaseRestore({
+          connectionString: restoreConnectionString,
+          backupFile: result.backupFile,
+        });
+
+        // The child row survives even though its parent's data was excluded;
+        // the unverifiable constraint is intentionally absent.
+        const childRows = await restoreSql.unsafe<{ count: number }[]>(`
+          SELECT count(*)::int AS count FROM "public"."backup_child_rows"
+        `);
+        expect(childRows[0]?.count).toBe(1);
+        const constraints = await restoreSql.unsafe<{ count: number }[]>(`
+          SELECT count(*)::int AS count FROM pg_constraint
+          WHERE conname = 'backup_child_rows_parent_id_backup_excluded_parent_id_fk'
+        `);
+        expect(constraints[0]?.count).toBe(0);
+      } finally {
+        await sourceSql.end();
+        await restoreSql.end();
+      }
+    },
+    60_000,
+  );
+
+  it(
     "preserves composite foreign key column order without duplicate referenced columns",
     async () => {
       const sourceConnectionString = await createTempDatabase();
