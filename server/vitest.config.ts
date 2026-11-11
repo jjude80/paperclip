@@ -31,15 +31,31 @@ export default defineConfig({
     // mirrors it for the same reason.
     hookTimeout: 30000,
     teardownTimeout: 30000,
+    // Two separate costs have to fit inside one per-test budget.
+    //
     // The route/authz suites import very large modules (for example
     // src/routes/issues.ts and its dependency graph). The first test in each
-    // file pays the one-time transform cost inside its own timeout budget. On
-    // the loaded serial shard (maxWorkers=1) that cost can cross vitest's
-    // default 5s testTimeout and fail the first test, which also lets its
-    // fire-and-forget wake leak into the next test. Give each test generous
-    // headroom; 15s is far above the observed module-load cost yet still
-    // catches a genuinely hung test well inside the 20 minute job limit.
-    testTimeout: 15000,
+    // file pays the one-time transform cost inside its own timeout budget, and
+    // on the loaded serial shard (maxWorkers=1) that cost crossed vitest's
+    // default 5s, which is why this budget exists at all.
+    //
+    // The git/filesystem suites then spend the budget on real work rather than
+    // module load. A single case in nested-clone-migration.test.ts builds two
+    // bare repositories, wires an isolated workspace, runs the migration, the
+    // expiration, the restore-point round trip and a reopen -- dozens of `git`
+    // subprocesses and fsyncs. Measured here on an idle-ish 12-core host, that
+    // case takes 17.0s and 24.1s on two consecutive runs; git-workspace-
+    // expiration.test.ts tops out near 10s but climbs under load. With a 15s
+    // budget those runs were a coin flip, which is why a *different* shard and
+    // a different test went red on each CI run (NEXA-804): the failure tracked
+    // test wall-clock, not a regression.
+    //
+    // 60s is ~2.5x the worst case measured locally, so it absorbs a rival
+    // fork's contention on the shard's other worker, and it still catches a
+    // genuinely hung test far inside the 20 minute job limit. Do not shrink
+    // this back toward the module-load number: it is the I/O suites that set
+    // the floor.
+    testTimeout: 60000,
     isolate: true,
     maxConcurrency: 1,
     maxWorkers: 1,
