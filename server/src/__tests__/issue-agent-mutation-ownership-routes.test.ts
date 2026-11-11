@@ -88,6 +88,7 @@ const mockIssueThreadInteractionService = vi.hoisted(() => ({
   expireStaleRequestConfirmationsForIssueDocument: vi.fn(async () => []),
   expireRequestConfirmationsSupersededByHistoricalComments: vi.fn(async () => []),
   listForIssue: vi.fn(async () => []),
+  listPendingInteractionsExpiringOnDone: vi.fn(async () => []),
 }));
 const mockIssueApprovalService = vi.hoisted(() => ({
   link: vi.fn(),
@@ -153,6 +154,7 @@ const mockExternalObjectService = vi.hoisted(() => ({
     unreachableCount: 0,
   })),
   listForIssue: vi.fn(async () => []),
+  listPendingInteractionsExpiringOnDone: vi.fn(async () => []),
   refreshIssueObjects: vi.fn(async () => []),
   syncCommentSafely: vi.fn(async () => undefined),
   syncDocumentSafely: vi.fn(async () => undefined),

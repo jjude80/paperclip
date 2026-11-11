@@ -4824,4 +4824,68 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       });
     });
   });
+
+  it("lists only the pending cards an agent done would expire", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Done expiry preview");
+    const agentId = randomUUID();
+    await db.insert(agents).values(
+      activeCodexAgentRow(agentId, companyId, "Closer", "engineer"),
+    );
+
+    const confirmationId = randomUUID();
+    const questionId = randomUUID();
+    const deferredQuestionId = randomUUID();
+    const questionsPayload = {
+      version: 1 as const,
+      questions: [{
+        id: "pick",
+        prompt: "Which story?",
+        selectionMode: "single" as const,
+        options: [{ id: "one", label: "One" }],
+      }],
+    };
+    await db.insert(issueThreadInteractions).values([
+      {
+        id: confirmationId,
+        companyId,
+        issueId,
+        kind: "request_confirmation",
+        status: "pending",
+        createdByAgentId: agentId,
+        payload: { version: 1, prompt: "Approve this review?" },
+      },
+      {
+        id: questionId,
+        companyId,
+        issueId,
+        kind: "ask_user_questions",
+        status: "pending",
+        createdByAgentId: agentId,
+        payload: questionsPayload,
+      },
+      {
+        id: deferredQuestionId,
+        companyId,
+        issueId,
+        kind: "ask_user_questions",
+        status: "pending",
+        createdByAgentId: agentId,
+        payload: questionsPayload,
+        dismissedAt: new Date(),
+        dismissedByUserId: "local-board",
+        effectiveResolverPolicySource: "requested",
+      },
+    ]);
+
+    const expiring = await interactionsSvc.listPendingInteractionsExpiringOnDone({
+      id: issueId,
+      companyId,
+    });
+
+    // The deferred ordinary question stays answerable after completion, exactly
+    // like expirePendingInteractionsForTerminalIssue's `done` filter.
+    expect(expiring.map((interaction) => interaction.id).sort()).toEqual(
+      [confirmationId, questionId].sort(),
+    );
+  });
 });
