@@ -5,6 +5,7 @@
 ### Patch Changes
 
 - Allow the Paperclip host to route adapter sandbox-sync full-tree Git enumeration through its process-wide bounded scheduler.
+- Keep an available broker identity when the managed GitHub launcher's `GH_CONFIG_DIR` is not writable for the run user: retry the operation's 0700 scratch directory under the system temp root instead of discarding the credential.
 
 ## 0.3.1
 
