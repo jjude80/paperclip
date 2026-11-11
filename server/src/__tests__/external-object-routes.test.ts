@@ -26,6 +26,7 @@ const mockExternalObjectsService = vi.hoisted(() => ({
   getIssueSummary: vi.fn(),
   getIssueSummaries: vi.fn(),
   listForIssue: vi.fn(),
+  listPendingInteractionsExpiringOnDone: vi.fn(async () => []),
   refreshIssueObjects: vi.fn(),
 }));
 const mockInstanceSettingsService = vi.hoisted(() => ({

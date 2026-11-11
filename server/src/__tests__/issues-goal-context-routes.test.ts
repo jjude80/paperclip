@@ -91,6 +91,7 @@ const mockRoutineService = vi.hoisted(() => ({
 
 const mockWorkProductService = vi.hoisted(() => ({
   listForIssue: vi.fn(async () => []),
+  listPendingInteractionsExpiringOnDone: vi.fn(async () => []),
 }));
 
 const mockEnvironmentService = vi.hoisted(() => ({}));
@@ -129,6 +130,7 @@ vi.mock("../services/index.js", () => ({
   }),
   issueThreadInteractionService: () => ({
     listForIssue: vi.fn(async () => []),
+    listPendingInteractionsExpiringOnDone: vi.fn(async () => []),
     expireRequestConfirmationsSupersededByComment: vi.fn(async () => []),
     expireStaleRequestConfirmationsForIssueDocument: vi.fn(async () => []),
   }),

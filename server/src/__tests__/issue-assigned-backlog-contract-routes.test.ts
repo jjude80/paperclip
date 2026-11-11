@@ -100,6 +100,7 @@ vi.mock("../services/index.js", () => ({
   }),
   issueThreadInteractionService: () => ({
     listForIssue: vi.fn(async () => []),
+    listPendingInteractionsExpiringOnDone: vi.fn(async () => []),
     expireRequestConfirmationsSupersededByComment: vi.fn(async () => []),
     expireStaleRequestConfirmationsForIssueDocument: vi.fn(async () => []),
   }),
@@ -114,6 +115,7 @@ vi.mock("../services/index.js", () => ({
   }),
   workProductService: () => ({
     listForIssue: vi.fn(async () => []),
+    listPendingInteractionsExpiringOnDone: vi.fn(async () => []),
   }),
 }));
 

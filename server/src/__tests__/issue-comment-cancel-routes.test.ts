@@ -82,6 +82,7 @@ const mockExternalObjectService = vi.hoisted(() => ({
     unreachableCount: 0,
   })),
   listForIssue: vi.fn(async () => []),
+  listPendingInteractionsExpiringOnDone: vi.fn(async () => []),
   refreshIssueObjects: vi.fn(async () => []),
   syncCommentSafely: vi.fn(async () => undefined),
   syncDocumentSafely: vi.fn(async () => undefined),

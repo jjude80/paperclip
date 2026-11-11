@@ -4901,6 +4901,30 @@ export function issueThreadInteractionService(
       if (expired.length) await db.delete(toolOauthStates).where(inArray(toolOauthStates.interactionId, expired.map((item) => item.id)));
       return expired;
     },
+    /**
+     * Pending interactions that a `done` transition would expire. Ordinary
+     * questions that remain answerable after completion are excluded, matching
+     * `expirePendingInteractionsForTerminalIssue` exactly. Callers use this to
+     * refuse an agent's own `done` before it silently destroys its cards.
+     */
+    listPendingInteractionsExpiringOnDone: async (issue: {
+      id: string;
+      companyId: string;
+    }) => {
+      const rows = await db
+        .select()
+        .from(issueThreadInteractions)
+        .where(
+          and(
+            eq(issueThreadInteractions.companyId, issue.companyId),
+            eq(issueThreadInteractions.issueId, issue.id),
+            eq(issueThreadInteractions.status, "pending"),
+            sql`not ${historicalQuestionCondition()}`,
+          ),
+        );
+      if (rows.length === 0) return [];
+      return rows.map(hydrateInteraction);
+    },
     expirePendingInteractionsForTerminalIssue: async (
       issue: { id: string; companyId: string; status: string },
       actor: InteractionActor = {},

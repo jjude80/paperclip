@@ -101,6 +101,7 @@ const mockIssueThreadInteractionService = vi.hoisted(() => ({
   expireRequestConfirmationsSupersededByComment: vi.fn(async () => []),
   expireStaleRequestConfirmationsForIssueDocument: vi.fn(async () => []),
   listForIssue: vi.fn(async () => []),
+  listPendingInteractionsExpiringOnDone: vi.fn(async () => []),
 }));
 const mockIssueRecoveryActionService = vi.hoisted(() => ({
   getActiveForIssue: vi.fn(async () => null),
@@ -415,6 +416,8 @@ describe("issue comment reopen routes", () => {
     mockInstanceSettingsService.listCompanyIds.mockReset();
     mockRoutineService.syncRunStatusForIssue.mockReset();
     mockIssueThreadInteractionService.listForIssue.mockReset();
+    mockIssueThreadInteractionService.listPendingInteractionsExpiringOnDone.mockReset();
+    mockIssueThreadInteractionService.listPendingInteractionsExpiringOnDone.mockResolvedValue([]);
     mockIssueRecoveryActionService.getActiveForIssue.mockReset();
     mockIssueTreeControlService.getActivePauseHoldGate.mockReset();
     mockExternalObjectService.syncCommentSafely.mockReset();
@@ -3657,6 +3660,48 @@ describe("issue comment reopen routes", () => {
         }),
       );
     });
+  });
+
+  it("refuses an auto-approval that would expire this run's own pending card", async () => {
+    const reviewerAgentId = "33333333-3333-4333-8333-333333333333";
+    const policy = await createAgentReviewPolicy(reviewerAgentId)!;
+    const issue = createReviewIssue(policy, reviewerAgentId);
+    const reviewBody = "## Review: PAP-580 - APPROVED\n\nLooks good.";
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueThreadInteractionService.listPendingInteractionsExpiringOnDone.mockResolvedValue([{
+      id: "66666666-6666-4666-8666-666666666666",
+      kind: "ask_user_questions",
+      status: "pending",
+      createdByAgentId: reviewerAgentId,
+      sourceRunId: "run-review-pending",
+      payload: { version: 1, questions: [] },
+    }]);
+
+    const res = await request(
+      await installActor(createApp(), {
+        type: "agent",
+        agentId: reviewerAgentId,
+        companyId: "company-1",
+        source: "agent_key",
+        runId: "run-review-pending",
+      }),
+    )
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: reviewBody });
+
+    expect(res.status).toBe(409);
+    expect(res.body).toMatchObject({
+      details: {
+        code: "pending_human_interactions",
+        interactions: [{
+          id: "66666666-6666-4666-8666-666666666666",
+          kind: "ask_user_questions",
+        }],
+      },
+    });
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockDb.transaction).not.toHaveBeenCalled();
   });
 
   it("rolls back the comment when the auto-approval status transition fails", async () => {

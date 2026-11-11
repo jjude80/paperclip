@@ -2054,7 +2054,7 @@ const ACTIVE_REVIEW_APPROVAL_STATUSES = new Set([
 const INVALID_AGENT_IN_REVIEW_DISPOSITION_MESSAGE =
   "invalid_issue_disposition: Agent-authored updates that move an issue to in_review must include a real review path. " +
   "This request would leave the issue in_review without anyone or anything owning the next action. " +
-  "Keep working instead of moving to review, create a request_confirmation or ask_user_questions interaction, " +
+  "Keep working instead of moving to review, create a non-tool request_confirmation, request_checkbox_confirmation, or ask_user_questions interaction and pass its id as reviewInteractionId, " +
   "link or request a pending approval, assign a human reviewer with assigneeUserId, hand the issue to an agent reviewer with assigneeAgentId (it must be a different agent, which wakes it), set a typed executionState.currentParticipant through an execution policy, " +
   "or schedule an issue monitor for an external review/check. After creating one of those review paths, retry the status update.";
 
@@ -4600,6 +4600,80 @@ export function issueRoutes(
     );
   }
 
+  /**
+   * A governed action (tool action, secret proposal, connection request) is not
+   * a human review card even when a human must click it; the review path only
+   * accepts interactions whose decision is the review itself.
+   */
+  function isToolBackedInteraction(interaction: {
+    payload?: unknown;
+  } | null | undefined) {
+    if (
+      !interaction ||
+      !interaction.payload ||
+      typeof interaction.payload !== "object" ||
+      Array.isArray(interaction.payload)
+    )
+      return false;
+    const payload = interaction.payload as Record<string, unknown>;
+    return (
+      payload.toolAction !== undefined ||
+      payload.secretProposal !== undefined ||
+      payload.connectionAuthorization !== undefined
+    );
+  }
+
+  /**
+   * An agent finishing its own task must not silently expire the cards it just
+   * posted. `done` keeps ordinary historical questions, but every other pending
+   * card is resolved as `issue_closed`, which destroys a board-facing decision
+   * without a trace (NEXAA-139). Refuse loudly and name the remedy instead.
+   * Other runs, board users, and an administrative `cancelled` are untouched.
+   */
+  async function assertAgentDoneWithoutPendingOwnInteractions(input: {
+    existing: {
+      id: string;
+      companyId: string;
+      status: string;
+    };
+    updateFields: Record<string, unknown>;
+    actorType: "agent" | "user";
+    actorAgentId?: string | null;
+    actorRunId?: string | null;
+  }) {
+    if (input.actorType !== "agent") return;
+    if (input.existing.status === "done") return;
+    if (input.updateFields.status !== "done") return;
+    if (!input.actorAgentId || !input.actorRunId) return;
+
+    const pending = (
+      await issueThreadInteractionService(db).listPendingInteractionsExpiringOnDone(
+        { id: input.existing.id, companyId: input.existing.companyId },
+      )
+    ).filter(
+      (interaction) =>
+        interaction.createdByAgentId === input.actorAgentId &&
+        interaction.sourceRunId === input.actorRunId,
+    );
+    if (pending.length === 0) return;
+
+    throw conflict(
+      "pending_human_interactions: This agent run still has pending human-facing " +
+        "interactions on the issue, and moving it to done would expire them as " +
+        "issue_closed. Park the issue in_review with reviewInteractionId set to a " +
+        "non-tool review card, or explicitly withdraw the interaction first.",
+      {
+        code: "pending_human_interactions",
+        interactions: pending.map((interaction) => ({
+          id: interaction.id,
+          kind: interaction.kind,
+        })),
+        remedy:
+          "PATCH the issue to in_review with reviewInteractionId, or withdraw the interaction before marking done.",
+      },
+    );
+  }
+
   async function assertInReviewReviewPath(input: {
     existing: {
       conversationAgentId?: string | null;
@@ -4650,37 +4724,35 @@ export function issueRoutes(
       : undefined;
     if (resolvedSourceResponse) return null;
     if (input.reviewInteractionId) {
-      const designatedReviewConfirmation = pendingInteractions.find(
+      const designatedReviewInteraction = pendingInteractions.find(
         (interaction) =>
           interaction.id === input.reviewInteractionId &&
           (interaction.kind === "request_confirmation" ||
-            interaction.kind === "request_checkbox_confirmation") &&
+            interaction.kind === "request_checkbox_confirmation" ||
+            interaction.kind === "ask_user_questions") &&
           (input.actorType === "agent"
             ? interaction.createdByAgentId === input.actorAgentId &&
               interaction.sourceRunId === input.actorRunId
             : interaction.createdByUserId === input.actorId) &&
-          !(
-            interaction.kind === "request_confirmation" &&
-            interaction.payload &&
-            typeof interaction.payload === "object" &&
-            (("toolAction" in interaction.payload &&
-              interaction.payload.toolAction !== undefined) ||
-              ("secretProposal" in interaction.payload &&
-                interaction.payload.secretProposal !== undefined))
-          ),
+          !isToolBackedInteraction(interaction),
       );
-      if (!designatedReviewConfirmation) {
+      if (!designatedReviewInteraction) {
         const creatorDescription =
           input.actorType === "agent" ? "this agent run" : "this user";
         throw unprocessable(
-          `reviewInteractionId must identify a pending non-tool confirmation created by ${creatorDescription}`,
+          `reviewInteractionId must identify a pending non-tool confirmation or ask_user_questions interaction created by ${creatorDescription}`,
           {
             code: "invalid_review_interaction",
             reviewInteractionId: input.reviewInteractionId,
+            acceptedKinds: [
+              "request_confirmation",
+              "request_checkbox_confirmation",
+              "ask_user_questions",
+            ],
           },
         );
       }
-      return designatedReviewConfirmation.id;
+      return designatedReviewInteraction.id;
     }
 
     if (input.actorType !== "agent") return null;
@@ -4744,6 +4816,7 @@ export function issueRoutes(
       missing: "review_path",
       validReviewPaths: [
         "pending_issue_thread_interaction",
+        "pending_ask_user_questions",
         "linked_pending_approval",
         "human_assignee_user_id",
         "agent_assignee_agent_id",
@@ -14461,6 +14534,13 @@ export function issueRoutes(
         }
       }
 
+      await assertAgentDoneWithoutPendingOwnInteractions({
+        existing,
+        updateFields,
+        actorType: actor.actorType,
+        actorAgentId: actor.agentId,
+        actorRunId: actor.runId,
+      });
       const reviewInteractionId = await assertInReviewReviewPath({
         existing,
         updateFields,
@@ -18859,6 +18939,16 @@ export function issueRoutes(
           actorAgentId: actor.agentId ?? null,
           actorUserId: actor.actorType === "user" ? actor.actorId : null,
         };
+        // Same guard as the PATCH path: an approval comment that finishes the
+        // issue must not silently expire this run's own pending cards. The
+        // comment is not inserted when the transition is refused.
+        await assertAgentDoneWithoutPendingOwnInteractions({
+          existing: currentIssue,
+          updateFields: updatePatch,
+          actorType: actor.actorType,
+          actorAgentId: actor.agentId,
+          actorRunId: actor.runId,
+        });
 
         const sourceTrust = await sourceTrustForActorWrite(currentIssue, actor);
         const commentOptions = {

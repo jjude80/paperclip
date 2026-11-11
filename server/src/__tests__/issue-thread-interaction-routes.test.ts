@@ -29,6 +29,7 @@ const mockIssueService = vi.hoisted(() => ({
 
 const mockInteractionService = vi.hoisted(() => ({
   listForIssue: vi.fn(),
+  listPendingInteractionsExpiringOnDone: vi.fn(async () => []),
   getForIssue: vi.fn(),
   create: vi.fn(),
   acceptInteraction: vi.fn(),
