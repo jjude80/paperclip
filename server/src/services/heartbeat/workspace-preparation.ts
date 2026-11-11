@@ -854,6 +854,9 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
           : null,
       baseRef: executionWorkspace.repoRef,
       baseRefSha: executionWorkspace.baseRefSha ?? null,
+      baseRefCommitDate: executionWorkspace.baseRefCommitDate ?? null,
+      behindOriginMain: executionWorkspace.behindOriginMain ?? null,
+      originMainRef: executionWorkspace.originMainRef ?? null,
     });
   let persistedWorktreeInstanceRoot =
     resolvedWorkspaceReusePolicy.shouldRestoreExistingWorkspace &&

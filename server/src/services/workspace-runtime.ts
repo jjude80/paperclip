@@ -192,6 +192,15 @@ export interface RealizedExecutionWorkspace extends ExecutionWorkspaceInput {
   // recreated or deleted.
   branchCreatedByRuntime: boolean;
   baseRefSha?: string | null;
+  /** Committer date of the resolved base commit, ISO-8601. */
+  baseRefCommitDate?: string | null;
+  /**
+   * Commits on the project integration line that the resolved base does not
+   * contain. Recorded in `metadata.baseRefSnapshot` at creation (NEXA-942).
+   */
+  behindOriginMain?: number | null;
+  /** The integration-line ref the behind count was measured against. */
+  originMainRef?: string | null;
   pendingForwardBranchReconcile?: PendingForwardBranchReconcile | null;
 }
 
@@ -1050,6 +1059,61 @@ async function resolveBaseRefSha(repoRoot: string, baseRef: string, diagnostic?:
     if (diagnostic && !diagnostic.refResolution) diagnostic.refResolution = "spawn_failed";
     return null;
   });
+}
+
+/**
+ * Any base that does not contain the integration line's tip is silently
+ * stale. This threshold is deliberately zero: a workspace that is one commit
+ * behind is still reading a tree that is not the integration line, and the
+ * defect this guards against is that nobody could see it.
+ */
+export const WORKSPACE_INTEGRATION_LINE_STALENESS_THRESHOLD = 0;
+
+type IntegrationLineDrift = {
+  integrationRef: string;
+  behindCount: number;
+  baseCommitDate: string | null;
+};
+
+async function inspectIntegrationLineDrift(input: {
+  repoRoot: string;
+  baseRefSha: string | null;
+  resolveGitAuth?: GitRemoteAuthProvider | null;
+}): Promise<IntegrationLineDrift | null> {
+  if (!input.baseRefSha) return null;
+  // The integration line is the remote's default branch. `detectDefaultBranch`
+  // refreshes the remote-tracking ref, so this is measured at workspace
+  // creation time rather than against a ref frozen earlier.
+  const integrationRef = await detectDefaultBranch(input.repoRoot, input.resolveGitAuth);
+  if (!integrationRef) return null;
+  const baseCommitDateRaw = await runGit(
+    ["log", "-1", "--format=%cI", input.baseRefSha],
+    input.repoRoot,
+  ).catch(() => "");
+  const behindRaw = await runGit(
+    ["rev-list", "--count", `${input.baseRefSha}..${integrationRef}`],
+    input.repoRoot,
+  ).catch(() => "");
+  const behindCount = Number.parseInt(behindRaw, 10);
+  if (!Number.isFinite(behindCount)) return null;
+  return {
+    integrationRef,
+    behindCount,
+    baseCommitDate: baseCommitDateRaw.trim() || null,
+  };
+}
+
+function integrationLineStalenessWarnings(
+  drift: IntegrationLineDrift | null,
+): string[] {
+  if (!drift || drift.behindCount <= WORKSPACE_INTEGRATION_LINE_STALENESS_THRESHOLD) {
+    return [];
+  }
+  const count = drift.behindCount;
+  const asOf = drift.baseCommitDate ?? "an unknown date";
+  return [
+    `This workspace is ${count} commit${count === 1 ? "" : "s"} behind ${drift.integrationRef} as of ${asOf}: its base commit is older than the integration line. Refresh or rebase the workspace before relying on recent base-branch fixes.`,
+  ];
 }
 
 function readRecordedBaseRefSha(metadata: Record<string, unknown> | null | undefined): string | null {
@@ -3755,6 +3819,16 @@ export async function realizeExecutionWorkspace(input: {
     recorder: input.recorder ?? null,
   });
 
+  // Measure the freshly resolved base against the integration line and record
+  // the result, so a workspace created from a stale ref is visible both in the
+  // run log and in the "Workspace Ready" notice on the issue thread instead of
+  // silently reading an old tree (NEXA-942).
+  const integrationLineDrift = await inspectIntegrationLineDrift({
+    repoRoot,
+    baseRefSha: currentBaseRefSha,
+    resolveGitAuth: input.resolveGitAuth,
+  });
+
   return {
     ...input.base,
     repoRef: baseRef,
@@ -3762,10 +3836,16 @@ export async function realizeExecutionWorkspace(input: {
     cwd: worktreePath,
     branchName,
     worktreePath,
-    warnings: baseRefreshWarnings,
+    warnings: [
+      ...baseRefreshWarnings,
+      ...integrationLineStalenessWarnings(integrationLineDrift),
+    ],
     created: true,
     branchCreatedByRuntime,
     baseRefSha: currentBaseRefSha,
+    baseRefCommitDate: integrationLineDrift?.baseCommitDate ?? null,
+    behindOriginMain: integrationLineDrift?.behindCount ?? null,
+    originMainRef: integrationLineDrift?.integrationRef ?? null,
   };
 }
 

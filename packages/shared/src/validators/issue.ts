@@ -249,6 +249,9 @@ export const issueExecutionWorkspaceSettingsSchema = z
     sharedWorkspaceConcurrency: z
       .enum(["auto", "serialize", "allow"])
       .optional(),
+    // Explicit integration-branch declaration (NEXA-942). Only this marker
+    // lets a child inherit the parent's branch as its workspace base ref.
+    integrationBranch: z.boolean().optional(),
     environmentId: z.string().guid().optional().nullable(),
     workspaceStrategy: executionWorkspaceStrategySchema.optional().nullable(),
     workspaceRuntime: z.record(z.string(), z.unknown()).optional().nullable(),
