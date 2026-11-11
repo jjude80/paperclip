@@ -693,6 +693,70 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(second!.id).toBeTruthy();
   });
 
+  it("skips a repeated contentless wake when the only assigned work is held by a live run", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({ maxConcurrentRuns: 2 });
+    const requester = { requestedByActorType: "user" as const, requestedByActorId: "responsible-user" };
+
+    const [issue] = await db.insert(issues).values({
+      companyId,
+      title: "Held by a live run",
+      status: "in_progress" as const,
+      assigneeAgentId: agentId,
+    }).returning();
+    const [holder] = await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "running",
+      startedAt: new Date(),
+      contextSnapshot: { issueId: issue.id },
+    }).returning();
+    await db.update(issues).set({ executionRunId: holder.id, checkoutRunId: holder.id })
+      .where(eq(issues.id, issue.id));
+
+    // The previous heartbeat tick was the same contentless pulse from the same
+    // requester, so only the actionable-work gate decides this one.
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId,
+      source: "on_demand",
+      triggerDetail: "manual",
+      status: "succeeded",
+      requestedByActorType: "user",
+      requestedByActorId: "responsible-user",
+      requestedAt: new Date(Date.now() - 5 * 60_000),
+      payload: { _paperclipWakeContext: { contentlessUnboundWake: true } },
+    });
+
+    const run = await heartbeat.wakeup(agentId, {
+      ...requester,
+      source: "on_demand",
+      triggerDetail: "manual",
+    });
+    expect(run).toBeNull();
+
+    const [skipped] = await db
+      .select({
+        status: agentWakeupRequests.status,
+        reason: agentWakeupRequests.reason,
+        payload: agentWakeupRequests.payload,
+      })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.status, "skipped"))
+      .orderBy(agentWakeupRequests.requestedAt)
+      .limit(1);
+    expect(skipped).toMatchObject({
+      status: "skipped",
+      reason: "heartbeat.wakeup.no_actionable_work",
+    });
+    expect(skipped?.payload).toMatchObject({
+      heartbeatSkip: {
+        reason: expect.stringContaining("no assigned todo or in_progress issue"),
+      },
+    });
+    expect(await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)).toHaveLength(1);
+  });
+
   it("does not suppress a contentless-looking wake that states a reason", async () => {
     const { agentId } = await seedCompanyAndAgent();
     const requester = { requestedByActorType: "user" as const, requestedByActorId: "responsible-user" };
