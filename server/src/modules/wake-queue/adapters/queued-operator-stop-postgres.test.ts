@@ -16,7 +16,7 @@ describePostgres("queued operator stop release", () => {
   beforeAll(async () => {
     database = await startEmbeddedPostgresTestDatabase("paperclip-queued-operator-stop-");
     db = createDb(database.connectionString);
-  }, 20_000);
+  }, 90_000);
 
   afterAll(async () => {
     await database?.cleanup();

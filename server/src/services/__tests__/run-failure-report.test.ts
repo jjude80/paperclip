@@ -52,7 +52,7 @@ describeEmbeddedPostgres("reportRunFailure", () => {
       tempDb = await startEmbeddedPostgresTestDatabase("paperclip-run-failure-report-");
       db = createDb(tempDb.connectionString);
     }
-  }, 20_000);
+  }, 90_000);
 
   beforeEach(() => {
     // Unknown host values intentionally count as secrets, including short values

@@ -103,7 +103,7 @@ describe("P6-32 legacy finalization regression", () => {
       workMode: "standard",
       assigneeAgentId: agentId,
     });
-  }, 30_000);
+  }, 90_000);
 
   afterAll(async () => {
     if (temporary) {

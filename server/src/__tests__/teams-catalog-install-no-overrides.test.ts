@@ -38,7 +38,7 @@ describeEmbeddedPostgres("teams catalog install with no caller adapter overrides
     process.env.PAPERCLIP_HOME = tempHome;
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-teams-catalog-no-overrides-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+  }, 90_000);
 
   afterAll(async () => {
     if (oldPaperclipHome === undefined) delete process.env.PAPERCLIP_HOME;

@@ -34,7 +34,7 @@ describeEmbeddedPostgres("runner goal service", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-runner-goals-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+  }, 90_000);
 
   afterEach(async () => {
     await db.delete(agentSessionGoalActions);

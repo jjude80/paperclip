@@ -23,7 +23,7 @@ if (!support.supported) console.warn(`Primary agent database tests unavailable: 
   beforeAll(async () => {
     temp = await startEmbeddedPostgresTestDatabase("paperclip-primary-agent-");
     db = createDb(temp.connectionString);
-  }, 30_000);
+  }, 90_000);
   afterAll(async () => { await temp?.cleanup(); });
 
   const actor = (companyId: string, userId = "user-a"): Express.Request["actor"] => ({

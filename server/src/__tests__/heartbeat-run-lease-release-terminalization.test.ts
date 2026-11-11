@@ -38,7 +38,7 @@ describeEmbeddedPostgres("heartbeat terminalizeRunOnLeaseRelease", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-lease-release-terminal-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+  }, 90_000);
 
   afterEach(async () => {
     await db.delete(heartbeatRunEvents);

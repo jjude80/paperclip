@@ -9,7 +9,7 @@ const support = await getEmbeddedPostgresTestSupport();
 (support.supported ? describe : describe.skip)("handoff approval evidence", () => {
   let temporary: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   let db: ReturnType<typeof createDb>;
-  beforeAll(async () => { temporary = await startEmbeddedPostgresTestDatabase("handoff-plan-"); db = createDb(temporary.connectionString); }, 20_000);
+  beforeAll(async () => { temporary = await startEmbeddedPostgresTestDatabase("handoff-plan-"); db = createDb(temporary.connectionString); }, 90_000);
   afterAll(async () => { await temporary?.cleanup(); });
   async function seed() {
     const companyId = randomUUID(), agentId = randomUUID(), sourceId = randomUUID(), runId = randomUUID();

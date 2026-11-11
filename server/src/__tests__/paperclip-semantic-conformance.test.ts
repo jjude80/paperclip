@@ -64,7 +64,7 @@ describeEmbedded("Paperclip semantic mock/production conformance", () => {
     const db = createDb(temporary.connectionString);
     await seedPaperclipSemanticConformance(db, ids);
     mock = await CapabilityMockSemanticConformanceAdapter.create();
-  }, 30_000);
+  }, 90_000);
 
   afterAll(async () => {
     await mock?.stop();

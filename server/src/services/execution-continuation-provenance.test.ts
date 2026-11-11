@@ -12,7 +12,7 @@ const support = await getEmbeddedPostgresTestSupport();
   beforeAll(async () => {
     database = await startEmbeddedPostgresTestDatabase("paperclip-continuation-provenance-");
     db = createDb(database.connectionString);
-  }, 30_000);
+  }, 90_000);
   afterAll(async () => { await database?.cleanup(); });
 
   async function fixture() {

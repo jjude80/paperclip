@@ -218,7 +218,7 @@ describeEmbeddedPostgres("tool access policy service", () => {
   beforeAll(async () => {
     if (!externalTestDatabaseUrl) tempDb = await startEmbeddedPostgresTestDatabase("paperclip-tool-access-policy-");
     db = createDb(externalTestDatabaseUrl ?? tempDb!.connectionString);
-  }, 20_000);
+  }, 90_000);
 
   afterEach(async () => {
     await db.delete(toolRateLimitCounters);

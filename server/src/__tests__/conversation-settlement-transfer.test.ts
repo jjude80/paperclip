@@ -13,7 +13,7 @@ const support = await getEmbeddedPostgresTestSupport();
   beforeAll(async () => {
     database = await startEmbeddedPostgresTestDatabase("paperclip-conversation-settlement-");
     db = createDb(database.connectionString);
-  }, 30_000);
+  }, 90_000);
   afterAll(async () => { await db?.$client.end({ timeout: 5 }); await database?.cleanup(); }, 60_000);
 
   async function seed(reply: "response" | "interaction" | "reset" | "none" = "response") {

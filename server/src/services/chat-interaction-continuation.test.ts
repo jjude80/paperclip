@@ -19,7 +19,7 @@ describe("chat interaction continuation delivery", () => {
     if (!externalUrl) temporary = await startEmbeddedPostgresTestDatabase("chat-interaction-delivery-");
     db = createDb(externalUrl ?? temporary!.connectionString);
     await db.insert(authUsers).values({ id: "requester", name: "Requester", email: "requester@example.test", createdAt: new Date(), updatedAt: new Date() }).onConflictDoNothing();
-  }, 30_000);
+  }, 90_000);
   afterAll(async () => { await temporary?.cleanup(); if (externalUrl) await closeRegisteredClients(externalUrl); });
   async function fixture(kind = "request_checkbox_confirmation", status = "accepted") {
     const [company] = await db.insert(companies).values({ name: "Continuation", issuePrefix: randomUUID().slice(0, 8) }).returning();

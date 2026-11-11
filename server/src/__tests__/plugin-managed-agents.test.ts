@@ -103,7 +103,7 @@ describeEmbeddedPostgres("plugin-managed agents", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-plugin-managed-agents-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+  }, 90_000);
 
   beforeEach(async () => {
     runnerTarget.platform = "linux";

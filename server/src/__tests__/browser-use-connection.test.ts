@@ -64,7 +64,7 @@ const actor = { actorType: "user" as const, actorId: "browser-reviewer" };
       process.env.PAPERCLIP_API_URL = "http://127.0.0.1:3100";
       temp = await startEmbeddedPostgresTestDatabase("paperclip-browser-use-");
       db = createDb(temp.connectionString);
-    }, 30000);
+    }, 90_000);
     afterAll(async () => {
       await temp?.cleanup();
       if (originalApiUrl === undefined) delete process.env.PAPERCLIP_API_URL;

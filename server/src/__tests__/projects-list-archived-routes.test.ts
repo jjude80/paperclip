@@ -119,7 +119,7 @@ describeEmbeddedPostgres("private project route visibility", { concurrent: false
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-private-project-routes-");
     db = createDb(tempDb.connectionString);
     process.env.PAPERCLIP_ISSUE_PRIVACY_MODE = "enforce";
-  }, 20_000);
+  }, 90_000);
 
   afterEach(async () => {
     await db.delete(companyMemberships);

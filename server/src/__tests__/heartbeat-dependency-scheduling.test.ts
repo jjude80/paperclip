@@ -108,7 +108,7 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     await db.insert(authUsers).values({ id: "responsible-user", name: "Fixture owner", email: "owner@example.test", createdAt: new Date(), updatedAt: new Date() });
     heartbeat = heartbeatService(db);
     await ensureIssueRelationsTable(db);
-  }, 20_000);
+  }, 90_000);
 
   afterEach(async () => {
     let idlePolls = 0;

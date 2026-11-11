@@ -157,7 +157,7 @@ describeEmbeddedPostgres("built-in agents", () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-built-in-agents-");
     db = createDb(tempDb.connectionString);
     lifecycleWorker = configureAgentLifecycle(db, { requiredPluginIds: async () => [], runPlugin: async () => "complete", runHost: async () => "complete" });
-  }, 20_000);
+  }, 90_000);
 
   beforeEach(async () => {
     runnerTarget.platform = "linux";

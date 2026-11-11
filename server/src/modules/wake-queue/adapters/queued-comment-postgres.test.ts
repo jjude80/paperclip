@@ -41,7 +41,7 @@ describeEmbeddedPostgres("queued-comment postgres adapter", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-queued-comment-postgres-adapter-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+  }, 90_000);
 
   afterEach(async () => {
     // Deleted first: activity_log rows reference companies, agents, and

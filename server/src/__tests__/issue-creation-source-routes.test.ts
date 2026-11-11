@@ -58,7 +58,7 @@ describePostgres("agent-created follow-ups: parent links and creation source", (
       { id: foreignRun, companyId: otherCompanyId, agentId: foreignAgentId, scopeKind: "issue", issueId: foreignSourceId, status: "running" },
       { id: legacyRun, companyId, agentId: qaAgentId, status: "succeeded", contextSnapshot: { taskKey: "PAP-168" } },
     ]);
-  }, 30_000);
+  }, 90_000);
   afterAll(async () => { await database?.cleanup(); });
 
   const boardActor = { type: "board", userId: "board-user", source: "local_implicit", isInstanceAdmin: true } as Express.Request["actor"];

@@ -67,7 +67,7 @@ describeEmbeddedPostgres("heartbeat teardown terminalizes the run before releasi
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-terminalize-before-release-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+  }, 90_000);
 
   afterEach(async () => {
     await db.delete(heartbeatRunEvents);

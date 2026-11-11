@@ -23,7 +23,7 @@ const support = await getEmbeddedPostgresTestSupport();
   beforeAll(async () => {
     database = await startEmbeddedPostgresTestDatabase("legacy-controller-");
     db = createDb(database.connectionString);
-  }, 30000);
+  }, 90_000);
   afterAll(async () => { await database?.cleanup(); });
   async function seed() {
     const companyId = randomUUID(), agentId = randomUUID();

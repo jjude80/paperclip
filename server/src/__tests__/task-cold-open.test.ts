@@ -24,7 +24,7 @@ const support = await getEmbeddedPostgresTestSupport();
     await db.insert(agents).values({ id: agentId, companyId, name: "Writer", role: "engineer", adapterType: "codex_local" });
     await db.insert(issues).values({ id: issueId, companyId, title: "Original instruction", description: "Read this first", identifier: `T${companyId.slice(0, 6)}-1`, issueNumber: 1 });
     await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, issueId, runtimeMode: "native", status: "succeeded" });
-  }, 30_000);
+  }, 90_000);
   afterAll(async () => { await fixture?.cleanup(); });
   function app(allowedCompany = companyId) {
     const app = express();

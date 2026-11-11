@@ -865,6 +865,22 @@ if [[ -f "$worktree_cwd/package.json" && -f "$worktree_cwd/pnpm-lock.yaml" ]]; t
     printf '%s\n' "$current_install_fingerprint" >"$install_fingerprint_path"
   fi
 
+  # Installing dependencies lines up node_modules but compiles nothing, and the
+  # workspace packages' dist/ is gitignored. Without this step a fresh worktree
+  # cannot import @paperclipai/plugin-sdk, so most server suites fail before
+  # running with "Failed to resolve entry for package" -- which reads like a
+  # broken exports map instead of a missing build (NEXA-722). The build is
+  # fingerprint-cached and costs about a second when nothing changed; manual
+  # (non-managed) worktrees get the same step from scripts/worktree-bootstrap.sh.
+  echo "Building workspace package outputs required by the server test suite..." >&2
+  (
+    cd "$worktree_cwd"
+    # pnpm 9.15.4 calls the deprecated url.parse() through toNerfDart on every
+    # invocation. Node 24 reports that call as DEP0169; see the install call sites.
+    NODE_OPTIONS="${NODE_OPTIONS:-} --disable-warning=DEP0169" \
+      pnpm --filter @paperclipai/plugin-sdk ensure-build-deps
+  )
+
   exit 0
 fi
 

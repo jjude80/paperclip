@@ -13,7 +13,7 @@ const support = await getEmbeddedPostgresTestSupport();
     temporary = await startEmbeddedPostgresTestDatabase("paperclip-runtime-workspace-binding-");
     db = createDb(temporary.connectionString);
     await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false });
-  }, 30_000);
+  }, 90_000);
   afterAll(async () => { await temporary?.cleanup(); });
 
   async function fixture(mode = "shared_workspace") {

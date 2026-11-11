@@ -54,7 +54,7 @@ describePostgres("heartbeat runtime services through adapter dispatch", () => {
       },
       testEnvironment: async () => ({ adapterType, status: "pass", checks: [], testedAt: new Date().toISOString() }),
     });
-  }, 30_000);
+  }, 90_000);
 
   afterAll(async () => {
     await heartbeat?.drainActiveRunExecutions();

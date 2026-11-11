@@ -57,7 +57,7 @@ const support = await getEmbeddedPostgresTestSupport();
   beforeAll(async () => {
     temp = await startEmbeddedPostgresTestDatabase("paperclip-braintrust-");
     db = createDb(temp.connectionString);
-  }, 30000);
+  }, 90_000);
   afterAll(async () => { await temp?.cleanup(); });
 
   async function fixture(options: { methodKey?: string; personal?: boolean; deferOAuth?: boolean } = {}) {

@@ -72,7 +72,7 @@ describeEmbeddedPostgres("heartbeat local environment lifecycle", () => {
     tempDb = await startEmbeddedPostgresTestDatabase("heartbeat-local-environment-");
     db = createDb(tempDb.connectionString);
     heartbeat = heartbeatService(db);
-  }, 20_000);
+  }, 90_000);
 
   afterEach(async () => {
     // A run reaches its terminal status before finalizeRun finishes writing

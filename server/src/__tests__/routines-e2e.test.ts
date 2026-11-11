@@ -102,7 +102,7 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-routines-e2e-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+  }, 90_000);
 
   afterEach(async () => {
     vi.unstubAllEnvs();

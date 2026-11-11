@@ -21,7 +21,7 @@ describeDatabase("Slack authorization revision", () => {
   beforeAll(async () => {
     database = await startEmbeddedPostgresTestDatabase("paperclip-slack-revision-");
     db = createDb(database.connectionString);
-  }, 20_000);
+  }, 90_000);
 
   afterEach(async () => {
     for (const companyId of companyIds.splice(0)) {

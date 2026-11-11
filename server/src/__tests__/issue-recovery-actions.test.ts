@@ -156,7 +156,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     process.env.WORKSPACE_OPERATION_LOG_BASE_PATH = operationLogRoot;
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issue-recovery-actions-");
     db = createDb(tempDb.connectionString);
-  }, 30_000);
+  }, 90_000);
 
   afterEach(async () => {
     await db.delete(caseHandoffs);

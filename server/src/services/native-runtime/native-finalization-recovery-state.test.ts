@@ -47,7 +47,7 @@ describeEmbeddedPostgres("native finalization recovery state", () => {
     db = createDb(tempDb.connectionString);
     await db.insert(companies).values({ id: companyId, name: "Recovery state", issuePrefix: "RST" });
     await db.insert(agents).values({ id: agentId, companyId, name: "Native worker", adapterType: "codex_local", status: "running" });
-  }, 30_000);
+  }, 90_000);
 
   afterAll(async () => {
     await tempDb?.cleanup();

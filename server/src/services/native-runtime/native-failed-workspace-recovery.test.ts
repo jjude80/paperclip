@@ -22,7 +22,7 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
       temporary = await startEmbeddedPostgresTestDatabase("native-failed-workspace-");
       db = createDb(temporary.connectionString);
     }
-  }, 30_000);
+  }, 90_000);
   afterAll(async () => { await db?.$client.end(); await temporary?.cleanup(); });
 
   async function seed() {

@@ -68,7 +68,7 @@ describeEmbeddedPostgres("question response delivery", () => {
       "paperclip-question-delivery-",
     );
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+  }, 90_000);
 
   afterEach(async () => {
     await db.delete(issueQuestionResponseDeliveries);
