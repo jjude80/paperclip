@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { enqueueOpenCodeProxyInput, openCodeProxyTurnRunId } from "./opencode-proxy-input.js";
+import { enqueueOpenCodeProxyInput } from "./opencode-proxy-input.js";
 
 describe("OpenCode proxy input sequencing", () => {
   it("drains requests in order before EOF shutdown", async () => {
@@ -148,20 +148,3 @@ it.each([true, false])("settles a real proxy interrupt with controller feedback 
     await rm(root, { recursive: true, force: true });
   }
 }, 30_000);
-
-describe("OpenCode proxy run attachment", () => {
-  it("returns the run id a resumed turn asks to attach", () => {
-    expect(openCodeProxyTurnRunId({ paperclipRunId: "11111111-2222-4333-8444-555555555555" }))
-      .toBe("11111111-2222-4333-8444-555555555555");
-  });
-
-  it("leaves turns without an attachment alone", () => {
-    expect(openCodeProxyTurnRunId({})).toBeNull();
-  });
-
-  it.each([42, "", "bad run\nid", "-leading"])("rejects an invalid run identity %j", (runId) => {
-    expect(() => openCodeProxyTurnRunId({ paperclipRunId: runId })).toThrow(
-      "Invalid Paperclip run identity",
-    );
-  });
-});

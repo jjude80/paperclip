@@ -11883,6 +11883,39 @@ export function issueService(db: Db) {
       await clearExecutionRunIfTerminal(id);
       await clearCheckoutRunIfTerminal(id);
 
+      // A run that already reached a terminal status cannot hold a checkout.
+      // The board dispatches a *new* run for a resumed conversation and the
+      // dispatcher checks the issue out under that live run id (heartbeat.ts),
+      // so a terminal actor here means the conversation is still presenting the
+      // dead run it was launched with. Letting it check out parks the issue
+      // `in_progress` under a lock the write guard has to strip, and the
+      // following status PATCH then fails closed with 409 while the wake stays
+      // uncloseable. Refuse the checkout so the row keeps its status and a live
+      // run can still claim it. (A missing run row keeps the previous
+      // behaviour: the write guard already refuses to adopt it.)
+      if (checkoutRunId) {
+        const actorRunStatus = await db
+          .select({ status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, checkoutRunId))
+          .then((rows) => rows[0]?.status ?? null);
+        if (
+          actorRunStatus !== null &&
+          TERMINAL_HEARTBEAT_RUN_STATUSES.has(actorRunStatus)
+        ) {
+          throw conflict("Issue checkout requires a live run", {
+            issueId: id,
+            runId: checkoutRunId,
+            runStatus: actorRunStatus,
+            securityPrinciples: [
+              "Complete Mediation",
+              "Fail Securely",
+              "Least Privilege",
+            ],
+          });
+        }
+      }
+
       const dependencyReadiness = await listIssueDependencyReadinessMap(
         db,
         issueCompany.companyId,
@@ -12105,7 +12138,6 @@ export function issueService(db: Db) {
         db
           .select({
             id: issues.id,
-            companyId: issues.companyId,
             status: issues.status,
             assigneeAgentId: issues.assigneeAgentId,
             checkoutRunId: issues.checkoutRunId,
@@ -12117,47 +12149,6 @@ export function issueService(db: Db) {
       const current = await loadCurrent();
 
       if (!current) throw notFound("Issue not found");
-
-      // A wake can outlive the run that claimed it. When that run is an
-      // interrupted run and the issue is parked with no live execution, the
-      // resumed conversation still has to land the disposition its wake
-      // contract requires. This is reconciliation of an already-claimed wake,
-      // not authority to start new work: only the interrupted run that owned
-      // this issue, with no newer run behind it, may reconcile the parked row.
-      if (
-        actorRunId &&
-        current.status === "blocked" &&
-        current.assigneeAgentId === actorAgentId &&
-        !current.checkoutRunId &&
-        !current.executionRunId
-      ) {
-        const actorRun = await db
-          .select({ status: heartbeatRuns.status, issueId: heartbeatRuns.issueId, agentId: heartbeatRuns.agentId })
-          .from(heartbeatRuns)
-          .where(and(eq(heartbeatRuns.id, actorRunId), eq(heartbeatRuns.companyId, current.companyId)))
-          .then((rows) => rows[0] ?? null);
-        if (
-          actorRun?.status === "interrupted" &&
-          actorRun.issueId === id &&
-          actorRun.agentId === actorAgentId
-        ) {
-          const newerLiveRun = await db
-            .select({ id: heartbeatRuns.id })
-            .from(heartbeatRuns)
-            .where(and(
-              eq(heartbeatRuns.companyId, current.companyId),
-              eq(heartbeatRuns.issueId, id),
-              eq(heartbeatRuns.agentId, actorAgentId),
-              notInArray(heartbeatRuns.status, [...TERMINAL_HEARTBEAT_RUN_STATUSES]),
-              ne(heartbeatRuns.id, actorRunId),
-            ))
-            .limit(1)
-            .then((rows) => rows[0] ?? null);
-          if (!newerLiveRun) {
-            return { ...current, adoptedFromRunId: null as string | null };
-          }
-        }
-      }
 
       const resolveSameRunOwnership = (candidate: {
         id: string;

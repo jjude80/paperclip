@@ -19,7 +19,7 @@ import {
   shouldAnnounceOpenCodeProxyTurn,
   shouldForwardOpenCodeProxyItem,
 } from "./opencode-proxy-events.js";
-import { enqueueOpenCodeProxyInput, openCodeProxyCompletionFeedback, openCodeProxyTurnRunId } from "./opencode-proxy-input.js";
+import { enqueueOpenCodeProxyInput, openCodeProxyCompletionFeedback } from "./opencode-proxy-input.js";
 import {
   assertOpenCodeProxyCollaborationMode,
   openCodeProxyCollaborationModes,
@@ -52,10 +52,6 @@ let eventPump: Promise<void> | null = null;
 let cwd = "";
 let activeModel = "";
 let activeTurnId: string | null = null;
-// A proxy process can outlive the run that launched it. Track the run this
-// provider session is currently serving so a resumed turn attaches to the new
-// run instead of writing with the launch (possibly terminal) run id.
-let activeRunId = process.env.PAPERCLIP_RUN_ID ?? "runnerd-run";
 const announcedTurnIds = new Set<string>();
 const launchBinding = trustedOpenCodeLaunchBinding(process.argv.slice(2));
 const usageLedger = new OpenCodeProxyUsageLedger();
@@ -361,12 +357,6 @@ async function handle(message: RpcMessage): Promise<void> {
     case "turn/start": {
       if (!session) throw new Error("OpenCode thread is not open");
       assertOpenCodeProxyCollaborationMode(params);
-      const attachedRunId = openCodeProxyTurnRunId(params);
-      if (attachedRunId !== null && attachedRunId !== activeRunId) {
-        if (!session.attachRun) throw new Error("OpenCode run attachment unavailable");
-        await session.attachRun({ runId: attachedRunId });
-        activeRunId = attachedRunId;
-      }
       const inputItems = Array.isArray(params.input)
         ? params.input.map(record)
         : [];

@@ -237,6 +237,7 @@ Paperclip already clears stale execution locks and can adopt some stale checkout
 The active-lock lifecycle is part of the checkout contract:
 
 - a run owns `checkoutRunId` only while that run is non-terminal
+- checkout refuses a terminal actor run instead of writing that dead id into `checkoutRunId`; the run dispatched for a resumed conversation performs the checkout, so a conversation presenting its launch run id is a stale identity, not an ownership claim
 - when a run reaches `succeeded`, `failed`, `cancelled`, or `timed_out`, finalization must compare-and-clear lock columns that still point at that run
 - finalization must not clear a lock already reacquired by a successor run
 - process-loss retry handoff must not leave `checkoutRunId` pinned to the failed run when `executionRunId` moves to the retry run

@@ -2,22 +2,6 @@ import type { OpenCodeCompletionFeedback } from "../drivers/opencode/opencode-se
 
 export { enqueueSerialInput as enqueueOpenCodeProxyInput } from "./serial-input-queue.js";
 
-const PAPERCLIP_RUN_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
-
-/**
- * runnerd may deliver a turn for a new heartbeat run to a proxy process that
- * was launched for an earlier run. A proxy that keeps using its launch run id
- * would present a terminal run to the board. Return the run id the turn asks
- * to attach, or null when the turn carries no attachment.
- */
-export function openCodeProxyTurnRunId(params: Record<string, unknown>): string | null {
-  const value = params.paperclipRunId;
-  if (value === undefined) return null;
-  if (typeof value !== "string" || !PAPERCLIP_RUN_ID_PATTERN.test(value))
-    throw new Error("Invalid Paperclip run identity");
-  return value;
-}
-
 /** Preserve the exact call binding and the controller's acceptance/rejection. */
 export function openCodeProxyCompletionFeedback(
   request: (method: string, params: Record<string, unknown>) => Promise<unknown>,
