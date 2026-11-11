@@ -818,6 +818,34 @@ const NATIVE_PROVIDER_HOST_ENV_KEYS = [
   "PATHEXT",
 ] as const;
 
+/**
+ * A run shell compares time against the board, and every board timestamp is
+ * UTC: `createdAt`, `updatedAt` and the run-log prefixes all carry a `Z`. The
+ * host is not UTC. `/etc/timezone` here is `America/New_York`, so a time
+ * argument written the way the board writes it -- `find -newermt
+ * 'YYYY-MM-DD HH:MM:SS'`, `date -d '...'`, `touch -d`, a hand-rolled epoch
+ * compare -- is parsed as *local* time. For the five hours between the stated
+ * UTC instant and that instant plus the local offset it is still in the
+ * future, so a leak-surveillance delta scan matches nothing and reports a
+ * false clean on exactly the runs it was meant to cover (NEXA-748).
+ *
+ * Normalize at the point of measurement: pin the run shell to UTC instead of
+ * asking every scan author to remember a `Z`. An agent that explicitly
+ * configures `TZ` still overrides this, because a configured value is a
+ * decision and the host's implicit timezone is not.
+ */
+const NATIVE_RUN_SHELL_TIMEZONE = "UTC";
+
+function withRunShellTimeZone(
+  environment: NodeJS.ProcessEnv,
+  configuredTimeZone?: string,
+): NodeJS.ProcessEnv {
+  return {
+    ...environment,
+    TZ: configuredTimeZone ?? NATIVE_RUN_SHELL_TIMEZONE,
+  };
+}
+
 async function measureNativeRunnerSpan<T>(
   trace: NativeRunTrace | undefined,
   name: string,
@@ -858,7 +886,10 @@ export function buildNativeProviderEnvironment(
         : [];
     }),
   );
-  const environment = { ...inherited, ...configured };
+  const environment = withRunShellTimeZone(
+    { ...inherited, ...configured },
+    configured.TZ,
+  );
   if (assignedWorkspaceCwd?.trim()) {
     environment.PAPERCLIP_WORKSPACE_CWD = assignedWorkspaceCwd;
   }
@@ -871,11 +902,13 @@ export function resolveNativeProviderEnvironment(
   configured: NodeJS.ProcessEnv | undefined,
   host: NodeJS.ProcessEnv = process.env,
 ): NodeJS.ProcessEnv {
-  if (configured !== undefined) return configured;
+  if (configured !== undefined) {
+    return withRunShellTimeZone(configured, configured.TZ);
+  }
   if (provider.kind === "acpx" && ["pi", "cursor", "copilot"].includes(provider.agent)) {
     return buildNativeProviderEnvironment({}, host);
   }
-  return host;
+  return withRunShellTimeZone(host);
 }
 
 type PlanSynchronization = {

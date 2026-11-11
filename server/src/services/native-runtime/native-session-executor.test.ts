@@ -3753,15 +3753,15 @@ describe("native provider bootstrap environment", () => {
     const host = { PATH: "/host/bin", HOME: "/host/home", OPENROUTER_API_KEY: "ambient-pi",
       CURSOR_API_KEY: "ambient-cursor", CURSOR_AUTH_TOKEN: "ambient-cursor-login", COPILOT_GITHUB_TOKEN: "ambient-copilot",
       PAPERCLIP_ACPX_CREDENTIAL_BINDING: "ambient-forged-binding" };
-    expect(resolveNativeProviderEnvironment(provider, undefined, host)).toEqual({ PATH: "/host/bin", HOME: "/host/home" });
+    expect(resolveNativeProviderEnvironment(provider, undefined, host)).toEqual({ TZ: "UTC", PATH: "/host/bin", HOME: "/host/home" });
     const explicit = { COPILOT_GITHUB_TOKEN: "explicit-company-binding" };
-    expect(resolveNativeProviderEnvironment(provider, explicit, host)).toBe(explicit);
+    expect(resolveNativeProviderEnvironment(provider, explicit, host)).toEqual({ TZ: "UTC", ...explicit });
   });
 
   it("preserves existing qualified and legacy missing-environment behavior", () => {
     const host = { OPENAI_API_KEY: "existing-host-key", OPENROUTER_API_KEY: "existing-opencode-key" };
     for (const provider of [{ kind: "codex" }, { kind: "opencode" }, { kind: "acpx", agent: "codex" }, { kind: "acpx", agent: "claude" }]) {
-      expect(resolveNativeProviderEnvironment(provider as NativeExecutionInput["provider"], undefined, host)).toBe(host);
+      expect(resolveNativeProviderEnvironment(provider as NativeExecutionInput["provider"], undefined, host)).toEqual({ TZ: "UTC", ...host });
     }
   });
 
@@ -3777,10 +3777,51 @@ describe("native provider bootstrap environment", () => {
         },
       ),
     ).toEqual({
+      TZ: "UTC",
       PATH: "/opt/homebrew/bin:/usr/bin",
       HOME: "/Users/runner",
       CODEX_HOME: "/Users/runner/.codex",
     });
+  });
+
+  it("pins the run shell to UTC even when the host is on another timezone", () => {
+    // The board's timestamps are UTC and the host's local time is not. A naive
+    // `find -newermt 'YYYY-MM-DD HH:MM:SS'` written from a board timestamp must
+    // not be parsed as local time, or the scan is empty for the local offset
+    // and reports a false clean (NEXA-748).
+    const host = { PATH: "/host/bin", TZ: "America/New_York" };
+    expect(buildNativeProviderEnvironment({}, host).TZ).toBe("UTC");
+    expect(
+      resolveNativeProviderEnvironment(
+        { kind: "opencode" } as NativeExecutionInput["provider"],
+        undefined,
+        host,
+      ).TZ,
+    ).toBe("UTC");
+  });
+
+  it("parses a board-shaped naive timestamp as UTC in the run shell", () => {
+    const environment = buildNativeProviderEnvironment(
+      {},
+      { PATH: process.env.PATH, TZ: "America/New_York" },
+    );
+    const offsetMinutes = Number(
+      execFileSync(
+        process.execPath,
+        [
+          "-e",
+          "process.stdout.write(String(new Date('2026-11-01T07:40:00').getTimezoneOffset()))",
+        ],
+        { env: environment, encoding: "utf8" },
+      ),
+    );
+    expect(offsetMinutes).toBe(0);
+  });
+
+  it("lets an explicitly configured run-shell timezone override the UTC default", () => {
+    expect(
+      buildNativeProviderEnvironment({ TZ: "Europe/Amsterdam" }, {}).TZ,
+    ).toBe("Europe/Amsterdam");
   });
 
   it("lets explicitly configured agent env override host defaults", () => {
@@ -3796,6 +3837,7 @@ describe("native provider bootstrap environment", () => {
         },
       ),
     ).toEqual({
+      TZ: "UTC",
       PATH: "/agent/bin",
       HOME: "/Users/runner",
       OPENAI_API_KEY: "configured-provider-key",
@@ -3812,6 +3854,7 @@ describe("native provider bootstrap environment", () => {
         "/Users/runner/.paperclip/instances/default/workspaces/agent-1",
       ),
     ).toEqual({
+      TZ: "UTC",
       HOME: "/Users/runner",
       PAPERCLIP_WORKSPACE_CWD:
         "/Users/runner/.paperclip/instances/default/workspaces/agent-1",
