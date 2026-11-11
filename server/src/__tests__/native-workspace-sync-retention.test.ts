@@ -78,7 +78,7 @@ describeEmbeddedPostgres("native workspace sync retention", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-native-workspace-sync-retention-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+  }, 90_000);
 
   afterEach(async () => {
     livePids = new Map();

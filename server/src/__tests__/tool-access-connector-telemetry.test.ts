@@ -176,7 +176,7 @@ describeEmbeddedPostgres("connector lifecycle telemetry (tool-access)", () => {
       "paperclip-lifecycle-telemetry-",
     );
     db = createDb(tempDb.connectionString);
-  }, 30_000);
+  }, 90_000);
 
   afterEach(async () => {
     track.mockClear();

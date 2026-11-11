@@ -42,7 +42,7 @@ describeEmbeddedPostgres("managed runtime loopback auth cookies", () => {
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-managed-loopback-auth-");
-  }, 20_000);
+  }, 90_000);
 
   afterAll(async () => {
     vi.unstubAllEnvs();

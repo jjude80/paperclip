@@ -18,7 +18,7 @@ describe("Muse native comment follow-up", () => {
     db = createDb(temporary.connectionString);
     vi.stubEnv("PAPERCLIP_SECRETS_MASTER_KEY", randomBytes(32).toString("base64"));
     await instanceSettingsService(db).updateExperimental({ enableNativeRunner: true, enableMuse: true });
-  }, 30000);
+  }, 90_000);
   afterAll(async () => { await temporary?.cleanup(); vi.unstubAllEnvs(); });
   async function fixture() {
     const companyId = randomUUID(), agentId = randomUUID(), userId = randomUUID(), runId = randomUUID(), bindingId = randomUUID();

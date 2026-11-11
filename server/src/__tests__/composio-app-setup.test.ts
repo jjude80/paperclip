@@ -55,7 +55,7 @@ const support = await getEmbeddedPostgresTestSupport();
     const database = await startEmbeddedPostgresTestDatabase("paperclip-composio-setup-");
     db = createDb(database.connectionString);
     cleanup = database.cleanup;
-  }, 20_000);
+  }, 90_000);
   afterAll(async () => { await cleanup?.(); });
 
   async function fixture(syncToolkits: string[] = ["circleback_mcp", "notion", "hubspot"]) {

@@ -37,7 +37,7 @@ describeDatabase("new agent configuration defaults", () => {
     const started = await startEmbeddedPostgresTestDatabase("agent-configure-defaults");
     db = createDb(started.connectionString);
     cleanup = started.cleanup;
-  }, 20_000);
+  }, 90_000);
 
   afterAll(async () => {
     await cleanup?.();

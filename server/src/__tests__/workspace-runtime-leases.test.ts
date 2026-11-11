@@ -40,7 +40,7 @@ describeEmbeddedPostgres("execution workspace runtime leases", () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-workspace-runtime-lease-");
     db = createDb(tempDb.connectionString);
     otherProcessDb = createDb(tempDb.connectionString);
-  }, 30_000);
+  }, 90_000);
 
   afterEach(async () => {
     await db.delete(executionWorkspaceRuntimeLeases);

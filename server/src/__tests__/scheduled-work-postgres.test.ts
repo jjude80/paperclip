@@ -14,7 +14,7 @@ describe.skipIf(!support.supported)("scheduled deadline database queries", () =>
   beforeAll(async () => {
     database = await startEmbeddedPostgresTestDatabase("paperclip-scheduled-deadlines");
     db = createDb(database.connectionString);
-  }, 30_000);
+  }, 90_000);
   afterAll(async () => { await db?.$client.end(); await database?.cleanup(); });
 
   it("selects future eligible deadlines and excludes inactive, mismatched and past work", async () => {

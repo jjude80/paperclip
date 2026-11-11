@@ -32,7 +32,7 @@ describePostgres("case REST mutation fencing", () => {
     temporary = await startEmbeddedPostgresTestDatabase("paperclip-case-mutation-fence-");
     db = createDb(temporary.connectionString);
     await instanceSettingsService(db).updateExperimental({ enableCases: true });
-  }, 30_000);
+  }, 90_000);
   afterAll(async () => {
     await temporary?.cleanup();
     if (oldJwtSecret === undefined) delete process.env.PAPERCLIP_AGENT_JWT_SECRET;

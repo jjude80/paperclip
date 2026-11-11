@@ -70,7 +70,7 @@ describeEmbeddedPostgres("heartbeat worktree suppression", () => {
     db = createDb(tempDb.connectionString);
     await db.insert(authUsers).values(["responsible-user", "operator"].map(id => ({ id, name: `Worktree fixture ${id}`,
       email: `worktree-${id}@example.test`, createdAt: new Date(), updatedAt: new Date() })));
-  }, 20_000);
+  }, 90_000);
 
   afterEach(async () => {
     // Await every in-flight background heartbeat run to quiescence before the

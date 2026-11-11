@@ -86,7 +86,7 @@ const support = await getEmbeddedPostgresTestSupport();
   beforeAll(async () => {
     temp = await startEmbeddedPostgresTestDatabase("paperclip-connector-policy-");
     db = createDb(temp.connectionString);
-  }, 30000);
+  }, 90_000);
   afterAll(async () => { await temp?.cleanup(); });
 
   it("applies reviewed endpoint risks and keeps changed tools quarantined without enabling a native bridge", async () => {

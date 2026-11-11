@@ -61,7 +61,7 @@ describeEmbeddedPostgres("cloud tenant company provisioning", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-tenant-provisioning-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+  }, 90_000);
 
   beforeEach(() => {
     process.env.PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN = SERVER_TOKEN;

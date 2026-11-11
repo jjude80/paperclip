@@ -141,7 +141,7 @@ describeEmbeddedPostgres("merged pull-request confirmation sweep", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-merged-pr-confirmations-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+  }, 90_000);
 
   afterEach(async () => {
     await db.delete(activityLog);

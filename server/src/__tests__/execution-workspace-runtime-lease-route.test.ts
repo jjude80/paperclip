@@ -93,7 +93,7 @@ describeEmbeddedPostgres("execution workspace runtime control lease enforcement"
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-runtime-lease-route-");
     db = createDb(tempDb.connectionString);
-  }, 30_000);
+  }, 90_000);
 
   afterAll(async () => {
     await tempDb?.cleanup();

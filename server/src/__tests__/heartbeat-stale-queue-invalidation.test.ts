@@ -214,7 +214,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       },
     });
     await ensureIssueRelationsTable(db);
-  }, 20_000);
+  }, 90_000);
 
   afterEach(async () => {
     beforeContinuationDispatchCheck = null;

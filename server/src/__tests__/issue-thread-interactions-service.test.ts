@@ -55,7 +55,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     db = createDb(externalUrl ?? tempDb!.connectionString);
     issuesSvc = issueService(db);
     interactionsSvc = issueThreadInteractionService(db);
-  }, 20_000);
+  }, 90_000);
 
   afterEach(async () => {
     vi.unstubAllEnvs();

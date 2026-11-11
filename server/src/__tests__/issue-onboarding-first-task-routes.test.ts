@@ -77,7 +77,7 @@ describeEmbeddedPostgres("issue create onboarding first-task routes", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issue-onboarding-first-task-routes-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+  }, 90_000);
 
   afterEach(async () => {
     // Wait for the background assignment wake to reach quiescence before the

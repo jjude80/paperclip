@@ -44,7 +44,7 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
     const started = await startEmbeddedPostgresTestDatabase("agent-secret-bindings");
     stopDb = started.cleanup;
     db = createDb(started.connectionString);
-  }, 20_000);
+  }, 90_000);
 
   afterEach(async () => {
     await db.delete(activityLog);

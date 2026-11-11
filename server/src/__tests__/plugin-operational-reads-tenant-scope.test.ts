@@ -164,7 +164,7 @@ describeEmbeddedPostgres("plugin operational reads are company-scoped", () => {
       { id: deliveryB, pluginId, companyId: companyB, webhookKey: "hook", status: "failed", error: "company B delivery error", payload: { who: "B" }, createdAt: new Date(base + 1_000) },
       { id: deliveryInstance, pluginId, companyId: null, webhookKey: "hook", status: "succeeded", payload: { who: "instance" }, createdAt: new Date(base + 2_000) },
     ]);
-  }, 20_000);
+  }, 90_000);
 
   afterEach(async () => {
     // Fixtures are seeded once for the suite; nothing mutates them.

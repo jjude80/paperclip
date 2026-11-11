@@ -13,7 +13,7 @@ const support = await getEmbeddedPostgresTestSupport();
   beforeAll(async () => {
     temporary = await startEmbeddedPostgresTestDatabase("paperclip-policy-persistence-");
     db = createDb(temporary.connectionString);
-  }, 30_000);
+  }, 90_000);
   afterAll(async () => { await temporary?.cleanup(); });
 
   it.each(["reviewer", "monitor"] as const)("retains the independent review limit after removing the last %s", async (removed) => {
