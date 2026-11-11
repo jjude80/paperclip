@@ -3129,7 +3129,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     });
   });
 
-  it("bases a child's own workspace on the parent workspace's integration branch", async () => {
+  it("bases a child's own workspace on an explicitly declared integration branch", async () => {
     const companyId = randomUUID();
     const projectId = randomUUID();
     const parentIssueId = randomUUID();
@@ -3174,7 +3174,10 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
       priority: "medium",
       executionWorkspaceId,
       executionWorkspacePreference: "reuse_existing",
-      executionWorkspaceSettings: { mode: "isolated_workspace" },
+      executionWorkspaceSettings: {
+        mode: "isolated_workspace",
+        integrationBranch: true,
+      },
     });
 
     const child = await svc.create(companyId, {
@@ -3190,7 +3193,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     });
   });
 
-  it("bases a child on the parent's durable base when the parent branch is transient", async () => {
+  it("leaves a transient parent branch out of the child's base ref", async () => {
     const companyId = randomUUID();
     const projectId = randomUUID();
     const parentIssueId = randomUUID();
@@ -3250,9 +3253,75 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     });
 
     expect(child.executionWorkspaceId).toBeNull();
+    // No base ref is frozen at issue creation: the child resolves the
+    // integration line tip when its own workspace is created (NEXA-942).
     expect(child.executionWorkspaceSettings).toEqual({
       mode: "isolated_workspace",
-      workspaceStrategy: { type: "git_worktree", baseRef: "origin/main" },
+    });
+  });
+
+  it("does not inherit a durable non-integration feature branch (NEXA-942)", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const parentIssueId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+    const staleBranch = "NEXA-553-the-authorise-this-browser-button";
+
+    await seedIssueCompany(db, companyId);
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+
+    await seedWorkspaceProject(db, companyId, projectId);
+
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "Primary workspace",
+      isPrimary: true,
+      sharedWorkspaceKey: "workspace-key",
+    });
+
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "Parent feature worktree",
+      branchName: staleBranch,
+      baseRef: `origin/${staleBranch}`,
+      status: "active",
+      providerType: "git_worktree",
+      providerRef: `/tmp/${executionWorkspaceId}`,
+      // Operator-owned: the branch still exists on origin. Existing on origin
+      // is not an integration-branch declaration.
+      metadata: { createdByRuntime: false, gitBranchOwnershipVersion: 1 },
+    });
+
+    await db.insert(issues).values({
+      id: parentIssueId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      title: "Parent issue",
+      status: "in_progress",
+      priority: "medium",
+      executionWorkspaceId,
+      executionWorkspacePreference: "reuse_existing",
+      executionWorkspaceSettings: { mode: "isolated_workspace" },
+    });
+
+    const child = await svc.create(companyId, {
+      parentId: parentIssueId,
+      projectId,
+      title: "Child issue",
+    });
+
+    expect(child.executionWorkspaceId).toBeNull();
+    expect(child.executionWorkspaceSettings).toEqual({
+      mode: "isolated_workspace",
     });
   });
 

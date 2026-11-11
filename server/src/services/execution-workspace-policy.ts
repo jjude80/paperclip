@@ -442,9 +442,19 @@ export function buildInheritedExecutionWorkspaceSettings(input: {
    * lands, because the ref is gone before the child's first dispatch.
    */
   sourceWorkspaceBranchIsTransient?: boolean;
+  /**
+   * True only when the parent issue explicitly declares its workspace branch
+   * an integration branch (NEXA-942). A branch that merely still exists on
+   * origin is not enough: inheriting every durable feature branch is how a
+   * child ends up reading a tree weeks behind the integration line.
+   */
+  sourceIssueDeclaresIntegrationBranch?: boolean;
   bindSourceWorkspace: boolean;
 }): Record<string, unknown> {
   const settings: Record<string, unknown> = { ...(input.sourceSettings ?? {}) };
+  // The declaration belongs to the parent issue, not to workspace settings.
+  // Carry it only if the child is explicitly marked later; never inherit it.
+  delete settings.integrationBranch;
   settings.mode = issueExecutionWorkspaceModeForPersistedWorkspace(
     input.sourceWorkspaceMode,
   );
@@ -454,29 +464,37 @@ export function buildInheritedExecutionWorkspaceSettings(input: {
       typeof input.sourceWorkspaceBranchName === "string"
         ? input.sourceWorkspaceBranchName.trim()
         : "";
-    const sourceWorkspaceBaseRef =
-      typeof input.sourceWorkspaceBaseRef === "string"
-        ? input.sourceWorkspaceBaseRef.trim()
-        : "";
-    // A branch the source workspace created for its own task is deleted when
-    // that workspace is reclaimed, so it cannot be a durable base for a child
-    // that has not started yet. Keep inheriting operator-owned integration
-    // branches, which survive the parent.
-    const parentDurableBranch =
+    // Only an explicitly declared integration branch is inherited. A branch
+    // the source workspace created for its own task is transient by definition;
+    // an operator-owned feature branch is durable but still not an integration
+    // line, so a child that has not started must not be pinned to it.
+    const parentIntegrationBranch =
+      input.sourceIssueDeclaresIntegrationBranch === true &&
       input.sourceWorkspaceStrategyType === "git_worktree" &&
       !input.sourceWorkspaceBranchIsTransient &&
       sourceWorkspaceBranchName.length > 0
         ? sourceWorkspaceBranchName
         : null;
-    // Falling back to the parent's own base ref is the same retarget a human
-    // performs by hand on a stranded child (usually `origin/main`).
-    const parentBaseRef = parentDurableBranch ?? (sourceWorkspaceBaseRef.length > 0 ? sourceWorkspaceBaseRef : null);
+    const hasPinnedBranch =
+      typeof sourceStrategy.existingBranch === "string" &&
+      sourceStrategy.existingBranch.trim().length > 0;
+    // An explicit exact-branch pin is an operator decision, so keep retargeting
+    // it as the child's base when the parent is not an integration branch.
+    // `sourceWorkspaceBaseRef` is deliberately not inherited: it was resolved
+    // when the parent was created and is exactly the frozen ref this issue is
+    // about. With no base ref, provisioning resolves the project's integration
+    // line tip at workspace-creation time.
+    const parentBaseRef = parentIntegrationBranch;
     const nextStrategy = retargetPinnedBranchAsBaseRef(sourceStrategy, parentBaseRef);
     if (parentBaseRef) {
       nextStrategy.baseRef = parentBaseRef;
       if (nextStrategy.type === undefined) {
         nextStrategy.type = "git_worktree";
       }
+    } else if (!hasPinnedBranch) {
+      // Drop a base ref that was inherited through the parent's settings, so
+      // this child is resolved against the current integration line instead.
+      delete nextStrategy.baseRef;
     }
     if (Object.keys(nextStrategy).length > 0) {
       settings.workspaceStrategy = nextStrategy;

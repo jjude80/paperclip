@@ -862,13 +862,14 @@ describe("execution workspace inheritance", () => {
     });
   });
 
-  it("bases a child on the parent workspace's integration branch, not the project default", () => {
+  it("bases a child on an explicitly declared integration branch, not the project default", () => {
     expect(
       buildInheritedExecutionWorkspaceSettings({
         sourceSettings: { mode: "isolated_workspace" },
         sourceWorkspaceMode: "isolated_workspace",
         sourceWorkspaceStrategyType: "git_worktree",
         sourceWorkspaceBranchName: "NEXA-415-integration",
+        sourceIssueDeclaresIntegrationBranch: true,
         bindSourceWorkspace: false,
       }),
     ).toEqual({
@@ -877,7 +878,7 @@ describe("execution workspace inheritance", () => {
     });
   });
 
-  it("prefers the parent workspace's integration branch over an older inherited base ref", () => {
+  it("prefers an explicitly declared integration branch over an older inherited base ref", () => {
     expect(
       buildInheritedExecutionWorkspaceSettings({
         sourceSettings: {
@@ -887,6 +888,7 @@ describe("execution workspace inheritance", () => {
         sourceWorkspaceMode: "isolated_workspace",
         sourceWorkspaceStrategyType: "git_worktree",
         sourceWorkspaceBranchName: "NEXA-415-integration",
+        sourceIssueDeclaresIntegrationBranch: true,
         bindSourceWorkspace: false,
       }),
     ).toEqual({
@@ -895,11 +897,34 @@ describe("execution workspace inheritance", () => {
     });
   });
 
-  it("bases a child on the parent's durable base, not a transient runtime branch", () => {
-    // The parent workspace created its own task branch. That branch is deleted
-    // when the parent is reclaimed, so a child that has not started yet would
-    // otherwise fail with workspace_base_ref_unresolved. Base it on the ref the
-    // parent itself started from instead.
+  it("does not inherit a durable feature branch that is not declared an integration branch (NEXA-942)", () => {
+    // The NEXA-553 chain: the branch still exists on origin, so the old
+    // durability test inherited it. Existing on origin is not evidence that a
+    // child created weeks later should read it. With no base ref, provisioning
+    // resolves the integration line tip at workspace-creation time.
+    expect(
+      buildInheritedExecutionWorkspaceSettings({
+        sourceSettings: {
+          mode: "isolated_workspace",
+          workspaceStrategy: { type: "git_worktree", baseRef: "origin/NEXA-553-feature-chain" },
+        },
+        sourceWorkspaceMode: "isolated_workspace",
+        sourceWorkspaceStrategyType: "git_worktree",
+        sourceWorkspaceBranchName: "NEXA-553-feature-chain",
+        sourceWorkspaceBaseRef: "origin/NEXA-553-feature-chain",
+        sourceWorkspaceBranchIsTransient: false,
+        bindSourceWorkspace: false,
+      }),
+    ).toEqual({
+      mode: "isolated_workspace",
+      // The child still wants a worktree; only the stale base ref is dropped.
+      workspaceStrategy: { type: "git_worktree" },
+    });
+  });
+
+  it("does not inherit the parent's recorded base ref either", () => {
+    // A ref frozen at issue creation is the defect even when it names the
+    // integration line: `origin/main` must be re-resolved at creation.
     expect(
       buildInheritedExecutionWorkspaceSettings({
         sourceSettings: { mode: "isolated_workspace" },
@@ -910,9 +935,26 @@ describe("execution workspace inheritance", () => {
         sourceWorkspaceBranchIsTransient: true,
         bindSourceWorkspace: false,
       }),
+    ).toEqual({ mode: "isolated_workspace" });
+  });
+
+  it("does not carry the integration marker into the child's settings", () => {
+    expect(
+      buildInheritedExecutionWorkspaceSettings({
+        sourceSettings: {
+          mode: "isolated_workspace",
+          integrationBranch: true,
+          workspaceStrategy: { type: "git_worktree", baseRef: "origin/main" },
+        },
+        sourceWorkspaceMode: "isolated_workspace",
+        sourceWorkspaceStrategyType: "git_worktree",
+        sourceWorkspaceBranchName: "release/integration",
+        sourceIssueDeclaresIntegrationBranch: true,
+        bindSourceWorkspace: false,
+      }),
     ).toEqual({
       mode: "isolated_workspace",
-      workspaceStrategy: { type: "git_worktree", baseRef: "origin/main" },
+      workspaceStrategy: { type: "git_worktree", baseRef: "release/integration" },
     });
   });
 
@@ -929,7 +971,7 @@ describe("execution workspace inheritance", () => {
     ).toEqual({ mode: "isolated_workspace" });
   });
 
-  it("keeps inheriting an operator-owned branch that outlives the parent", () => {
+  it("keeps inheriting an operator-owned branch explicitly declared an integration branch (NEXA-482)", () => {
     expect(
       buildInheritedExecutionWorkspaceSettings({
         sourceSettings: { mode: "isolated_workspace" },
@@ -938,6 +980,7 @@ describe("execution workspace inheritance", () => {
         sourceWorkspaceBranchName: "release/integration",
         sourceWorkspaceBaseRef: "origin/main",
         sourceWorkspaceBranchIsTransient: false,
+        sourceIssueDeclaresIntegrationBranch: true,
         bindSourceWorkspace: false,
       }),
     ).toEqual({

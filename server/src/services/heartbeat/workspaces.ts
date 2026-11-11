@@ -214,6 +214,12 @@ export function mergeExecutionWorkspaceMetadataForPersistence(input: {
   workspaceConfigMetadata?: EffectiveRunWorkspaceConfigMetadata | null;
   baseRef: string | null | undefined;
   baseRefSha: string | null | undefined;
+  /** Committer date of the resolved base commit, ISO-8601 (NEXA-942). */
+  baseRefCommitDate?: string | null;
+  /** Commits on the integration line missing from the resolved base (NEXA-942). */
+  behindOriginMain?: number | null;
+  /** Integration-line ref the behind count was measured against (NEXA-942). */
+  originMainRef?: string | null;
 }) {
   const base = {
     ...(input.existingMetadata ?? {}),
@@ -232,6 +238,11 @@ export function mergeExecutionWorkspaceMetadataForPersistence(input: {
     base.baseRefSnapshot = {
       baseRef: input.baseRef ?? null,
       resolvedSha: input.baseRefSha,
+      ...(input.baseRefCommitDate ? { baseCommitDate: input.baseRefCommitDate } : {}),
+      ...(typeof input.behindOriginMain === "number"
+        ? { behindOriginMain: input.behindOriginMain }
+        : {}),
+      ...(input.originMainRef ? { originMainRef: input.originMainRef } : {}),
     };
   }
 
