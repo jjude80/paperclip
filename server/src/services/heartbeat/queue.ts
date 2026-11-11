@@ -615,6 +615,17 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           inArray(issues.status, [...TIMER_ACTIONABLE_ISSUE_STATUSES]),
           isNull(issues.conversationAgentId),
           nonIdleSlackIssueCondition(),
+          // An issue whose execution a live run already owns is not work this
+          // wake can start. Counting it as actionable lets a contentless
+          // heartbeat pulse through on every tick, and each admitted pulse
+          // becomes an unbound run that can only watch the holder. NEXA-909.
+          sql`NOT EXISTS (
+            SELECT 1 FROM ${heartbeatRuns} live_issue_run
+            WHERE live_issue_run.company_id = ${agent.companyId}
+              AND live_issue_run.status IN ('queued', 'running', 'scheduled_retry')
+              AND (live_issue_run.id = ${issues.executionRunId}
+                OR live_issue_run.context_snapshot->>'issueId' = ${issues.id}::text)
+          )`,
         ),
       )
       .limit(1)
