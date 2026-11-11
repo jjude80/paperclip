@@ -301,6 +301,35 @@ for (const installExit of [0, 42]) {
   });
 }
 
+test("dependency provisioning builds the workspace outputs the server suite imports", () => {
+  const baseCwd = makeBaseWorkspace({ helpExit: 0, initExit: 0 });
+  const bin = makeTempDir("paperclip-build-deps-pnpm-");
+  fs.writeFileSync(
+    path.join(bin, "pnpm"),
+    `#!/bin/sh
+printf '%s\\n' "$*" >> pnpm-calls
+mkdir -p node_modules cli/node_modules
+exit 0
+`,
+    { mode: 0o700 },
+  );
+  const { result, worktreeCwd } = runProvision(baseCwd, {
+    pathPrefix: bin,
+    setupWorktree(root) {
+      fs.writeFileSync(path.join(root, "package.json"), "{}\n");
+      fs.writeFileSync(path.join(root, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
+    },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const calls = fs.readFileSync(path.join(worktreeCwd, "pnpm-calls"), "utf8").trim().split("\n");
+  const installIndex = calls.findIndex((call) => call.startsWith("install "));
+  const buildIndex = calls.indexOf("--filter @paperclipai/plugin-sdk ensure-build-deps");
+  // Order matters: the build needs the node_modules the install just laid down.
+  assert.ok(installIndex >= 0, calls.join("\n"));
+  assert.ok(buildIndex > installIndex, calls.join("\n"));
+});
+
 test("rejects a dangling base workspace config symlink instead of falling back", () => {
   const baseCwd = makeBaseWorkspace({ helpExit: 0, initExit: 0 });
   fs.mkdirSync(path.join(baseCwd, ".paperclip"), { recursive: true });
