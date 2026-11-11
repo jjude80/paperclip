@@ -2,6 +2,7 @@ import { insertIssueComment } from "./issue-comment-writes.js";
 import { restoreGitWorkspaceContents } from "./git-workspace-contents.js";
 import { savedGitWorkspaceRestoration, ensureSavedGitCommit, GitCacheRestorationFailure } from "./git-workspace-restoration.js";
 import { applyGitRestorePointToWorktree, ensureGitRestorePointCommit } from "./git-restore-point-storage.js";
+import { shareGitWorktreeWithGroup } from "./git-worktree-sharing.js";
 import { getStorageService } from "../storage/index.js";
 import type { StorageService } from "../storage/types.js";
 import { sanitizeRuntimeServiceBaseEnv } from "./runtime-service-env.js";
@@ -3320,7 +3321,44 @@ async function resolveGitRepoRootForWorkspaceCleanup(
   return path.dirname(resolvedGitDir);
 }
 
-export async function realizeExecutionWorkspace(input: {
+export async function realizeExecutionWorkspace(
+  input: Parameters<typeof realizeExecutionWorkspaceUnshared>[0],
+): Promise<RealizedExecutionWorkspace> {
+  const realized = await realizeExecutionWorkspaceUnshared(input);
+  await shareRealizedGitWorktree(realized);
+  return realized;
+}
+
+/**
+ * NEXA-947: the files git writes into the shared `.git` for a new worktree are
+ * created with the server's umask, so on a host that runs the server as the
+ * checkout owner with `umask 0077` the workspace's own branch ref and
+ * `.git/config` land unreadable and every sibling agent's fetch aborts on them.
+ * Install group-read inheritance and make what was just written readable before
+ * the workspace is handed to the run. Best effort: a host without POSIX ACLs
+ * must not lose its workspace.
+ */
+async function shareRealizedGitWorktree(realized: RealizedExecutionWorkspace): Promise<void> {
+  if (realized.strategy !== "git_worktree" || !realized.worktreePath) return;
+  try {
+    const sharing = await shareGitWorktreeWithGroup({
+      worktreePath: realized.worktreePath,
+      branchName: realized.branchName,
+    });
+    if (sharing.status === "partial") {
+      console.warn(
+        `[workspace-runtime] shared git metadata for ${realized.worktreePath} is incomplete: ${sharing.warnings.join("; ")}`,
+      );
+    }
+  } catch (error) {
+    // Sharing is a host-permission concern; it must never fail realization.
+    console.warn(
+      `[workspace-runtime] could not share git metadata for ${realized.worktreePath}: ${(error as Error).message}`,
+    );
+  }
+}
+
+async function realizeExecutionWorkspaceUnshared(input: {
   db?: Db | null;
   base: ExecutionWorkspaceInput;
   config: Record<string, unknown>;
@@ -3780,7 +3818,7 @@ function isPersistedTaskDirectory(workspace: {
     && workspace.projectId === null && workspace.projectWorkspaceId === null && workspace.repoUrl === null;
 }
 
-export async function ensurePersistedExecutionWorkspaceAvailable(input: {
+async function ensurePersistedExecutionWorkspaceUnshared(input: {
   prepareRestoredLocalSource?: (sourceCwd: string) => Promise<() => Promise<void>>;
   persistContentsRestoredAt?: (at: string | null) => Promise<void>;
   persistRestorePointAppliedAt?: (at: string) => Promise<void>;
@@ -4146,6 +4184,14 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
       ?? (created ? restoreCurrentBaseRefSha : baseDrift.branchBaseRefSha)
       ?? baseDrift.currentBaseRefSha,
   };
+}
+
+export async function ensurePersistedExecutionWorkspaceAvailable(
+  input: Parameters<typeof ensurePersistedExecutionWorkspaceUnshared>[0],
+): Promise<RealizedExecutionWorkspace | null> {
+  const realized = await ensurePersistedExecutionWorkspaceUnshared(input);
+  if (realized) await shareRealizedGitWorktree(realized);
+  return realized;
 }
 
 export async function acquireGitWorktreeCleanupLock(worktreePath: string) {
